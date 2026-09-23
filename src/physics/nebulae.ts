@@ -104,6 +104,30 @@ export function photonFractionAbove(T: number, eV: number): number {
   return photonIntegral(eV / kT) / photonIntegral(IONIZATION_EV.H / kT);
 }
 
+/** Helium abundance by number, y = n_He / n_H. */
+export const Y_HE = 0.1;
+/** Case-B recombination coefficients of He⁰ and He⁺ relative to H at 10⁴ K (hydrogenic scaling for He⁺). */
+export const ALPHA_HEI_OVER_H = 1.05;
+export const ALPHA_HEII_OVER_H = 5.3;
+
+export type Zone = 'He+' | 'O++' | 'He++';
+
+/**
+ * Where an ionization zone ends, expressed as the fraction of the *hydrogen* photon budget C_H
+ * (0 < C ≤ 1, see photonBudgetK). Photons harder than 24.6 eV are eaten mainly by helium
+ * (abundance y = 0.1), so a zone ends where C_H = f_X / (y a_X): f_X is the hardness fraction
+ * above the ion's threshold and a_X its recombination rate relative to hydrogen.
+ * Reproduces Osterbrock & Ferland §2.5: the He⁺ zone fills the H⁺ zone for T* ≳ 40 kK, and
+ * [OIII]/He II cores grow as the star heats up. A value of 1 means "fills the H⁺ zone".
+ */
+export function zoneThreshold(T: number, zone: Zone): number {
+  let c: number;
+  if (zone === 'He+') c = photonFractionAbove(T, IONIZATION_EV.He) / (Y_HE * ALPHA_HEI_OVER_H);
+  else if (zone === 'O++') c = photonFractionAbove(T, IONIZATION_EV.OII) / (Y_HE * ALPHA_HEI_OVER_H);
+  else c = photonFractionAbove(T, IONIZATION_EV.HeII) / (Y_HE * ALPHA_HEII_OVER_H);
+  return Math.min(1, Math.max(1e-6, c));
+}
+
 // ——— H II regions ————————————————————————————————————————————————————————————
 
 /** Strömgren radius R_S = (3Q / (4π n² α_B))^{1/3}, in parsecs (n in cm⁻³, Q in s⁻¹). */
@@ -148,17 +172,20 @@ export interface IonizingStarType {
   mv: number;
 }
 
-/** O dwarf calibration (Martins, Schaerer & Hillier 2005, observational T_eff scale, Table 1; rounded). */
+/**
+ * O dwarf calibration, rounded from the observational T_eff scale of Martins, Schaerer &
+ * Hillier (2005, Table 4); B0 V extrapolated. Good to ~0.1 dex in Q — ample for a label.
+ */
 export const O_DWARFS: readonly IonizingStarType[] = [
-  { type: 'O3 V', teff: 44600, logQ: 49.63, mv: -5.78 },
-  { type: 'O4 V', teff: 43400, logQ: 49.47, mv: -5.55 },
-  { type: 'O5 V', teff: 41500, logQ: 49.26, mv: -5.31 },
-  { type: 'O6 V', teff: 38200, logQ: 48.96, mv: -4.95 },
-  { type: 'O7 V', teff: 35500, logQ: 48.63, mv: -4.66 },
-  { type: 'O8 V', teff: 33400, logQ: 48.29, mv: -4.39 },
-  { type: 'O9 V', teff: 31500, logQ: 47.90, mv: -4.13 },
-  { type: 'O9.5 V', teff: 30500, logQ: 47.56, mv: -3.97 },
-  { type: 'B0 V', teff: 29000, logQ: 47.2, mv: -3.8 },
+  { type: 'O3 V', teff: 44850, logQ: 49.64, mv: -5.78 },
+  { type: 'O4 V', teff: 42860, logQ: 49.47, mv: -5.55 },
+  { type: 'O5 V', teff: 40860, logQ: 49.26, mv: -5.33 },
+  { type: 'O6 V', teff: 38870, logQ: 49.02, mv: -5.11 },
+  { type: 'O7 V', teff: 36870, logQ: 48.75, mv: -4.88 },
+  { type: 'O8 V', teff: 34880, logQ: 48.44, mv: -4.66 },
+  { type: 'O9 V', teff: 32880, logQ: 48.08, mv: -4.43 },
+  { type: 'O9.5 V', teff: 31880, logQ: 47.88, mv: -4.32 },
+  { type: 'B0 V', teff: 30000, logQ: 47.4, mv: -4.0 },
 ];
 
 /** Describe an ionizing photon rate as an equivalent number of O dwarfs of the nearest type. */
@@ -284,28 +311,26 @@ export function trueLineRGB(nm: number): [number, number, number] {
 
 /**
  * Display colour (linear sRGB per unit line energy) of each carried line in a palette.
- * - 'true': physical colour (trueLineRGB).
- * - 'sho':  the Hubble palette: [SII] → red, Hα → green, [OIII] → blue. Each narrowband
- *           channel is stretched independently in press images; the gains mimic that.
- * - 'hoo':  bicolour Hα → red, [OIII] → teal (green + blue).
+ * - 'true': physical colour (trueLineRGB) — H II regions come out pink (Hα + Hβ + Hγ), [OIII]
+ *           cores greenish-white, exactly as the eye/a colour camera would record them.
+ * - 'sho':  the Hubble palette: [SII] → red, Hα → green, [OIII] → blue (HST F673N/F656N/F502N).
+ *           Press images stretch each narrowband channel independently; the gains below do
+ *           the same for typical line ratios (Hα : [OIII] : [SII] ≈ 2.9 : 1.5 : 0.3 in Hβ
+ *           units), so H II interiors come out teal and ionization fronts gold.
+ * - 'hoo':  amateur bicolour Hα → red, [OIII] → teal (green + blue).
+ * Narrowband colours carry roughly the same luminance as true colour so one exposure fits all.
  */
 export function paletteLineColours(p: Palette): Record<LineId, [number, number, number]> {
   const out = {} as Record<LineId, [number, number, number]>;
-  for (const l of NEBULA_LINES) {
-    if (p === 'true') out[l.id] = trueLineRGB(l.nm);
-    else out[l.id] = [0, 0, 0];
-  }
-  // Narrowband palettes are normalised to the Hα true-colour luminance so exposure carries over.
-  const ha = trueLineRGB(LINES.H_ALPHA);
-  const y = 0.2126 * ha[0] + 0.7152 * ha[1] + 0.0722 * ha[2];
+  for (const l of NEBULA_LINES) out[l.id] = p === 'true' ? trueLineRGB(l.nm) : [0, 0, 0];
   if (p === 'sho') {
-    out.SII = [4.2 * y / 0.2126 * 0.62, 0.9 * y, 0.05 * y];
-    out.Ha = [0.35 * y, 0.95 * y / 0.7152 * 0.55, 0.12 * y];
-    out.OIII = [0.0, 0.55 * y, 1.15 * y / 0.0722 * 0.1];
+    out.SII = [1.25, 0.12, 0.0];
+    out.Ha = [0.02, 0.26, 0.035];
+    out.OIII = [0.0, 0.11, 0.62];
   } else if (p === 'hoo') {
-    out.Ha = [1.0 * y / 0.2126 * 0.8, 0.12 * y, 0.08 * y];
-    out.OIII = [0.0, 0.85 * y / 0.7152 * 0.55, 0.85 * y / 0.0722 * 0.08];
-    out.NII = [0.5 * y / 0.2126 * 0.8, 0.06 * y, 0.04 * y]; // leaks into a 7 nm Hα filter
+    out.Ha = [0.36, 0.02, 0.025];
+    out.NII = [0.18, 0.01, 0.012]; // leaks into a typical 7 nm Hα filter
+    out.OIII = [0.0, 0.36, 0.5];
   }
   return out;
 }
