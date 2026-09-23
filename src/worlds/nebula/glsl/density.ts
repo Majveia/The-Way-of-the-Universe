@@ -43,19 +43,27 @@ vec4 nebDensity(vec3 p) {
   float g1 = fbm3(s * 0.32, 5);
   float g2 = fbm3(s * 0.95 + 11.3, 5);
   float g3 = snoise(s * 2.7 + 3.1);
-  // Molecular cloud: a floor and a back wall, both corrugated.
+  // Molecular cloud: a floor and a back wall, both corrugated, inside an organic envelope
+  // (a finite cloud, so the simulation cube never shows).
   float floorY = -1.35 + 1.1 * fbm3(vec3(p.x * 0.24, 1.7, p.z * 0.24) + uSeedOff, 4);
   float backZ = -2.0 + 1.1 * fbm3(vec3(p.x * 0.22, p.y * 0.22, 4.2) + uSeedOff.yzx, 4);
   float inCloud = max(smoothstep(0.3, -0.3, p.y - floorY - 0.35 * g2), smoothstep(0.4, -0.4, p.z - backZ - 0.45 * g2));
+  // Ragged outer edge: the cloud thins out along fractal lanes instead of ending on a surface.
+  float edgeN = fbm3(s * 0.55 + 21.0, 5);
+  vec3 ec = (p - vec3(-0.3, -1.0, -1.1)) / vec3(1.25, 0.95, 0.9);
+  float envelope = 1.0 - smoothstep(0.55 * uHalf, 1.0 * uHalf, length(ec) * (1.0 + 0.55 * edgeN));
+  inCloud *= envelope;
   // Cavity blown by the cluster's winds and radiation pressure.
   float rs = length(p - uSource);
   float R = uCavityR * (1.0 + 0.3 * g1 + 0.12 * g2);
   float cloud = inCloud * smoothstep(R - 0.3, R + 0.3, rs);
-  float n = 2200.0 * cloud * exp(1.4 * g2 + 0.5 * g3);
-  // Tenuous, streaky gas inside the cavity, denser toward its walls.
+  // Smooth, large-scale lognormal structure on the walls; small scales come from the detail field.
+  float n = 2200.0 * cloud * exp(1.0 * g2 + 0.2 * g3);
+  // Tenuous, streaky ionized gas filling the cavity (and only the cavity), denser toward its walls.
   vec3 radial = (p - uSource) / max(rs, 1e-3);
   float streak = fbm3(radial * 3.2 + s * 0.2 + 7.7, 4);
-  n += 22.0 * exp(1.6 * g1 + 0.9 * streak) * (0.35 + 0.65 * smoothstep(0.2 * R, R, rs));
+  float bubble = 1.0 - smoothstep(0.85 * R, 1.25 * R, rs);
+  n += 14.0 * exp(1.5 * g1 + 0.9 * streak) * (0.3 + 0.7 * smoothstep(0.2 * R, R, rs)) * bubble * (0.4 + 0.6 * envelope);
   // Pillars (elephant trunks) pointing at the cluster, with evaporating heads.
   vec3 wob = vec3(snoise(s * 1.6), snoise(s * 1.6 + 5.1), snoise(s * 1.6 + 9.7));
   vec3 pw = p + 0.1 * wob;
@@ -103,7 +111,7 @@ void main() {
   vec3 p = (uvw * 2.0 - 1.0) * uHalf;
   vec4 d = nebDensity(p);
   // Soft fade toward the cube faces so the box is never visible.
-  vec3 e = 1.0 - smoothstep(vec3(0.82 * uHalf), vec3(0.985 * uHalf), abs(p));
+  vec3 e = 1.0 - smoothstep(vec3(0.72 * uHalf), vec3(0.98 * uHalf), abs(p));
   d.x *= e.x * e.y * e.z;
   outColor = d;
 }`;

@@ -55,12 +55,14 @@ float barDust(vec2 XY) {
       float yc = sign(b.x) * (uBarLane.y + 0.06 * L * ax / L);
       float w = uBarLane.z * (0.7 + 0.6 * ax / L);
       float along = gsmooth(uRing.x * 0.6, uRing.x * 1.4, ax) * (1.0 - gsmooth(L * 0.8, L * 1.15, ax));
-      tau += uBarLane.w * uBarStrength * along * exp(-0.5 * pow((b.y - yc) / w, 2.0));
+      float dy = (b.y - yc) / w;
+      tau += uBarLane.w * uBarStrength * along * exp(-0.5 * dy * dy);
     }
   }
   if (uRing.z > 0.0) {
     float R = length(XY);
-    tau += uRing.z * exp(-0.5 * pow((R - uRing.x) / uRing.y, 2.0));
+    float dr = (R - uRing.x) / uRing.y;
+    tau += uRing.z * exp(-0.5 * dr * dr);
   }
   return tau;
 }

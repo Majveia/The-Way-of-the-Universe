@@ -128,8 +128,27 @@ const DIST_OVERRIDE = {
   "Luyten's Star": 1000 / 264.13,
 };
 
+// Display names for notable neighbours that HYG lists only by Gliese number.
+const GL_NAMES = {
+  'Gl 820A': '61 Cygni A',
+  'Gl 820B': '61 Cygni B',
+  'Gl 244B': 'Sirius B',
+  'Gl 280B': 'Procyon B',
+  'Gl 54.1': 'YZ Ceti',
+  'GJ 1061': 'GJ 1061',
+  'GJ 1111': 'DX Cancri',
+  'GJ 1002': 'GJ 1002',
+  'Gl 581': 'Gliese 581',
+  'Gl 667C': 'Gliese 667 C',
+  'Gl 166B': '40 Eridani B',
+  'Gl 166C': '40 Eridani C',
+  'Gl 866A': 'EZ Aquarii',
+};
+
 // Stars missing from HYG that matter for a voyage through the neighbourhood.
 const EXTRA = [
+  // Teegarden's Star: M7 dwarf found in 2003, two Earth-mass planets (Zechmeister+2019; ϖ = 261.01 mas).
+  { proper: "Teegarden's Star", ra: 2.88359, dec: 16.88139, dist: 1000 / 261.01, absmag: 17.21, ci: 2.1, spect: 'M7.0V', gl: 'GJ 3181' },
   // Luhman 16 AB: nearest brown-dwarf binary (Luhman 2013; Gaia DR3 ϖ = 501.557 mas). Teff ≈ 1300 K.
   { proper: 'Luhman 16', ra: 10.82099, dec: -53.31889, dist: 1000 / 501.557, absmag: 26.0, ci: 6.5, spect: 'L7.5+T0.5', gl: 'Luhman 16', bvEst: true },
   // TRAPPIST-1: ultracool M8V dwarf with seven Earth-sized planets (Gillon+2017; ϖ = 80.21 mas).
@@ -142,6 +161,8 @@ for (const r of rows) {
   let dist = num(r.dist);
   if (!isFinite(mag)) continue;
   const isSun = r.proper === 'Sol';
+  if (!r.proper && GL_NAMES[r.gl]) r.proper = GL_NAMES[r.gl];
+  if (r.proper === 'EZ Aqr') r.proper = 'EZ Aquarii';
   const near = dist > 0 && dist <= 25;
   if (!(isSun || mag <= 6.5 || near)) continue;
   let flags = 0;

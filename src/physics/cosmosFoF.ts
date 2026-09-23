@@ -5,11 +5,11 @@
  * are "friends"; groups are the connected components. Such groups enclose an overdensity of
  * roughly 100–200 × the mean, close to the virial overdensity of dark-matter halos.
  *
- * Implementation: candidates are binned in a periodic cell grid of side ≥ ℓ, cells are found
- * through an open-addressing hash table, each occupied cell is compared with itself and its 13
- * "forward" neighbours, and connectivity is tracked with union–find (path halving).
- * The caller may pre-select candidates (e.g. particles in overdense regions): a particle in a
- * b = 0.2 group sits at δ ≳ 60, so a generous density cut loses nothing but saves time.
+ * Implementation: candidates are binned in a periodic grid of cells of side ≥ ℓ and sorted by
+ * cell (LSD radix sort on the 32-bit cell key); cells are found through an open-addressing hash
+ * table; each occupied cell is compared with itself and its 13 "forward" neighbours; connectivity
+ * is tracked with union–find (path halving). The caller may pre-select candidates (e.g. particles
+ * in overdense regions) — a particle in a b = 0.2 group sits at δ ≳ 60.
  */
 
 export interface FoFResult {
@@ -19,6 +19,41 @@ export interface FoFResult {
   groupStart: Int32Array;
   /** Particle indices, grouped, largest group first. */
   members: Uint32Array;
+}
+
+function fmix32(h: number): number {
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+/** Sort `idx` by `key` (both length M, keys < 2^32) with a stable 4-pass LSD radix sort. */
+function radixSort(key: Uint32Array, idx: Uint32Array, M: number): void {
+  let kA: Uint32Array = key, iA: Uint32Array = idx;
+  let kB: Uint32Array = new Uint32Array(M), iB: Uint32Array = new Uint32Array(M);
+  const count = new Uint32Array(256);
+  for (let shift = 0; shift < 32; shift += 8) {
+    count.fill(0);
+    for (let i = 0; i < M; i++) count[(kA[i] >>> shift) & 255]++;
+    let sum = 0;
+    for (let b = 0; b < 256; b++) {
+      const c = count[b];
+      count[b] = sum;
+      sum += c;
+    }
+    for (let i = 0; i < M; i++) {
+      const b = (kA[i] >>> shift) & 255;
+      const d = count[b]++;
+      kB[d] = kA[i];
+      iB[d] = iA[i];
+    }
+    const tk = kA; kA = kB; kB = tk;
+    const ti = iA; iA = iB; iB = ti;
+  }
+  // After 4 passes the sorted data is back in the original arrays.
 }
 
 export function friendsOfFriends(
@@ -31,137 +66,141 @@ export function friendsOfFriends(
 ): FoFResult {
   const M = candidateCount;
   if (M === 0) return { groups: 0, groupStart: new Int32Array(1), members: new Uint32Array(0) };
-  const nc = Math.max(3, Math.floor(box / link));
-  const cs = box / nc;
-  const inv = 1 / cs;
-  // Cell key per candidate; sort candidates by key (packed into one exact float64).
-  const idxBits = Math.ceil(Math.log2(M + 1));
-  const mul = 2 ** idxBits;
-  if (nc * nc * nc * mul > 2 ** 53) throw new Error('FoF: grid too fine for packed sort');
-  const packed = new Float64Array(M);
+  const nc = Math.max(3, Math.min(1290, Math.floor(box / link)));
+  const inv = nc / box;
+  const key = new Uint32Array(M);
+  const sp = new Uint32Array(M); // sorted particle indices
   for (let j = 0; j < M; j++) {
     const p = candidates[j];
     let cx = Math.floor(pos[3 * p] * inv), cy = Math.floor(pos[3 * p + 1] * inv), cz = Math.floor(pos[3 * p + 2] * inv);
     if (cx >= nc) cx = nc - 1;
     if (cy >= nc) cy = nc - 1;
     if (cz >= nc) cz = nc - 1;
-    packed[j] = ((cx * nc + cy) * nc + cz) * mul + j;
+    key[j] = (cx * nc + cy) * nc + cz;
+    sp[j] = p;
   }
-  packed.sort();
-  const sortedP = new Uint32Array(M); // sorted particle index
-  const keys = new Float64Array(M);
+  radixSort(key, sp, M);
+  // Local copy of positions in sorted order (cache-friendly pair tests).
+  const px = new Float32Array(M), py = new Float32Array(M), pz = new Float32Array(M);
   for (let s = 0; s < M; s++) {
-    const v = packed[s];
-    const key = Math.floor(v / mul);
-    const j = v - key * mul;
-    keys[s] = key;
-    sortedP[s] = candidates[j];
+    const p = sp[s];
+    px[s] = pos[3 * p];
+    py[s] = pos[3 * p + 1];
+    pz[s] = pos[3 * p + 2];
   }
-  // Cell table: unique keys → [start, end).
+  // Unique cells.
+  const cellStart = new Int32Array(M + 1);
   let cells = 0;
-  const cellStart: number[] = [];
-  for (let s = 0; s < M; s++) if (s === 0 || keys[s] !== keys[s - 1]) (cellStart.push(s), cells++);
-  cellStart.push(M);
+  for (let s = 0; s < M; s++) if (s === 0 || key[s] !== key[s - 1]) cellStart[cells++] = s;
+  cellStart[cells] = M;
   let cap = 1;
   while (cap < cells * 2) cap <<= 1;
-  const hk = new Float64Array(cap).fill(-1);
-  const hv = new Int32Array(cap);
   const hmask = cap - 1;
-  const hash = (k: number) => (Math.imul((k % 4294967296) | 0, 0x9e3779b1) ^ Math.imul(Math.floor(k / 4294967296), 0x85ebca6b)) >>> 0;
+  const hk = new Uint32Array(cap);
+  const hv = new Int32Array(cap).fill(-1);
   for (let c = 0; c < cells; c++) {
-    const k = keys[cellStart[c]];
-    let h = hash(k) & hmask;
-    while (hk[h] !== -1) h = (h + 1) & hmask;
+    const k = key[cellStart[c]];
+    let h = fmix32(k) & hmask;
+    while (hv[h] !== -1) h = (h + 1) & hmask;
     hk[h] = k;
     hv[h] = c;
   }
-  const lookup = (k: number): number => {
-    let h = hash(k) & hmask;
-    while (true) {
-      const v = hk[h];
-      if (v === -1) return -1;
-      if (v === k) return hv[h];
-      h = (h + 1) & hmask;
-    }
-  };
-  // Union–find over sorted slots.
   const parent = new Int32Array(M);
   for (let i = 0; i < M; i++) parent[i] = i;
-  const find = (i: number): number => {
-    while (parent[i] !== i) {
-      parent[i] = parent[parent[i]];
-      i = parent[i];
-    }
-    return i;
-  };
-  const union = (a: number, b: number) => {
-    let ra = find(a), rb = find(b);
-    if (ra === rb) return;
-    if (ra < rb) {
-      const t = ra;
-      ra = rb;
-      rb = t;
-    }
-    parent[ra] = rb;
-  };
   const l2 = link * link;
   const half = box / 2;
-  const linkPair = (sa: number, sb: number) => {
-    const pa = sortedP[sa], pb = sortedP[sb];
-    let dx = pos[3 * pa] - pos[3 * pb];
-    if (dx > half) dx -= box;
-    else if (dx < -half) dx += box;
-    if (dx * dx > l2) return;
-    let dy = pos[3 * pa + 1] - pos[3 * pb + 1];
-    if (dy > half) dy -= box;
-    else if (dy < -half) dy += box;
-    const d2 = dx * dx + dy * dy;
-    if (d2 > l2) return;
-    let dz = pos[3 * pa + 2] - pos[3 * pb + 2];
-    if (dz > half) dz -= box;
-    else if (dz < -half) dz += box;
-    if (d2 + dz * dz <= l2) union(sa, sb);
-  };
+  const nc2 = nc * nc;
   // 13 forward neighbour offsets.
-  const offs: Array<[number, number, number]> = [];
-  for (let dx = -1; dx <= 1; dx++)
-    for (let dy = -1; dy <= 1; dy++)
-      for (let dz = -1; dz <= 1; dz++) {
-        if (dx > 0 || (dx === 0 && dy > 0) || (dx === 0 && dy === 0 && dz > 0)) offs.push([dx, dy, dz]);
-      }
+  const OX = [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+  const OY = [0, 1, 1, 1, -1, -1, -1, 0, 0, 0, 1, 1, 1];
+  const OZ = [1, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1];
   for (let c = 0; c < cells; c++) {
     const s0 = cellStart[c], s1 = cellStart[c + 1];
-    const key = keys[s0];
-    const cz = key % nc, cy = Math.floor(key / nc) % nc, cx = Math.floor(key / (nc * nc));
-    for (let a = s0; a < s1; a++) for (let b = a + 1; b < s1; b++) linkPair(a, b);
-    for (const [ox, oy, oz] of offs) {
-      const nx = (cx + ox + nc) % nc, ny = (cy + oy + nc) % nc, nz = (cz + oz + nc) % nc;
-      const nb = lookup((nx * nc + ny) * nc + nz);
-      if (nb < 0) continue;
-      const t0 = cellStart[nb], t1 = cellStart[nb + 1];
-      for (let a = s0; a < s1; a++) for (let b = t0; b < t1; b++) linkPair(a, b);
+    const k = key[s0];
+    const cx = (k / nc2) | 0, cy = ((k / nc) | 0) % nc, cz = k % nc;
+    for (let o = -1; o < 13; o++) {
+      let t0: number, t1: number;
+      if (o < 0) {
+        t0 = s0;
+        t1 = s1;
+      } else {
+        let nx = cx + OX[o], ny = cy + OY[o], nz = cz + OZ[o];
+        if (nx >= nc) nx -= nc; else if (nx < 0) nx += nc;
+        if (ny >= nc) ny -= nc; else if (ny < 0) ny += nc;
+        if (nz >= nc) nz -= nc; else if (nz < 0) nz += nc;
+        const nk = (nx * nc + ny) * nc + nz;
+        let h = fmix32(nk) & hmask;
+        let nb = -1;
+        while (hv[h] !== -1) {
+          if (hk[h] === nk) {
+            nb = hv[h];
+            break;
+          }
+          h = (h + 1) & hmask;
+        }
+        if (nb < 0) continue;
+        t0 = cellStart[nb];
+        t1 = cellStart[nb + 1];
+      }
+      for (let a = s0; a < s1; a++) {
+        const ax = px[a], ay = py[a], az = pz[a];
+        for (let b = o < 0 ? a + 1 : t0; b < t1; b++) {
+          let dx = ax - px[b];
+          if (dx > half) dx -= box; else if (dx < -half) dx += box;
+          const dx2 = dx * dx;
+          if (dx2 > l2) continue;
+          let dy = ay - py[b];
+          if (dy > half) dy -= box; else if (dy < -half) dy += box;
+          const d2 = dx2 + dy * dy;
+          if (d2 > l2) continue;
+          let dz = az - pz[b];
+          if (dz > half) dz -= box; else if (dz < -half) dz += box;
+          if (d2 + dz * dz > l2) continue;
+          // union(a, b) with path halving
+          let ra = a;
+          while (parent[ra] !== ra) {
+            parent[ra] = parent[parent[ra]];
+            ra = parent[ra];
+          }
+          let rb = b;
+          while (parent[rb] !== rb) {
+            parent[rb] = parent[parent[rb]];
+            rb = parent[rb];
+          }
+          if (ra !== rb) {
+            if (ra < rb) parent[rb] = ra;
+            else parent[ra] = rb;
+          }
+        }
+      }
     }
   }
   // Collect groups.
+  const root = new Int32Array(M);
   const size = new Int32Array(M);
-  for (let s = 0; s < M; s++) size[find(s)]++;
+  for (let s = 0; s < M; s++) {
+    let r = s;
+    while (parent[r] !== r) r = parent[r];
+    root[s] = r;
+    size[r]++;
+  }
   const roots: number[] = [];
-  for (let s = 0; s < M; s++) if (parent[s] === s && size[s] >= minMembers) roots.push(s);
-  roots.sort((a, b) => size[b] - size[a]);
+  for (let s = 0; s < M; s++) if (root[s] === s && size[s] >= minMembers) roots.push(s);
+  roots.sort((a, b) => size[b] - size[a] || a - b);
   const gid = new Int32Array(M).fill(-1);
   const groupStart = new Int32Array(roots.length + 1);
   let total = 0;
-  roots.forEach((r, g) => {
-    gid[r] = g;
+  for (let g = 0; g < roots.length; g++) {
+    gid[roots[g]] = g;
     groupStart[g] = total;
-    total += size[r];
-  });
+    total += size[roots[g]];
+  }
   groupStart[roots.length] = total;
-  const fill = groupStart.slice(0, roots.length);
+  const fill = groupStart.slice(0, Math.max(1, roots.length));
   const members = new Uint32Array(total);
   for (let s = 0; s < M; s++) {
-    const g = gid[find(s)];
-    if (g >= 0) members[fill[g]++] = sortedP[s];
+    const g = gid[root[s]];
+    if (g >= 0) members[fill[g]++] = sp[s];
   }
   return { groups: roots.length, groupStart, members };
 }

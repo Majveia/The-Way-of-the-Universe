@@ -1,5 +1,6 @@
-import { KIND_BULGE, smoothAccel, updateSmoothDisk, type SmoothModel } from './galaxy';
-import { diskMomentRadius, type ScenarioData } from './scenario';
+import { smoothAccel, type SmoothModel } from './galaxy';
+import { applyDiskMoments, diskMoments, DISK_REFIT_TAU } from './moments';
+import type { ScenarioData } from './scenario';
 import { G_SIM } from './units';
 
 /**
@@ -9,8 +10,9 @@ import { G_SIM } from './units';
  *  1. Skeleton — kick-drift-kick leapfrog (Verlet; symplectic, time-reversible) with direct
  *     Plummer-softened summation, ε_ij² = ½(ε_i² + ε_j²) (keeps forces pairwise-antisymmetric,
  *     so momentum is conserved to round-off).
- *  2. Centre tracking — each galaxy's centre is the Gaussian-weighted "shrinking sphere" centroid
- *     of its skeleton bulge particles (Power et al. 2003-style), from the previous centre.
+ *  2. Centre tracking — each galaxy's smooth-field centre follows its inner skeleton: a
+ *     Gaussian-windowed centroid (shrinking-sphere style, Power et al. 2003) filtered by a
+ *     ballistic predictor driven by the window's mean acceleration (see CENTER_TAU).
  *  3. Tracers — K leapfrog sub-steps per skeleton step in the smooth field of both galaxies,
  *     whose centres are interpolated linearly across the step.
  *  4. Disk refit — the smooth disk of each galaxy is re-derived from its own disk tracers:
@@ -33,10 +35,18 @@ export interface Diagnostics {
   angularMomentum: [number, number, number];
 }
 
-/** Smoothing time for the refit disk parameters (Myr). */
-export const DISK_REFIT_TAU = 25;
-/** Shrinking-sphere radii (kpc, multiples of the bulge scale). */
-export const TRACK_RADII = [3, 1.6, 1];
+/** Shrinking window radii (multiples of the bulk window). */
+export const TRACK_RADII = [2, 1];
+/**
+ * Centre filter time constants (Myr). The smooth-field centre moves ballistically under the mean
+ * skeleton acceleration of the bulge (internal forces cancel pairwise, so this is smooth) and is
+ * pulled gently toward the measured centroid: dc/dt = u + Δ/τ_x, du/dt = ā + Δ/τ_v² + (ū − u)/τ_u,
+ * with Δ = c_meas − c. This removes the Brownian jitter a grainy skeleton bulge suffers from its
+ * 10⁸–10⁹ M☉ halo particles (which would otherwise shake the thin tracer disks).
+ */
+export const CENTER_TAU = { x: 40, v: 60, u: 80 };
+/** Gaussian window (kpc) for the bulk velocity/acceleration: max(8 kpc, 3 R_d). */
+export const bulkWindow = (rd: number) => Math.max(8, 3 * rd);
 
 export class CpuNBody {
   time = 0;
@@ -57,6 +67,8 @@ export class CpuNBody {
   readonly models: SmoothModel[];
   readonly centers: number[][];
   readonly centerVel: number[][];
+  /** Mean skeleton acceleration of each bulge (drives the centre filter). */
+  readonly centerAcc: number[][];
   readonly spins: number[][];
   private prevCenters: number[][];
 
@@ -100,10 +112,16 @@ export class CpuNBody {
     this.models = data.galaxies.map((g) => structuredClone(g.model));
     this.centers = data.galaxies.map((g) => [...g.center]);
     this.centerVel = data.galaxies.map((g) => [...g.velocity]);
+    this.centerAcc = data.galaxies.map(() => [0, 0, 0]);
     this.spins = data.galaxies.map((g) => [...g.spin]);
     this.prevCenters = this.centers.map((c) => [...c]);
     this.skeletonForces();
-    this.track();
+    this.measureCenters();
+    this.data.galaxies.forEach((_, g) => {
+      this.centers[g] = [...this.meas[g].c];
+      this.centerVel[g] = [...this.meas[g].v];
+      this.centerAcc[g] = [...this.meas[g].a];
+    });
   }
 
   /** Direct-summation accelerations and potentials of the skeleton. */
@@ -138,20 +156,30 @@ export class CpuNBody {
     for (let i = 0; i < nS; i++) phi[i] *= G_SIM;
   }
 
-  /** Shrinking-sphere centres of each galaxy's bulge. */
-  track(): void {
+  /** Latest raw measurements (centroid, mean velocity, mean acceleration) per galaxy. */
+  readonly meas = [0, 1].map(() => ({ c: [0, 0, 0], v: [0, 0, 0], a: [0, 0, 0] }));
+
+  /**
+   * Measure each galaxy's inner centroid, bulk velocity and bulk acceleration: Gaussian-weighted
+   * means over ALL of the galaxy's skeleton particles (halo, bulge, disk) in a broad window around
+   * the current centre (two shrinking passes). Averaging over ~10³ particles makes this far less
+   * noisy than a bulge-only centroid, and internal forces cancel pairwise to first order, so the
+   * mean acceleration traces the orbit (tides, dynamical friction) without the core's Brownian
+   * sloshing inside a grainy halo.
+   */
+  measureCenters(): void {
     this.data.galaxies.forEach((g, gi) => {
-      const seg = g.bulge;
-      const c = this.centers[gi];
-      const ab = g.spec.bulge.scale;
-      let wS = 0;
-      for (const rk of TRACK_RADII) {
-        const s2 = 2 * (rk * Math.max(0.5, ab)) ** 2;
-        let sx = 0, sy = 0, sz = 0;
-        wS = 0;
-        for (let i = seg.start; i < seg.start + seg.count; i++) {
+      const c = [...this.centers[gi]];
+      const win = bulkWindow(g.spec.disk.scale);
+      const out = this.meas[gi];
+      let sw2 = 0;
+      for (const f of TRACK_RADII) {
+        sw2 = 2 * (f * win) ** 2;
+        let sx = 0, sy = 0, sz = 0, wS = 0;
+        for (let i = 0; i < this.nS; i++) {
+          if (this.code[i] >> 2 !== gi) continue;
           const dx = this.x[i * 3] - c[0], dy = this.x[i * 3 + 1] - c[1], dz = this.x[i * 3 + 2] - c[2];
-          const w = this.m[i] * Math.exp(-(dx * dx + dy * dy + dz * dz) / s2);
+          const w = this.m[i] * Math.exp(-(dx * dx + dy * dy + dz * dz) / sw2);
           wS += w;
           sx += w * this.x[i * 3];
           sy += w * this.x[i * 3 + 1];
@@ -163,20 +191,52 @@ export class CpuNBody {
           c[2] = sz / wS;
         }
       }
-      // Velocity of the centre: same weights at the final radius.
-      const s2 = 2 * (TRACK_RADII[TRACK_RADII.length - 1] * Math.max(0.5, ab)) ** 2;
-      let vx = 0, vy = 0, vz = 0;
-      wS = 0;
-      for (let i = seg.start; i < seg.start + seg.count; i++) {
+      out.c = c;
+      let vx = 0, vy = 0, vz = 0, ax = 0, ay = 0, az = 0, wS = 0;
+      for (let i = 0; i < this.nS; i++) {
+        if (this.code[i] >> 2 !== gi) continue;
         const dx = this.x[i * 3] - c[0], dy = this.x[i * 3 + 1] - c[1], dz = this.x[i * 3 + 2] - c[2];
-        const w = this.m[i] * Math.exp(-(dx * dx + dy * dy + dz * dz) / s2);
+        const w = this.m[i] * Math.exp(-(dx * dx + dy * dy + dz * dz) / sw2);
         wS += w;
         vx += w * this.v[i * 3];
         vy += w * this.v[i * 3 + 1];
         vz += w * this.v[i * 3 + 2];
+        ax += w * this.a[i * 3];
+        ay += w * this.a[i * 3 + 1];
+        az += w * this.a[i * 3 + 2];
       }
-      if (wS > 0) this.centerVel[gi] = [vx / wS, vy / wS, vz / wS];
+      if (wS > 0) {
+        out.v = [vx / wS, vy / wS, vz / wS];
+        out.a = [ax / wS, ay / wS, az / wS];
+      }
     });
+  }
+
+  /** Advance the filtered centres by one step (leapfrog with the mean acceleration + corrections). */
+  filterCenters(dt: number): void {
+    const T = CENTER_TAU;
+    const n = this.data.galaxies.length;
+    // Predict: kick–drift with the previous mean acceleration.
+    for (let g = 0; g < n; g++) {
+      const c = this.centers[g], u = this.centerVel[g], a0 = this.centerAcc[g];
+      for (let k = 0; k < 3; k++) {
+        u[k] += 0.5 * dt * a0[k];
+        c[k] += dt * u[k];
+      }
+    }
+    this.measureCenters();
+    // Correct: second half-kick with the new mean acceleration, plus gentle pulls toward the
+    // measured centroid and mean velocity.
+    for (let g = 0; g < n; g++) {
+      const c = this.centers[g], u = this.centerVel[g], a0 = this.centerAcc[g];
+      const m = this.meas[g];
+      for (let k = 0; k < 3; k++) {
+        const d = m.c[k] - c[k];
+        u[k] += 0.5 * dt * m.a[k] + (dt * d) / (T.v * T.v) + (dt * (m.v[k] - u[k])) / T.u;
+        c[k] += (dt * d) / T.x;
+        a0[k] = m.a[k];
+      }
+    }
   }
 
   /** Smooth-field acceleration on a tracer at fraction f of the current step. */
@@ -223,29 +283,8 @@ export class CpuNBody {
   refitDisks(dtMyr: number): void {
     const k = 1 - Math.exp(-dtMyr / DISK_REFIT_TAU);
     this.data.galaxies.forEach((g, gi) => {
-      const c = this.centers[gi], cv = this.centerVel[gi];
-      const rc2 = diskMomentRadius(g.spec) ** 2;
-      let w = 0, Lx = 0, Ly = 0, Lz = 0;
-      let Sxx = 0, Syy = 0, Szz = 0, Sxy = 0, Sxz = 0, Syz = 0;
-      for (let i = 0; i < this.nT; i++) {
-        if (this.gal[i] !== gi || this.kind[i] === KIND_BULGE) continue;
-        const dx = this.tx[i * 3] - c[0], dy = this.tx[i * 3 + 1] - c[1], dz = this.tx[i * 3 + 2] - c[2];
-        const d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 > rc2) continue;
-        const wi = this.weight[i];
-        const ux = this.tv[i * 3] - cv[0], uy = this.tv[i * 3 + 1] - cv[1], uz = this.tv[i * 3 + 2] - cv[2];
-        w += wi;
-        Lx += wi * (dy * uz - dz * uy);
-        Ly += wi * (dz * ux - dx * uz);
-        Lz += wi * (dx * uy - dy * ux);
-        Sxx += wi * dx * dx;
-        Syy += wi * dy * dy;
-        Szz += wi * dz * dz;
-        Sxy += wi * dx * dy;
-        Sxz += wi * dx * dz;
-        Syz += wi * dy * dz;
-      }
-      applyDiskMoments(this.models[gi], this.spins[gi], g, { w, L: [Lx, Ly, Lz], S: [Sxx, Syy, Szz, Sxy, Sxz, Syz] }, k);
+      const mo = diskMoments(this.tx, this.tv, this.kind, this.gal, this.weight, gi, this.centers[gi], this.centerVel[gi], g.spec.disk.scale);
+      applyDiskMoments(this.models[gi], this.spins[gi], g, mo, k);
     });
   }
 
@@ -259,7 +298,7 @@ export class CpuNBody {
     this.skeletonForces();
     for (let i = 0; i < nS * 3; i++) v[i] += 0.5 * dt * a[i];
     this.prevCenters = this.centers.map((c) => [...c]);
-    this.track();
+    this.filterCenters(dt);
     this.stepTracers();
     this.refitDisks(dt);
     this.time += dt;
@@ -284,52 +323,4 @@ export class CpuNBody {
     }
     return { kinetic: K, potential: W, energy: K + W, momentum: P, angularMomentum: L };
   }
-}
-
-export interface DiskMoments {
-  /** Σ w inside the refit radius. */
-  w: number;
-  /** Σ w (d × u) — angular momentum about the centre. */
-  L: [number, number, number];
-  /** Σ w d_a d_b: xx, yy, zz, xy, xz, yz. */
-  S: [number, number, number, number, number, number];
-}
-
-/**
- * Refit a smooth disk from its tracer moments, relaxing toward the new values with weight k.
- * Shared by the CPU reference and the GPU system (which reads the moments back asynchronously).
- */
-export function applyDiskMoments(
-  model: SmoothModel,
-  spin: number[],
-  g: { spec: { disk: { mass: number; scale: number; height: number } }; moments0: { R2: number; z2: number; weightIn: number } },
-  mo: DiskMoments,
-  k: number,
-): void {
-  if (!(mo.w > 0)) return;
-  const Lm = Math.hypot(mo.L[0], mo.L[1], mo.L[2]);
-  if (Lm > 0) {
-    const nx = mo.L[0] / Lm, ny = mo.L[1] / Lm, nz = mo.L[2] / Lm;
-    spin[0] += k * (nx - spin[0]);
-    spin[1] += k * (ny - spin[1]);
-    spin[2] += k * (nz - spin[2]);
-    const s = Math.hypot(spin[0], spin[1], spin[2]) || 1;
-    spin[0] /= s;
-    spin[1] /= s;
-    spin[2] /= s;
-  }
-  const [nx, ny, nz] = spin;
-  const [Sxx, Syy, Szz, Sxy, Sxz, Syz] = mo.S;
-  const zz = nx * nx * Sxx + ny * ny * Syy + nz * nz * Szz + 2 * (nx * ny * Sxy + nx * nz * Sxz + ny * nz * Syz);
-  const tr = Sxx + Syy + Szz;
-  const z2 = Math.max(0, zz / mo.w);
-  const R2 = Math.max(1e-9, (tr - zz) / mo.w);
-  const d = g.spec.disk;
-  const mass = d.mass * Math.min(1, mo.w / g.moments0.weightIn);
-  const rd = d.scale * Math.sqrt(R2 / g.moments0.R2);
-  const z0 = d.height * Math.sqrt(Math.max(z2, 1e-12) / g.moments0.z2);
-  model.disk.mass += k * (mass - model.disk.mass);
-  model.disk.rd += k * (rd - model.disk.rd);
-  model.disk.z0 += k * (z0 - model.disk.z0);
-  updateSmoothDisk(model);
 }

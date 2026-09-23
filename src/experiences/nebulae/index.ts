@@ -3,6 +3,7 @@ import type { Experience, ExperienceContext, FrameInfo } from '../../core/types'
 import { OrbitRig } from '../../core/rigs/OrbitRig';
 import { Sky } from '../../worlds/sky/Sky';
 import { NebulaVolume } from '../../worlds/nebula/NebulaVolume';
+import { NebulaStars } from '../../worlds/nebula/NebulaStars';
 import type { NebulaVariant } from '../../worlds/nebula/types';
 import type { Palette } from '../../physics/nebulae';
 
@@ -12,6 +13,7 @@ class Nebulae implements Experience {
   private rig!: OrbitRig;
   private camera = new THREE.PerspectiveCamera(50, 1, 0.005, 5000);
   private volume: NebulaVolume | null = null;
+  private stars: NebulaStars | null = null;
   private variant: NebulaVariant = 'pillars';
   private seed = 0;
 
@@ -38,6 +40,9 @@ class Nebulae implements Experience {
       idleDelay: 10,
     });
     ctx.audio.setMood('nebulae', { intensity: 0.4 });
+    if (ctx.params.get('stars') !== '0') this.stars = new NebulaStars({ stars: this.volume.stars, fieldStars: ctx.params.has('field') ? Number(ctx.params.get('field')) : Math.round(2500 * Math.min(1, ctx.quality.detail + 0.3)), fieldRadius: 70, seed: 7 });
+    this.stars?.setVolume(this.volume);
+    if (this.stars && ctx.params.get('spikes')) this.stars.spikes = ctx.params.get('spikes') as 'none' | 'hubble' | 'jwst';
     await this.volume.bake(ctx.renderer, (f) => ctx.progress(f, 'Ionizing the gas'));
     ctx.signalReady();
   }
@@ -55,6 +60,7 @@ class Nebulae implements Experience {
     this.sky.render(r, this.camera, this.ctx.engine.pixelRatio);
     r.clearDepth();
     this.volume?.render(r, this.camera, target);
+    this.stars?.render(r, this.camera, target, this.ctx.engine.pixelRatio);
   }
 
   // ——— debug hooks (scripts/shot.mjs --eval) ———
@@ -72,6 +78,8 @@ class Nebulae implements Experience {
   unmount(): void {
     this.volume?.dispose();
     this.volume = null;
+    this.stars?.dispose();
+    this.stars = null;
     this.sky.dispose();
   }
 }

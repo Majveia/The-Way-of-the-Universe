@@ -53,10 +53,12 @@ export class ParticleMesh {
     this.deltaIm = new Float64Array(this.fft.im.length);
     this.green = new Float32Array(this.fft.re.length);
     const nzc = this.fft.nzc, half = n >> 1;
-    const p = opts.deconvolve ?? 1;
+    const p = opts.deconvolve ?? 2;
     const rs = opts.smoothing ?? 0;
     const w = (2 * Math.PI) / n;
     const sinc = (x: number) => (x === 0 ? 1 : Math.sin(x) / x);
+    // Response of the 4-point difference to a mode of wavenumber k (cell units), relative to ik.
+    const fd = (k: number) => (k === 0 ? 1 : (8 * Math.sin(k) - Math.sin(2 * k)) / (6 * k));
     for (let ix = 0; ix < n; ix++) {
       const fx = ix < half ? ix : ix - n;
       for (let iy = 0; iy < n; iy++) {
@@ -71,9 +73,18 @@ export class ParticleMesh {
           const k2 = kx * kx + ky * ky + kz * kz;
           let g = -1 / k2;
           if (p > 0) {
-            // CIC window per axis: sinc²(k Δ/2)
+            // CIC window per axis: sinc²(kΔ/2); deconvolve the assignment (and interpolation) smoothing.
             const W = (sinc(kx / 2) * sinc(ky / 2) * sinc(kz / 2)) ** 2;
-            g /= Math.pow(Math.max(W, 0.05), p);
+            let comp = 1 / Math.pow(W, p);
+            // Compensate the finite-difference gradient with the component-weighted mean of 1/D(k_i):
+            // exact for modes along an axis or a diagonal, within a fraction of a per cent otherwise.
+            comp *= (kx * kx / Math.max(fd(kx), 0.05) + ky * ky / Math.max(fd(ky), 0.05) + kz * kz / Math.max(fd(kz), 0.05)) / k2;
+            // Never amplify by more than ×2.5 (noise and aliasing live near Nyquist), and roll the
+            // compensation off smoothly over the top third of the band.
+            comp = Math.min(comp, 2.5);
+            const kk = Math.sqrt(k2) / Math.PI;
+            if (kk > 0.6) comp = 1 + (comp - 1) * Math.exp(-(((kk - 0.6) / 0.25) ** 2));
+            g *= comp;
           }
           if (rs > 0) g *= Math.exp(-k2 * rs * rs);
           this.green[idx] = g;

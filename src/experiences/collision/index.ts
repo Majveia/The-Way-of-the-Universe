@@ -1,3 +1,3 @@
-import { placeholder } from '../placeholder';
+import { CollisionExperience } from './Collision';
 
-export default () => placeholder('This world is being built.');
+export default () => new CollisionExperience();

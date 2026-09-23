@@ -16,7 +16,29 @@
  * Lengths in h⁻¹ Mpc, k in h Mpc⁻¹. Fields are normalised to z = 0 linear theory (D1 = 1).
  */
 import { RealFFT3D } from './cosmosFFT';
-import { hashInts } from './random';
+
+/** murmur3 32-bit finaliser: full avalanche of one word. */
+function fmix32(h: number): number {
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+/**
+ * Independent 32-bit hash of an integer wavevector, seed and stream. Every input passes through a
+ * full avalanche so that different streams (and neighbouring modes) are uncorrelated — correlated
+ * draws would bias the phases and make all modes add up coherently at the origin.
+ */
+export function modeHash(kx: number, ky: number, kz: number, seed: number, stream: number): number {
+  let h = fmix32((seed ^ 0x9e3779b9) >>> 0);
+  h = fmix32((h + Math.imul(kx | 0, 0x27d4eb2f)) >>> 0);
+  h = fmix32((h ^ Math.imul(ky | 0, 0x165667b1)) >>> 0);
+  h = fmix32((h + Math.imul(kz | 0, 0x9e3779b1)) >>> 0);
+  return fmix32((h ^ Math.imul(stream + 1, 0x85ebca77)) >>> 0);
+}
 
 export interface GaussianFieldParams {
   /** Mesh cells per side (power of two). */
@@ -60,8 +82,8 @@ export class GaussianField {
     const seed = p.seed | 0;
     const fixed = !!p.fixedAmplitude;
     const draw = (kx: number, ky: number, kz: number, out: { r: number; i: number }) => {
-      const h1 = hashInts(kx, ky, kz, seed);
-      const h2 = hashInts(kx, ky, kz, seed ^ 0x5bd1e995);
+      const h1 = modeHash(kx, ky, kz, seed, 0);
+      const h2 = modeHash(kx, ky, kz, seed, 1);
       const u1 = (h1 + 0.5) / 4294967296;
       const u2 = (h2 + 0.5) / 4294967296;
       const r = fixed ? Math.SQRT2 : Math.sqrt(-2 * Math.log(u1));

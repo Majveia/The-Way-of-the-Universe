@@ -176,7 +176,6 @@ export class NebulaVolume {
       magFilter: THREE.LinearFilter,
       wrapS: wrap,
       wrapT: wrap,
-      wrapR: wrap,
       depthBuffer: false,
       stencilBuffer: false,
       generateMipmaps: false,
@@ -189,6 +188,9 @@ export class NebulaVolume {
     ];
     const dn = this.quality.detailN;
     this.detailRT = new THREE.WebGL3DRenderTarget(dn, dn, dn, opts3(THREE.UnsignedByteType, THREE.RepeatWrapping));
+    // (wrapR is not a RenderTarget option; set it on the 3D textures directly.)
+    this.detailRT.texture.wrapR = THREE.RepeatWrapping;
+    for (const t of [this.dens, ...this.fields]) t.texture.wrapR = THREE.ClampToEdgeWrapping;
 
     const base = { vertexShader: FULLSCREEN_VERT, glslVersion: THREE.GLSL3, depthTest: false, depthWrite: false };
     this.matDetail = new THREE.ShaderMaterial({

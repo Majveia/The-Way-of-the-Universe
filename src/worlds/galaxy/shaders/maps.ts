@@ -61,9 +61,9 @@ void main() {
     float wig = uFloc * (0.22 * nLarge + 0.1 * nMid);
     float d = wrapPi(phi - armPhiK(k, R) + wig) * R * sinI;
     float brk = mix(1.0, smoothstep(-0.35, 0.25, nLarge + 0.3 * nMid), uFloc * 0.8);
-    young += w * brk * exp(-0.5 * sq((d - sd * 0.45 * sig) / (1.15 * sig)));
+    young += w * brk * exp(-0.5 * sq((d - sd * 0.45 * sig) / (0.95 * sig)));
     hii += w * brk * exp(-0.5 * sq((d - sd * 0.55 * sig) / (0.7 * sig)));
-    lane += w * mix(1.0, brk, 0.6) * exp(-0.5 * sq((d + sd * 0.55 * sig) / (0.36 * sig)));
+    lane += w * mix(1.0, brk, 0.6) * exp(-0.5 * sq((d + sd * 0.6 * sig) / (0.5 * sig)));
     armGas += w * exp(-0.5 * sq((d + sd * 0.15 * sig) / (1.4 * sig)));
   }
 
@@ -73,11 +73,11 @@ void main() {
 
   // Scattered (non-arm) star formation: clumps and a faint floor.
   float clumps = pow(max(0.0, nKnot + 0.25), 2.0) * (0.4 + 1.6 * uClump) + pow(max(0.0, nMid + 0.1), 3.0) * 2.0 * uClump;
-  float field = (1.0 - uArmFrac) * clumps + 0.06;
+  float field = (1.0 - uArmFrac) * clumps + 0.025;
 
   float youngS = env * (uArmFrac * young * (0.75 + 0.5 * max(0.0, nMid + 0.5)) + field * 0.9);
   // HII regions are knots: thresholded noise along the star-forming ridge.
-  float knots = pow(max(0.0, nKnot + 0.18), 2.2) * 3.5 + 0.12 * pow(max(0.0, nFine + 0.3), 2.0);
+  float knots = pow(max(0.0, nKnot + 0.12), 3.2) * 9.0 + 0.08 * pow(max(0.0, nFine + 0.3), 2.0);
   float hiiS = env * (uArmFrac * hii * knots + field * knots * 0.7);
 
   // Dust: a smooth exponential disk with a bar-swept hole, plus arm lanes and clumpy clouds.

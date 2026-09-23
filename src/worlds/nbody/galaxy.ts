@@ -402,30 +402,38 @@ export function realizeGalaxy(spec: GalaxySpec, sk: SkeletonCounts, tr: TracerCo
   const mDisk = (spec.disk.mass * dFrac) / Math.max(1, sk.disk);
   let p = 0;
   const tmp = [0, 0, 0];
+  // Symmetrised ("quiet") sampling: particles come in antipodal pairs (x, v) / (−x, −v), which
+  // zeroes every odd multipole of the sampling noise — in particular the dipole, so the bulge,
+  // disk and halo share one centre and the galaxy has exactly zero momentum (McMillan & Dehnen 2007).
   const placeSphere = (n: number, a: number, frac: number, m: number, comp: number) => {
-    for (let i = 0; i < n; i++, p++) {
-      // Stratified in mass fraction for a quieter start.
-      const u = ((i + rng.next()) / n) * frac;
+    const half = n >> 1;
+    for (let i = 0; i < half; i++, p += 2) {
+      const u = ((i + rng.next()) / half) * frac;
       const r = hernquistInverseMass(a, u);
       isotropic(rng, r, tmp, 0);
-      sPos[p * 3] = tmp[0];
-      sPos[p * 3 + 1] = tmp[1];
-      sPos[p * 3 + 2] = tmp[2];
-      sMass[p] = m;
-      sComp[p] = comp;
+      for (let k = 0; k < 3; k++) {
+        sPos[p * 3 + k] = tmp[k];
+        sPos[p * 3 + 3 + k] = -tmp[k];
+      }
+      sMass[p] = sMass[p + 1] = m;
+      sComp[p] = sComp[p + 1] = comp;
     }
   };
   placeSphere(sk.halo, spec.halo.scale, hFrac, mHalo, COMP_HALO);
   placeSphere(sk.bulge, spec.bulge.scale, bFrac, mBulge, COMP_BULGE);
-  for (let i = 0; i < sk.disk; i++, p++) {
-    const u = ((i + rng.next()) / sk.disk) * dFrac;
+  for (let i = 0; i < sk.disk >> 1; i++, p += 2) {
+    const u = ((i + rng.next()) / (sk.disk >> 1)) * dFrac;
     const R = expDiskInverse(u) * Rd;
     const ph = rng.next() * 2 * Math.PI;
+    const z = sech2Height(rng, z0);
     sPos[p * 3] = R * Math.cos(ph);
     sPos[p * 3 + 1] = R * Math.sin(ph);
-    sPos[p * 3 + 2] = sech2Height(rng, z0);
-    sMass[p] = mDisk;
-    sComp[p] = COMP_DISK;
+    sPos[p * 3 + 2] = z;
+    sPos[p * 3 + 3] = -R * Math.cos(ph);
+    sPos[p * 3 + 4] = -R * Math.sin(ph);
+    sPos[p * 3 + 5] = -z;
+    sMass[p] = sMass[p + 1] = mDisk;
+    sComp[p] = sComp[p + 1] = COMP_DISK;
   }
 
   // ——— Skeleton velocities: halo & bulge from Eddington DFs in the total (softened) potential ———
@@ -442,11 +450,12 @@ export function realizeGalaxy(spec: GalaxySpec, sk: SkeletonCounts, tr: TracerCo
     rMin: 1e-4,
     rMax: 1e3 * spec.halo.rmax,
   });
-  for (let i = 0; i < sk.halo + sk.bulge; i++) {
+  for (let i = 0; i < sk.halo + sk.bulge; i += 2) {
     const x = sPos[i * 3], y = sPos[i * 3 + 1], z = sPos[i * 3 + 2];
     const r = Math.hypot(x, y, z);
     const v = (sComp[i] === COMP_HALO ? dfHalo : dfBulge).sampleSpeed(rng, r);
     isotropic(rng, v, sVel, i * 3);
+    for (let k = 0; k < 3; k++) sVel[i * 3 + 3 + k] = -sVel[i * 3 + k];
   }
 
   // Skeleton disk: v_c from the actual softened field of the realised skeleton (azimuthal average).
@@ -499,10 +508,11 @@ export function realizeGalaxy(spec: GalaxySpec, sk: SkeletonCounts, tr: TracerCo
     sigmaR: sigmaRFromQ(spec, skelCurve, spec.disk.Q, Rd),
     dlnRhoSigma2: (R) => -2 * (R / Rd),
   };
-  for (let i = sk.halo + sk.bulge; i < nS; i++) {
+  for (let i = sk.halo + sk.bulge; i < nS; i += 2) {
     diskVelocity(rng, skelDisk, sPos[i * 3], sPos[i * 3 + 1], sPos[i * 3 + 2], sVel, i * 3);
+    for (let k = 0; k < 3; k++) sVel[i * 3 + 3 + k] = -sVel[i * 3 + k];
   }
-  // Remove net momentum / centre-of-mass offset (sampling noise).
+  // Pairs already cancel; remove residual round-off of the centre of mass and momentum.
   let M = 0, cx = 0, cy = 0, cz = 0, px = 0, py = 0, pz = 0;
   for (let i = 0; i < nS; i++) {
     const m = sMass[i];

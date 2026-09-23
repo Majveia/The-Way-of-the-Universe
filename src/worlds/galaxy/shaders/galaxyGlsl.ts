@@ -111,7 +111,7 @@ void youngState(float Rg, float cidF, float midF, float mass, float tau, float T
   cycle = nF;
   uint n = uint(int(nF));
   uint h = hash2u(cid, n);
-  float active = u01(hash2u(cid, 0x51abu)) < uSfrActive ? 1.0 : 0.0;
+  float sfOn = u01(hash2u(cid, 0x51abu)) < uSfrActive ? 1.0 : 0.0;
 
   float OmG = lutAt(Rg, 0).x;
   float wsum = 0.0;
@@ -169,7 +169,7 @@ void youngState(float Rg, float cidF, float midF, float mass, float tau, float T
     L = L0 * 1.6;
     T = red ? 3650.0 + 500.0 * u01(hash2u(cid, mid + 99u)) : T0 * 0.75;
   }
-  L *= active * uSfrBright;
+  L *= sfOn * uSfrBright;
 }
 
 void particleState(vec4 a0, vec4 a1, vec4 a2, float t, out vec3 P, out float L, out float T) {

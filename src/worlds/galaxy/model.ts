@@ -57,7 +57,7 @@ export interface GalaxyParticles {
 }
 
 /** Fraction of each population's light carried by particles (the rest is the diffuse volume). */
-export const PARTICLE_LIGHT = { disk: 0.34, thick: 0.34, bar: 0.3, bulge: 0.3, young: 0.72, halo: 1, globular: 1 } as const;
+export const PARTICLE_LIGHT = { disk: 0.15, thick: 0.15, bar: 0.12, bulge: 0.12, young: 0.4, halo: 1, globular: 1 } as const;
 
 /** Live, user-controlled parameters shared by the GPU and the CPU mirror. */
 export interface GalaxyLive {
@@ -82,27 +82,27 @@ type ClassTable = ReadonlyArray<[prob: number, tLo: number, tHi: number, wLo: nu
 const CLASSES: Record<'disk' | 'thick' | 'bulge' | 'halo', ClassTable> = {
   // dwarfs G/K, A/F main sequence, red clump & K giants, M giants
   disk: [
-    [0.55, 4400, 6100, 0.3, 1.5],
-    [0.12, 6600, 9800, 2, 10],
-    [0.25, 4300, 5000, 5, 30],
-    [0.08, 3300, 3900, 10, 80],
+    [0.55, 4600, 6200, 0.4, 1.5],
+    [0.14, 6800, 10000, 2, 8],
+    [0.24, 4400, 5100, 3, 12],
+    [0.07, 3500, 4000, 5, 22],
   ],
   thick: [
-    [0.6, 4600, 5900, 0.3, 1.3],
-    [0.3, 4200, 4900, 5, 28],
-    [0.1, 3400, 3900, 10, 60],
+    [0.6, 4700, 5900, 0.4, 1.3],
+    [0.3, 4300, 5000, 3, 12],
+    [0.1, 3500, 4000, 5, 20],
   ],
   bulge: [
-    [0.5, 4500, 5700, 0.3, 1.2],
-    [0.35, 4000, 4800, 5, 30],
-    [0.15, 3200, 3800, 12, 90],
+    [0.5, 4600, 5700, 0.4, 1.2],
+    [0.35, 4100, 4900, 3, 12],
+    [0.15, 3400, 3900, 5, 25],
   ],
   // metal-poor: warmer giants, blue horizontal branch, RR Lyrae
   halo: [
-    [0.55, 5000, 6200, 0.3, 1.2],
-    [0.3, 4300, 5200, 5, 25],
-    [0.1, 7500, 10000, 5, 15],
-    [0.05, 6000, 7200, 5, 10],
+    [0.55, 5000, 6200, 0.4, 1.2],
+    [0.3, 4300, 5200, 2, 8],
+    [0.1, 7500, 10000, 2, 6],
+    [0.05, 6000, 7200, 2, 5],
   ],
 };
 
@@ -150,7 +150,7 @@ export function generateParticles(params: GalaxyParams, n: number): GalaxyPartic
     bar: P.bar.lum > 0 && P.bar.strength > 0 ? 0.1 : 0,
     bulge: P.bulge.lum > 0 ? (P.disk.lum > 0 ? 0.075 : 0.86) : 0,
     young: P.young.lum > 0 && P.young.sfr > 0 ? 0.2 : 0,
-    halo: P.halo.lum > 0 ? 0.03 : 0,
+    halo: P.halo.lum > 0 ? 0.045 : 0,
     globular: P.globulars.count > 0 ? (P.disk.lum > 0 ? 0.02 : 0.06) : 0,
   };
   const wsum = Object.values(want).reduce((a, b) => a + b, 0);
@@ -361,10 +361,12 @@ export function generateParticles(params: GalaxyParams, n: number): GalaxyPartic
         }
         made += nm;
       }
-      const lum = P.young.lum * PARTICLE_LIGHT.young;
-      const k = lumAvg > 0 ? lum / lumAvg : 0;
+      // Particles keep (nearly) real stellar luminosities: the boost is capped at ×1.5, and any light
+      // the sampled stars cannot carry stays in the diffuse young component of the volume.
+      const want = P.young.lum * PARTICLE_LIGHT.young;
+      const k = lumAvg > 0 ? Math.min(want / lumAvg, 1.5) : 0;
       for (let i = start; i < start + made; i++) data[i * STRIDE + 10] *= k;
-      populations.push({ name: 'young', kind: KIND_YOUNG, start, count: made, lum });
+      populations.push({ name: 'young', kind: KIND_YOUNG, start, count: made, lum: lumAvg * k });
     }
   }
 

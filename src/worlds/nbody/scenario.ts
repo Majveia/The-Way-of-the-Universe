@@ -9,6 +9,7 @@ import {
   type Softening,
 } from './galaxy';
 import { diskRotation, keplerStart, rotate, type OrbitSpec, type RelativeState } from './orbit';
+import { MOMENT_HARD, MOMENT_SIGMA, type DiskMomentsRef } from './moments';
 
 /**
  * A two-galaxy encounter, laid out for the GPU.
@@ -69,14 +70,23 @@ export interface GalaxyInfo {
   tracerRows: [number, number];
   /** Skeleton bulge segment (for centre tracking). */
   bulge: Segment;
-  /** Initial second moments of the disk tracers (for smooth-disk refits). */
-  moments0: { R2: number; z2: number; weightIn: number; weightAll: number };
+  /** Initial moments of the disk tracers (calibrate smooth-disk refits). */
+  moments0: DiskMomentsRef;
 }
 
 export interface ScenarioData {
   def: ScenarioDef;
   skeleton: { n: number; width: number; pos: Float32Array; vel: Float32Array; segments: Segment[] };
-  tracers: { n: number; width: number; rows: number; pos: Float32Array; vel: Float32Array; attr: Float32Array };
+  tracers: {
+    n: number;
+    width: number;
+    rows: number;
+    pos: Float32Array;
+    vel: Float32Array;
+    attr: Float32Array;
+    /** Contiguous index ranges [start, count) per population (one per galaxy). */
+    ranges: { bulge: Array<[number, number]>; disk: Array<[number, number]>; gas: Array<[number, number]> };
+  };
   galaxies: [GalaxyInfo, GalaxyInfo];
   relative: RelativeState;
 }
@@ -92,8 +102,6 @@ export function defaultSoftening(spec: GalaxySpec): Softening {
   };
 }
 
-/** Radius inside which the smooth disk is refit from its tracers. */
-export const diskMomentRadius = (spec: GalaxySpec) => 5 * spec.disk.scale;
 
 /** Partition the particle budgets between two galaxies and their components. */
 export function allocateCounts(def: ScenarioDef, counts: ScenarioCounts) {
@@ -190,20 +198,21 @@ export function buildScenario(def: ScenarioDef, counts: ScenarioCounts): Scenari
     const rot = rots[g];
     const row0 = q / TRACER_WIDTH;
     const n = R.tracers.kind.length;
-    // Moments of the disk tracers (local frame) for later smooth-disk refits.
-    const rCut = diskMomentRadius(R.spec);
-    let wIn = 0, wAll = 0, R2 = 0, z2 = 0;
+    // Moments of the disk tracers (local frame, spin = z) with the refit estimator.
+    const rd = R.spec.disk.scale;
+    const hard2 = (MOMENT_HARD * rd) ** 2, s2 = 2 * (MOMENT_SIGMA * rd) ** 2;
+    let wIn = 0, wG = 0, R2 = 0, z2 = 0;
     for (let i = 0; i < n; i++, q++) {
       const x = R.tracers.pos[i * 3], y = R.tracers.pos[i * 3 + 1], z = R.tracers.pos[i * 3 + 2];
       const kind = R.tracers.kind[i];
       const w = R.tracers.weight[i];
       if (kind !== 0) {
-        wAll += w;
-        if (x * x + y * y + z * z < rCut * rCut) {
-          wIn += w;
-          R2 += w * (x * x + y * y);
-          z2 += w * z * z;
-        }
+        const d2 = x * x + y * y + z * z;
+        if (d2 < hard2) wIn += w;
+        const wg = w * Math.exp(-d2 / s2);
+        wG += wg;
+        R2 += wg * (x * x + y * y);
+        z2 += wg * z * z;
       }
       rotate(rot, x, y, z, tmpA);
       rotate(rot, R.tracers.vel[i * 3], R.tracers.vel[i * 3 + 1], R.tracers.vel[i * 3 + 2], tmpB);
@@ -235,13 +244,23 @@ export function buildScenario(def: ScenarioDef, counts: ScenarioCounts): Scenari
       softening: soft[g],
       tracerRows: [row0, n / TRACER_WIDTH],
       bulge: segs.find((s) => s.comp === COMP_BULGE && s.galaxy === g)!,
-      moments0: { R2: R2 / Math.max(wIn, 1e-30), z2: z2 / Math.max(wIn, 1e-30), weightIn: wIn, weightAll: wAll },
+      moments0: { wIn, R2: R2 / Math.max(wG, 1e-30), z2: z2 / Math.max(wG, 1e-30) },
     });
+  }
+  // Tracers are laid out per galaxy as [bulge | disk | gas] (see realizeGalaxy).
+  const ranges = { bulge: [] as Array<[number, number]>, disk: [] as Array<[number, number]>, gas: [] as Array<[number, number]> };
+  let o = 0;
+  for (const R of reals) {
+    const c = R.tracers.counts;
+    ranges.bulge.push([o, c.bulge]);
+    ranges.disk.push([o + c.bulge, c.disk]);
+    ranges.gas.push([o + c.bulge + c.disk, c.gas]);
+    o += c.bulge + c.disk + c.gas;
   }
   return {
     def,
     skeleton: { n: nS, width: SKELETON_WIDTH, pos: sPos, vel: sVel, segments: segs },
-    tracers: { n: nT, width: TRACER_WIDTH, rows: nT / TRACER_WIDTH, pos: tPos, vel: tVel, attr: tAttr },
+    tracers: { n: nT, width: TRACER_WIDTH, rows: nT / TRACER_WIDTH, pos: tPos, vel: tVel, attr: tAttr, ranges },
     galaxies: [infos[0], infos[1]],
     relative: rel,
   };

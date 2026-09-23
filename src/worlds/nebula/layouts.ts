@@ -73,11 +73,13 @@ function pillarsLayout(p: NebulaPreset, seed: number): VariantLayout {
       G[g++].set(t[0] + d.x * 0.3, t[1] + Math.abs(d.y) * 0.25 + 0.05, t[2] + d.z * 0.3, rng.range(0.035, 0.07));
     }
   }
-  const nBok = curated ? 5 : 3 + rng.int(5);
+  // Bok globules: dark knots adrift in the far half of the cavity, silhouetted on the glowing wall.
+  const nBok = curated ? 3 : 2 + rng.int(3);
   for (let j = 0; j < nBok && g < 16; j++) {
-    const d = rng.onSphere();
-    const r = cavityR * rng.range(0.45, 0.85);
-    G[g++].set(src[0] + d.x * r, src[1] + d.y * r * 0.7 - 0.4, src[2] + d.z * r * 0.6, rng.range(0.06, 0.13));
+    const az = rng.range(-2.6, -0.6);
+    const el = rng.range(-0.5, 0.35);
+    const r = cavityR * rng.range(0.72, 0.92);
+    G[g++].set(src[0] + Math.cos(az) * Math.cos(el) * r, src[1] + Math.sin(el) * r, src[2] + Math.sin(-az) * Math.cos(el) * r * 0.5 + 0.8, rng.range(0.1, 0.16));
   }
   const seedOffset: Vec3 = curated ? [11.7, 3.2, 7.9] : [rng.range(-50, 50), rng.range(-50, 50), rng.range(-50, 50)];
   const stars = [
