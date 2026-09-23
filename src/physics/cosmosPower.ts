@@ -17,6 +17,14 @@
  */
 
 const E = Math.E;
+/**
+ * EH98 (no massive neutrinos) with Planck 2018's A_s = 2.105e-9 gives σ8 = 0.829, 2 % above the
+ * Boltzmann-code value 0.8102 (EH98 fit error + the 0.06 eV neutrino suppression). This factor,
+ * (0.8102/0.8289)², calibrates the primordial normalisation so both modes agree for Planck 2018.
+ */
+export const AS_CALIBRATION = 0.9554;
+/** Planck 2018 primordial scalar amplitude at k = 0.05 Mpc⁻¹ (Paper VI, TT,TE,EE+lowE+lensing+BAO). */
+export const PLANCK18_AS = 2.105e-9;
 /** Present-day critical density, h² M☉ Mpc⁻³ (= 3H0²/8πG). */
 export const RHO_CRIT_H2 = 2.77536627e11;
 const C_KMS = 299792.458;
@@ -168,7 +176,8 @@ export class LinearPower {
       const gmd = p.growthMD ?? 1;
       const c100 = C_KMS / 100;
       const kp = 0.05 / p.h;
-      this.amplitude = (2 * Math.PI * Math.PI * (4 / 25) * p.As * kp ** (1 - p.ns) * c100 ** 4 * gmd * gmd) / (p.Om0 * p.Om0);
+      this.amplitude =
+        (AS_CALIBRATION * 2 * Math.PI * Math.PI * (4 / 25) * p.As * kp ** (1 - p.ns) * c100 ** 4 * gmd * gmd) / (p.Om0 * p.Om0);
     } else {
       this.amplitude = 1;
       this.amplitude = ((p.sigma8 ?? 0.8102) / this.sigmaR(8)) ** 2;
