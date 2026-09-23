@@ -48,7 +48,6 @@ export function friendsOfFriends(
     packed[j] = ((cx * nc + cy) * nc + cz) * mul + j;
   }
   packed.sort();
-  const order = new Uint32Array(M); // candidate slot → position in sorted order
   const sortedP = new Uint32Array(M); // sorted particle index
   const keys = new Float64Array(M);
   for (let s = 0; s < M; s++) {
@@ -57,7 +56,6 @@ export function friendsOfFriends(
     const j = v - key * mul;
     keys[s] = key;
     sortedP[s] = candidates[j];
-    order[j] = s;
   }
   // Cell table: unique keys → [start, end).
   let cells = 0;
@@ -165,6 +163,5 @@ export function friendsOfFriends(
     const g = gid[find(s)];
     if (g >= 0) members[fill[g]++] = sortedP[s];
   }
-  void order;
   return { groups: roots.length, groupStart, members };
 }
