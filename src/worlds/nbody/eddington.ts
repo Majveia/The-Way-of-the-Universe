@@ -32,9 +32,6 @@ export class EddingtonDF {
   readonly f: Float64Array;
   private readonly lnE: Float64Array;
   private readonly lnf: Float64Array;
-  /** Radius grid (descending Ψ). */
-  private readonly r: Float64Array;
-  private readonly psiR: Float64Array;
   private readonly psiFn: (r: number) => number;
   /** Number of E samples where the inversion went negative (clamped to 0). */
   readonly negatives: number;
@@ -92,22 +89,28 @@ export class EddingtonDF {
     // Boundary term dρ/dΨ at Ψ→0 (evaluated at rMax).
     const drhodpsi0 = inp.drho(r[nR - 1]) / dpsi[nR - 1];
 
+    // ℰ grid follows the radius grid (ℰ_k = Ψ(r_k)), so resolution is logarithmic both in
+    // ℰ → 0 (large r) and in Ψ₀ − ℰ → 0 (the cusp), where f diverges.
     const E = new Float64Array(nE);
     const f = new Float64Array(nE);
-    const e0 = Math.log(P[0] * 1.001), e1 = Math.log(P[nR - 1] * 0.999);
     const NS = 512; // Simpson intervals (even)
     let neg = 0;
+    const lq0 = Math.log(inp.rMin * 1.02), lq1 = Math.log(inp.rMax * 0.98);
     for (let k = 0; k < nE; k++) {
-      const En = Math.exp(e0 + ((e1 - e0) * k) / (nE - 1));
+      // k = 0 → largest radius (smallest ℰ); ascending ℰ.
+      const rr = Math.exp(lq1 + ((lq0 - lq1) * k) / (nE - 1));
+      const En = inp.psi(rr);
       const T = Math.sqrt(En);
-      const dt = T / NS;
+      // Concentrate Simpson nodes near t = 0 (Ψ → ℰ), where g peaks: t = T·u².
       let s = 0;
+      const du = 1 / NS;
       for (let j = 0; j <= NS; j++) {
-        const t = j * dt;
+        const u = j * du;
+        const t = T * u * u;
         const w = j === 0 || j === NS ? 1 : j % 2 ? 4 : 2;
-        s += w * 2 * gAt(En - t * t);
+        s += w * 2 * gAt(En - t * t) * 2 * T * u;
       }
-      s *= dt / 3;
+      s *= du / 3;
       s += drhodpsi0 / Math.sqrt(En);
       let fv = s / (Math.sqrt(8) * Math.PI * Math.PI);
       if (!(fv > 0)) {
@@ -125,27 +128,33 @@ export class EddingtonDF {
     let minPos = Infinity;
     for (const v of f) if (v > 0 && v < minPos) minPos = v;
     this.lnf = f.map((v) => Math.log(v > 0 ? v : minPos * 1e-6));
-    this.r = r;
-    this.psiR = psi;
   }
 
   /** Distribution function f(ℰ) (log-log interpolation; 0 for unbound ℰ ≤ 0). */
   df(E: number): number {
     if (E <= 0) return 0;
-    const lnE = this.lnE, lnf = this.lnf;
-    const n = lnE.length;
-    const x = Math.log(E);
-    if (x <= lnE[0]) {
+    const Et = this.E, lnE = this.lnE, lnf = this.lnf;
+    const n = Et.length;
+    if (E <= Et[0]) {
       // Power-law extrapolation toward ℰ → 0.
       const slope = (lnf[1] - lnf[0]) / (lnE[1] - lnE[0]);
-      return Math.exp(lnf[0] + slope * (x - lnE[0]));
+      return Math.exp(lnf[0] + slope * (Math.log(E) - lnE[0]));
     }
-    if (x >= lnE[n - 1]) return Math.exp(lnf[n - 1]);
-    // Uniform spacing in ln E.
-    const u = ((x - lnE[0]) / (lnE[n - 1] - lnE[0])) * (n - 1);
-    const i = Math.min(n - 2, Math.floor(u));
-    const t = u - i;
-    return Math.exp(lnf[i] + t * (lnf[i + 1] - lnf[i]));
+    if (E >= Et[n - 1]) return Math.exp(lnf[n - 1]);
+    let lo = 0, hi = n - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (Et[mid] <= E) lo = mid;
+      else hi = mid;
+    }
+    // Interpolate ln f linearly in ln(Ψ₀ − ℰ) near the top, ln ℰ elsewhere: use the local
+    // variable with the larger relative change between the bracketing nodes.
+    const top = Et[n - 1] * 1.000001;
+    const a0 = Math.log(top - Et[lo]), a1 = Math.log(top - Et[hi]);
+    const b0 = lnE[lo], b1 = lnE[hi];
+    const useTop = Math.abs(a1 - a0) > Math.abs(b1 - b0);
+    const t = useTop ? (Math.log(top - E) - a0) / (a1 - a0) : (Math.log(E) - b0) / (b1 - b0);
+    return Math.exp(lnf[lo] + t * (lnf[hi] - lnf[lo]));
   }
 
   /**

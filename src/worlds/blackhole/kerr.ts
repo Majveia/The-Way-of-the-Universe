@@ -557,10 +557,30 @@ export interface TraceOptions {
  * p_z) of the *time-reversed* photon (k = −p), built as k_μ = −E0_μ + dⁱ E_iμ from a tetrad.
  * Same algorithm as the GPU shader (adaptive RK4, h ∝ r), with float64 precision.
  */
+/** dr/dλ (Boyer–Lindquist r) from a state and its derivative: ∇r · dx/dλ. */
+export function radialVelocity(a: number, s: ArrayLike<number>, d: ArrayLike<number>, r = ksRadius(a, s[0], s[1], s[2])): number {
+  const a2 = a * a;
+  const A = s[0] * s[0] + s[1] * s[1] + s[2] * s[2] - a2;
+  const D = Math.sqrt(A * A + 4 * a2 * s[2] * s[2]) || 1e-12;
+  return (r * (s[0] * d[0] + s[1] * d[1]) + (s[2] * (r * r + a2) * d[2]) / r) / D;
+}
+
+/**
+ * Radius inside which an ingoing ray can never turn around (between r₊ and the prograde photon
+ * orbit, the smallest radius any escaping photon can reach). Backward-traced rays that would
+ * otherwise creep towards the past horizon — where the ingoing Kerr–Schild momentum diverges
+ * like 1/Δ — are declared captured here.
+ */
+export const captureRadius = (a: number): number => {
+  const rh = horizonRadius(a);
+  return rh + 0.5 * (photonOrbitRadius(a, true) - rh);
+};
+
 export function traceRay(a: number, pos: Vec3, kCov: Vec4, o: TraceOptions = {}): RayResult {
   const eps = o.eps ?? 0.04;
   const maxSteps = o.maxSteps ?? 20000;
   const rH = horizonRadius(a);
+  const rCap = captureRadius(a);
   const r0 = ksRadius(a, pos[0], pos[1], pos[2]);
   const rEsc = o.rEscape ?? Math.max(r0 * 1.05, 60);
   const s = new Float64Array([pos[0], pos[1], pos[2], kCov[1], kCov[2], kCov[3]]);
@@ -582,8 +602,8 @@ export function traceRay(a: number, pos: Vec3, kCov: Vec4, o: TraceOptions = {})
     const r = ksRadius(a, s[0], s[1], s[2]);
     rMin = Math.min(rMin, r);
     ksRhs(a, s, pt, d);
-    const vr = s[0] * d[0] + s[1] * d[1] + s[2] * d[2]; // ∝ dρ/dλ
-    if (r < rH * 1.0005 + 1e-3 && !(insideStart && vr > 0)) {
+    const vr = radialVelocity(a, s, d, r);
+    if (vr < 0 && r < (insideStart ? rH * 1.0005 : rCap)) {
       fate = 'captured';
       break;
     }
@@ -591,7 +611,12 @@ export function traceRay(a: number, pos: Vec3, kCov: Vec4, o: TraceOptions = {})
       fate = 'escaped';
       break;
     }
-    const h = eps * Math.max(r, 0.2) * (r > 40 ? 3 : 1);
+    // Step control: a fixed fraction of r in coordinate length, and never more than a fraction of
+    // the momentum's e-folding "time" (keeps RK4 stable where p grows near the horizon).
+    const speed = Math.hypot(d[0], d[1], d[2]) + 1e-12;
+    const pn = Math.hypot(s[3], s[4], s[5]) + 1e-12;
+    const dpn = Math.hypot(d[3], d[4], d[5]) + 1e-12;
+    const h = Math.min((eps * Math.max(r, 0.2) * (r > 40 ? 3 : 1)) / speed, (8 * eps * pn) / dpn);
     const z0 = s[2];
     const x0 = s[0], y0 = s[1];
     rk4Step(a, s, pt, h, work);
@@ -610,7 +635,11 @@ export function traceRay(a: number, pos: Vec3, kCov: Vec4, o: TraceOptions = {})
     if (dphi < -Math.PI) dphi += 2 * Math.PI;
     sweep += dphi;
     prevPhi = phi;
-    if (!s.every(Number.isFinite)) break;
+    if (!s.every(Number.isFinite)) {
+      // Only happens for rays diving at the horizon faster than the step control can follow.
+      fate = 'captured';
+      break;
+    }
   }
   ksRhs(a, s, pt, d);
   let dir: Vec3 = [d[0], d[1], d[2]];

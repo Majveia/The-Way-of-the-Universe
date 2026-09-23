@@ -180,15 +180,15 @@ describe('Kerr–Schild geometry', () => {
     ksRhs(a, s, pt, out);
     const H = (v: number[]) => hamiltonian(a, v[0], v[1], v[2], [pt, v[3], v[4], v[5]]);
     const h = 1e-6;
-    for (let i = 0; i < 6; i++) {
-      const sp = s.slice(), sm = s.slice();
-      sp[i] += h;
-      sm[i] -= h;
-      const dH = (H(sp) - H(sm)) / (2 * h);
-      // dx/dλ = ∂H/∂p ; dp/dλ = −∂H/∂x
-      const expected = i < 3 ? (() => { const q = s.slice(), m = s.slice(); q[i + 3] += h; m[i + 3] -= h; return (H(q) - H(m)) / (2 * h); })() : -dH;
-      if (i < 3) expect(out[i]).toBeCloseTo(expected, 7);
-      else expect(out[i]).toBeCloseTo(-(H(sp) - H(sm)) / (2 * h), 7);
+    const dH = (k: number) => {
+      const q = s.slice(), m = s.slice();
+      q[k] += h;
+      m[k] -= h;
+      return (H(q) - H(m)) / (2 * h);
+    };
+    for (let i = 0; i < 3; i++) {
+      expect(out[i]).toBeCloseTo(dH(i + 3), 7); // dx/dλ = ∂H/∂p
+      expect(out[i + 3]).toBeCloseTo(-dH(i), 7); // dp/dλ = −∂H/∂x
     }
   });
 });
@@ -220,7 +220,7 @@ describe('observers and tetrads', () => {
     expect(start[0] * cov[2] - start[1] * cov[1]).toBeCloseTo(0, 10); // L_z = 0
     const s = new Float64Array([...start, cov[1], cov[2], cov[3]]);
     const work = new Float64Array(30);
-    for (let i = 0; i < 4000; i++) {
+    for (let i = 0; i < 8000; i++) {
       rk4Step(a2, s, cov[0], 0.003, work);
       if (ksRadius(a2, s[0], s[1], s[2]) < 0.8 * horizonRadius(a2)) break;
     }
