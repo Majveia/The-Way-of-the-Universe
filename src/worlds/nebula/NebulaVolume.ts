@@ -540,8 +540,8 @@ export class NebulaVolume {
       this.object.updateMatrixWorld();
       const inv = new THREE.Matrix4().copy(this.object.matrixWorld).invert();
       const v2l = new THREE.Matrix4().multiplyMatrices(inv, camera.matrixWorld);
-      (mp.uniforms.uViewToLocal.value as THREE.Matrix3) = new THREE.Matrix3().setFromMatrix4(v2l);
-      (mp.uniforms.uCamLocal.value as THREE.Vector3) = new THREE.Vector3().setFromMatrixPosition(v2l);
+      mp.uniforms.uViewToLocal.value = new THREE.Matrix3().setFromMatrix4(v2l);
+      mp.uniforms.uCamLocal.value = new THREE.Vector3().setFromMatrixPosition(v2l);
       mp.uniforms.uProjInv.value = (camera as THREE.PerspectiveCamera).projectionMatrixInverse.clone();
       mp.uniforms.uProbeNdc.value = new THREE.Vector2(ndcX, ndcY);
       mp.uniforms.uSteps.value = 200;

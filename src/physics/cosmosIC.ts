@@ -118,9 +118,12 @@ export class GaussianField {
     fft: RealFFT3D,
     out: Float32Array | Float64Array,
     kernel: (kx: number, ky: number, kz: number, k2: number, res: { r: number; i: number }) => void,
+    shiftCells = 0,
   ): void {
     const n = this.n, nzc = this.nzc, kf = this.kf;
     const res = { r: 0, i: 0 };
+    // Shift theorem: multiplying by exp(i k·s) makes node m hold the field at m + s (s in cells).
+    const sh = shiftCells * (this.box / n);
     for (let ix = 0; ix < n; ix++) {
       const kx = this.freq(ix) * kf;
       for (let iy = 0; iy < n; iy++) {
@@ -136,8 +139,16 @@ export class GaussianField {
             continue;
           }
           kernel(kx, ky, kz, kx * kx + ky * ky + kz * kz, res);
-          fft.re[idx] = dr * res.r - di * res.i;
-          fft.im[idx] = dr * res.i + di * res.r;
+          let rr = res.r, ri = res.i;
+          if (sh !== 0) {
+            const ph = (kx + ky + kz) * sh;
+            const c = Math.cos(ph), s = Math.sin(ph);
+            const t = rr * c - ri * s;
+            ri = rr * s + ri * c;
+            rr = t;
+          }
+          fft.re[idx] = dr * rr - di * ri;
+          fft.im[idx] = dr * ri + di * rr;
         }
       }
     }
@@ -218,9 +229,19 @@ export interface LPTDisplacements {
 }
 
 /**
+ * Lagrangian lattice position of particle index i along one axis, in mesh cells:
+ * q = i·(n/np) + ½. The half-cell offset keeps particles off the mesh nodes, where cloud-in-cell
+ * assignment of a slightly perturbed lattice would be non-linear in the displacement.
+ */
+export const LATTICE_OFFSET = 0.5;
+export function latticeCoord(i: number, n: number, np: number): number {
+  return i * (n / np) + LATTICE_OFFSET;
+}
+
+/**
  * Compute Zel'dovich and 2LPT displacement fields on the mesh and sample them at the particle
- * lattice q = (i, j, k)·(L/np). With np = n the lattice sits exactly on mesh nodes; otherwise
- * the fields are trilinearly interpolated.
+ * lattice q = latticeCoord(i, j, k). Fields are evaluated half a cell off the nodes by a Fourier
+ * phase shift, so with np = n the sampling is exact; otherwise it is trilinearly interpolated.
  */
 export function lptDisplacements(
   field: GaussianField,
@@ -273,7 +294,7 @@ export function lptDisplacements(
     field.realise(fft, A, (kx, ky, kz, k2, r) => {
       r.r = 0;
       r.i = kc(kx, ky, kz) / k2;
-    });
+    }, LATTICE_OFFSET);
     sample(A, psi1, c, 3);
     for (let i = 0; i < N3; i++) psiVar += A[i] * A[i];
     prog(0.1 + 0.1 * c, 'Zel’dovich displacements');
@@ -285,7 +306,7 @@ export function lptDisplacements(
   field.realise(fft, A, (_kx, _ky, _kz, k2, r) => {
     r.r = Math.exp(-0.5 * k2 * R * R);
     r.i = 0;
-  });
+  }, LATTICE_OFFSET);
   let dv = 0;
   for (let i = 0; i < N3; i++) dv += A[i] * A[i];
   const sigmaL = Math.sqrt(dv / N3);
@@ -324,6 +345,7 @@ export function lptDisplacements(
     // Ψ2 = ∇φ2, φ2(k) = −S2(k)/k²  →  Ψ2(k) = −i k S2(k)/k²
     fft.forward(S);
     const sre = Float64Array.from(fft.re), sim = Float64Array.from(fft.im);
+    const shift = LATTICE_OFFSET * cell;
     const kf = field.kf, half = n >> 1, nzc = fft.nzc;
     for (let c = 0; c < 3; c++) {
       for (let ix = 0; ix < n; ix++) {
@@ -340,9 +362,12 @@ export function lptDisplacements(
             }
             const kc = (c === 0 ? fx : c === 1 ? fy : iz) * kf;
             const k2 = q * kf * kf;
-            // (sre + i sim) · (−i kc/k²) = (sim·kc/k²) + i(−sre·kc/k²)
-            fft.re[idx] = (sim[idx] * kc) / k2;
-            fft.im[idx] = (-sre[idx] * kc) / k2;
+            // (sre + i sim) · (−i kc/k²) · exp(i k·s): evaluated half a cell off the nodes
+            const ph = (fx + fy + iz) * kf * shift;
+            const cr = Math.cos(ph), ci = Math.sin(ph);
+            const ar = (sim[idx] * kc) / k2, ai = (-sre[idx] * kc) / k2;
+            fft.re[idx] = ar * cr - ai * ci;
+            fft.im[idx] = ar * ci + ai * cr;
           }
         }
       }

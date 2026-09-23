@@ -5,7 +5,7 @@
  */
 import { Expansion, fastpmDrift, fastpmKick } from '../../physics/cosmosExpansion';
 import { LinearPower, RHO_CRIT_H2 } from '../../physics/cosmosPower';
-import { GaussianField, lptDisplacements, measurePower } from '../../physics/cosmosIC';
+import { GaussianField, LATTICE_OFFSET, lptDisplacements, measurePower } from '../../physics/cosmosIC';
 import { ParticleMesh } from '../../physics/cosmosPM';
 import { friendsOfFriends, type FoFResult } from '../../physics/cosmosFoF';
 import { centralQuenchedFraction, mergingTime, r200c, satelliteQuenched, stellarMass } from '../../physics/cosmosGalaxies';
@@ -168,7 +168,7 @@ export class Simulation {
     for (let i = 0; i < np; i++)
       for (let j = 0; j < np; j++)
         for (let k = 0; k < np; k++, p++) {
-          const q = [i * ratio, j * ratio, k * ratio];
+          const q = [i * ratio + LATTICE_OFFSET, j * ratio + LATTICE_OFFSET, k * ratio + LATTICE_OFFSET];
           for (let c = 0; c < 3; c++) {
             const s1 = lpt.psi1[3 * p + c] * inv, s2 = lpt.psi2[3 * p + c] * inv;
             let x = q[c] + D1 * s1 + D2 * s2;
@@ -270,8 +270,8 @@ export class Simulation {
     const galaxies = gals.catalog(halos);
 
     // Power spectrum of the evolved field vs linear theory.
-    const shot = cfg.box ** 3 / N;
-    const m = measurePower(pm.deltaRe, pm.deltaIm, nm, cfg.box, 22, { window2: ParticleMesh.cicWindow2(nm), shotNoise: shot });
+    // No shot-noise subtraction: a perturbed lattice carries almost none (unlike a Poisson sample).
+    const m = measurePower(pm.deltaRe, pm.deltaIm, nm, cfg.box, 22, { window2: ParticleMesh.cicWindow2(nm) });
     const pk = { k: new Float32Array(m.k), P: new Float32Array(m.P), Plin: new Float32Array(m.k.length) };
     for (let i = 0; i < m.k.length; i++) pk.Plin[i] = D * D * lp.P(m.k[i]);
 

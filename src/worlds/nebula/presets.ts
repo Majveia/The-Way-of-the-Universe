@@ -51,7 +51,7 @@ export const PRESETS: Record<NebulaVariant, NebulaPreset> = {
         'Their tips glow where the ionization front meets them; inside, new stars are still forming.',
     },
   },
-} as Record<NebulaVariant, NebulaPreset>;
+} as unknown as Record<NebulaVariant, NebulaPreset>;
 
 /** Default variant for each spec type. */
 export const DEFAULT_VARIANT: Record<NebulaType, NebulaVariant> = {
