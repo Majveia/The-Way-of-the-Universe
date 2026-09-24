@@ -566,6 +566,8 @@ export class NebulaVolume {
     // 1. Ray march (low resolution, MRT: radiance+T, depth).
     const mu = this.matMarch.uniforms;
     mu.uRes.value.set(lowRT.width, lowRT.height);
+    const fov = (camera as THREE.PerspectiveCamera).fov ?? 50;
+    mu.uPixAngle.value = (2 * Math.tan(THREE.MathUtils.degToRad(fov) / 2)) / lowRT.height;
     mu.uFrame.value = this.frameIndex % 4096;
     (mu.uProjInv.value as THREE.Matrix4).copy((camera as THREE.PerspectiveCamera).projectionMatrixInverse);
     mu.uExpand.value = s;
@@ -748,6 +750,8 @@ export class NebulaVolume {
       uNearScale: { value: 0.1 },
       uMaxT: { value: 1e9 },
       uDetailFreq: { value: new THREE.Vector2(1 / p.detailScale[0], 1 / p.detailScale[1]) },
+      uTexel: { value: new THREE.Vector3(p.detailScale[0] / this.quality.detailN, p.detailScale[1] / this.quality.detailN, 1 / this.quality.detailN) },
+      uPixAngle: { value: 0 },
       uDrift1: { value: new THREE.Vector3() },
       uDrift2: { value: new THREE.Vector3() },
       uTurb: { value: p.turbulence },

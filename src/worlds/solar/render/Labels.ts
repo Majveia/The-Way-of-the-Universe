@@ -165,7 +165,8 @@ export class Labels {
       }
       return;
     }
-    if (Math.abs(x - e.lastX) > 0.05 || Math.abs(y - e.lastY) > 0.05) {
+    // (lastX starts as NaN: `!(|Δ| <= ε)` is true for NaN, so the first write always lands.)
+    if (!(Math.abs(x - e.lastX) <= 0.05) || !(Math.abs(y - e.lastY) <= 0.05)) {
       e.root.style.transform = `translate3d(${x.toFixed(1)}px, ${(y - 5.5).toFixed(1)}px, 0)`;
       e.lastX = x;
       e.lastY = y;

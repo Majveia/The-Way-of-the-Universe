@@ -29,6 +29,7 @@ import { DepthSlicer } from './DepthSlices';
 import { Labels, type LabelCandidate } from './Labels';
 import { rockGeometry, rockMaterial } from './Rocks';
 import { SunGlare } from './SunGlare';
+import { CometTails, type CometCandidate } from './CometTails';
 import { sampleHildas, sampleKuiper, sampleMainBelt, sampleNEAs, sampleOort, sampleTrojans } from '../belts';
 
 export type ScaleMode = 'true' | 'enlarged';
@@ -120,6 +121,19 @@ const _slot: OrbitSlot = {
   trail: 1,
 };
 
+/** Hyperbolic anomaly H of a hyperbolic conic at jd: e sinh H − H = √(µ/|a|³)(t − tp) (Newton). */
+function hyperbolicAnomaly(el: { q: number; e: number; tp: number; mu: number }, jd: number): number {
+  const a = el.q / (el.e - 1);
+  const M = Math.sqrt(el.mu / (a * a * a)) * (jd - el.tp);
+  let H = Math.asinh(M / el.e);
+  for (let k = 0; k < 30; k++) {
+    const d = (el.e * Math.sinh(H) - H - M) / (el.e * Math.cosh(H) - 1);
+    H -= d;
+    if (Math.abs(d) < 1e-12) break;
+  }
+  return H;
+}
+
 const srgbToLinear = (hex: string) => new THREE.Color(hex); // three.Color parses CSS hex as sRGB → linear working space
 
 export class SolarSystemLayer {
@@ -153,6 +167,9 @@ export class SolarSystemLayer {
   private orbits = new OrbitLines(this.occ);
   private sprites: BodySprites;
   private glare: SunGlare;
+  /** Comae, dust and ion tails of the active comets. */
+  readonly tails: CometTails;
+  private cometCands: CometCandidate[] = [];
   private occList: BodyRender[] = [];
   private overlayNear = 1e-9;
   private slicer = new DepthSlicer();
@@ -213,15 +230,16 @@ export class SolarSystemLayer {
     }
     this.sprites = new BodySprites(model.bodies.length + 4, this.occ);
     this.glare = new SunGlare(this.occ);
-    this.overlayScene.add(this.glare.object, this.orbits.object, this.sprites.object);
+    this.tails = new CometTails(this.detail, this.occ);
+    this.overlayScene.add(this.glare.object, this.orbits.object, this.tails.object, this.sprites.object);
     const d = this.detail;
     const n = (x: number) => Math.max(500, Math.round(x * d));
     // Reference fluxes chosen so a 10 km, p = 0.1 asteroid at r = 2.7 AU, Δ = 2 AU is display ≈ 1.
     const fluxRef = 0.1 * (10 * 6.6845871e-9) ** 2 / (2.7 * 2.7 * 2 * 2);
     this.belts = {
       main: new BeltPoints(sampleMainBelt(n(60000)), { brightness: 0.05, gamma: 0.42, fluxRef }, 6, this.occ),
-      hildas: new BeltPoints(sampleHildas(n(3500)), { brightness: 0.055, gamma: 0.42, fluxRef }, 6, this.occ),
-      trojans: new BeltPoints(sampleTrojans(n(9000)), { brightness: 0.055, gamma: 0.42, fluxRef }, 7, this.occ),
+      hildas: new BeltPoints(sampleHildas(n(6000)), { brightness: 0.12, gamma: 0.42, fluxRef }, 6, this.occ),
+      trojans: new BeltPoints(sampleTrojans(n(18000)), { brightness: 0.16, gamma: 0.42, fluxRef }, 7, this.occ),
       neas: new BeltPoints(sampleNEAs(n(1500)), { brightness: 0.04, gamma: 0.42, fluxRef }, 5, this.occ),
       kuiper: new BeltPoints(sampleKuiper(n(36000)), { brightness: 0.05, gamma: 0.36, fluxRef: fluxRef * 1e-4 }, 1200, this.occ),
       oort: new BeltPoints(sampleOort(n(16000)), { brightness: 0.05, gamma: 0.3, fluxRef: fluxRef * 1e-9 }, 2e5, this.occ),
@@ -452,15 +470,18 @@ export class SolarSystemLayer {
       const phase = (Math.sin(alpha) + (Math.PI - alpha) * Math.cos(alpha)) / Math.PI;
       const albedo = b.def.kind === 'comet' ? 0.3 : b.def.albedo;
       const flux = albedo * Math.max(phase, 0.03) * Math.PI * r.radiusPx * r.radiusPx * (2 / 3) * this.sunIntensity(rs);
-      const floor = b.def.kind === 'planet' ? 0.06 : b.def.kind === 'dwarf' ? 0.035 : b.def.kind === 'spacecraft' ? 0.03 : 0.018;
-      const I = Math.max(floor, 2.2 * Math.pow(flux, 0.42)) * w / expo;
+      // Display compression (the eye/camera sees planets as the brightest "stars"): a power law
+      // F^0.38 keeps the order Venus > Jupiter > Mars > Saturn > … while every world stays findable.
+      const kind = b.def.kind;
+      const floor = kind === 'planet' ? 1.5 : kind === 'dwarf' ? 0.28 : kind === 'spacecraft' ? 0.22 : kind === 'moon' ? 0.16 : 0.1;
+      const I = Math.min(6, Math.max(floor, 34 * Math.pow(flux, 0.38))) * w / expo;
       const c = b.def.kind === 'spacecraft' ? this.planetColor.setRGB(1, 0.8, 0.6) : r.color;
       const tint = 0.55; // colour saturation of the points
       const lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
       const cr = (lum + (c.r - lum) * tint) / Math.max(lum, 1e-3);
       const cg = (lum + (c.g - lum) * tint) / Math.max(lum, 1e-3);
       const cb = (lum + (c.b - lum) * tint) / Math.max(lum, 1e-3);
-      this.sprites.add(r.rel, I * cr, I * cg, I * cb, 0.62 * this.pixelRatio);
+      this.sprites.add(r.rel, I * cr, I * cg, I * cb, (kind === 'planet' ? 0.8 : 0.65) * this.pixelRatio);
     }
     this.sprites.end();
 
@@ -496,7 +517,29 @@ export class SolarSystemLayer {
       this.glare.update(this.sunRel, this.starRGB, strength, corePx * this.pixelRatio, corePx * this.pixelRatio * 9 + 220 * this.pixelRatio, this.width, this.height);
     } else this.glare.update(this.sunRel, this.starRGB, 0, 1, 1, this.width, this.height);
 
-    // 5. Belts.
+    // 5. Comet comae and tails (Finson–Probstein dust, solar-wind ions).
+    let nc = 0;
+    if (this.settings.comets) {
+      for (const r of this.bodies) {
+        if (r.body.def.kind !== 'comet' || !r.shown || !r.body.conic) continue;
+        const c = this.cometCands[nc] ?? (this.cometCands[nc] = { body: r.body, rel: r.rel, dist: 1 });
+        c.body = r.body;
+        c.rel = r.rel;
+        c.dist = r.dist;
+        nc++;
+      }
+    }
+    this.tails.update(this.cometCands, nc, {
+      jd,
+      sunRel: this.sunRel,
+      pixelAngle: pa,
+      maxPointSize: this.maxPointSize,
+      exposure: expo,
+      selected: this.selected,
+      occ: this.occ,
+    });
+
+    // 6. Belts.
     const s = this.settings;
     const camR = cam.length();
     const bm = this.belts;
@@ -510,7 +553,9 @@ export class SolarSystemLayer {
       belt.fade = fade / expo;
       if (fade > 0) {
         belt.update(jd, this.sunRel, pa, this.pixelRatio, this.maxPointSize);
-        belt.eccentricity = k === 'oort' ? 1 : s.beltEccentricity;
+        // The Kirkwood reveal (e → 0) applies to the main belt; Hildas and Trojans keep their true
+        // orbits, which is what makes the Hilda triangle and the L4/L5 swarms.
+        belt.eccentricity = k === 'main' ? s.beltEccentricity : 1;
       }
     }
   }
@@ -570,8 +615,10 @@ export class SolarSystemLayer {
         return THREE.MathUtils.smoothstep(camSun, 25, 60) * 0.7;
       }
       case 'comet':
-        // Active comets (inside ~6 AU) show their path; the rest only when selected.
-        return 1 - THREE.MathUtils.smoothstep(b.sunDistance, 4, 7);
+        // Active comets (inside ~3 AU) show their path; the rest (and interstellar hyperbolae,
+        // which read as stray straight lines at system scale) only when selected.
+        if (b.conic && b.conic.e > 1) return 1 - THREE.MathUtils.smoothstep(b.sunDistance, 1.5, 3);
+        return 1 - THREE.MathUtils.smoothstep(b.sunDistance, 2.2, 4);
       case 'spacecraft':
         return THREE.MathUtils.smoothstep(camSun, 20, 60) * 0.8;
       default:
@@ -595,11 +642,13 @@ export class SolarSystemLayer {
       const dParent = Math.max(parent.dist, 1e-12);
       const sizePx = (_geom.hyperbolic ? Math.max(_geom.a, b.local.length()) : _geom.a) / dParent / pa / this.pixelRatio;
       let alpha = THREE.MathUtils.smoothstep(sizePx, 10, 70);
+      // Close to a body its own orbit degenerates into a straight line through it: fade it out.
+      alpha *= THREE.MathUtils.smoothstep(r.dist / Math.max(_geom.a, 1e-12), 0.002, 0.012);
       // Orbits of moons of an enlarged planet cannot be drawn honestly.
       if (b.def.kind === 'moon' && parent.scale > 1.5) alpha = 0;
       if (alpha <= 0.001) continue;
       const kind = b.def.kind;
-      const base = kind === 'planet' ? 0.42 : kind === 'dwarf' ? 0.3 : kind === 'moon' ? 0.3 : kind === 'comet' ? 0.34 : kind === 'spacecraft' ? 0.36 : 0.2;
+      const base = kind === 'planet' ? 0.42 : kind === 'dwarf' ? 0.3 : kind === 'moon' ? 0.3 : kind === 'comet' ? (b === this.selected ? 0.34 : 0.16) : kind === 'spacecraft' ? 0.36 : 0.2;
       alpha *= base * policy * (b === this.selected ? 1.9 : 1);
       _slot.P.copy(_geom.P);
       _slot.Q.copy(_geom.Q);
@@ -610,10 +659,12 @@ export class SolarSystemLayer {
       _slot.anomaly = _geom.anomaly;
       if (_geom.hyperbolic) {
         // Draw the branch out to max(40 AU, 1.3 × current distance) on the way in and out.
-        const rMax = Math.max(40, 1.3 * b.local.length());
+        const rMax = b === this.selected ? Math.max(40, 1.3 * b.local.length()) : Math.max(6, 1.3 * b.local.length());
         const Hmax = Math.acosh(Math.max(1, (rMax / _geom.a + 1) / _geom.e));
         let Hmin = -Hmax;
-        if (b.def.kind === 'spacecraft' && b.def.visibleFrom) Hmin = Math.max(Hmin, _geom.anomaly - 60); // (whole post-flyby path)
+        // Spacecraft: only the path actually flown since the state epoch (the last planetary flyby);
+        // the incoming asymptote of the escape hyperbola is fictitious.
+        if (b.def.kind === 'spacecraft' && b.conic && b.def.orbit.type === 'state') Hmin = Math.max(Hmin, hyperbolicAnomaly(b.conic, b.def.orbit.jd));
         _slot.rangeBack = Math.min(0, Hmin - _geom.anomaly);
         _slot.rangeAhead = Math.max(0, Hmax - _geom.anomaly);
       } else if (kind === 'comet' && _geom.a * (1 + _geom.e) > 40 && b !== this.selected) {
@@ -696,17 +747,31 @@ export class SolarSystemLayer {
         const sepPx = b.local.length() / r.dist / pa / this.pixelRatio;
         strength = THREE.MathUtils.smoothstep(sepPx, pr.radiusPx / this.pixelRatio + 14, pr.radiusPx / this.pixelRatio + 44);
       } else if (kind === 'asteroid' || kind === 'comet' || kind === 'spacecraft' || kind === 'dwarf') {
-        // Minor bodies: show when fairly near or selected.
-        const near = b.def.priority <= 3 ? 30 : 6;
-        const ref = kind === 'spacecraft' ? 60 : kind === 'dwarf' && b.def.priority <= 2 ? 200 : near;
-        strength = 1 - THREE.MathUtils.smoothstep(r.dist, ref * 0.6, ref);
-        if (kind === 'comet' && b.sunDistance < 4) strength = Math.max(strength, 0.85);
+        // Minor bodies declutter by distance: named only in their own neighbourhood, except the
+        // dwarf planets of the outer system (shown once we pull back beyond the planets) and
+        // comets while they are active.
+        const camSun = this.cameraPosition.length();
+        const sepPx = b.sunDistance / r.dist / pa / this.pixelRatio;
+        const clearOfSun = THREE.MathUtils.smoothstep(sepPx, 14, 40);
+        if (kind === 'spacecraft') strength = Math.max(1 - THREE.MathUtils.smoothstep(r.dist, 2, 4), THREE.MathUtils.smoothstep(camSun, 25, 45)) * clearOfSun;
+        else if (kind === 'dwarf') strength = Math.max(1 - THREE.MathUtils.smoothstep(r.dist, 2.5, 4), b.sunDistance > 20 ? THREE.MathUtils.smoothstep(camSun, 25, 45) : 0) * clearOfSun;
+        else if (kind === 'comet') strength = b.sunDistance < 4 ? 1 - THREE.MathUtils.smoothstep(r.dist, 2, 3) : 1 - THREE.MathUtils.smoothstep(r.dist, 0.3, 0.5);
+        else strength = 1 - THREE.MathUtils.smoothstep(r.dist, b.def.priority <= 3 ? 0.9 : 0.35, b.def.priority <= 3 ? 1.4 : 0.6);
       } else if (kind === 'planet') {
         // Inner planets are lost in the glare at Kuiper-belt distances.
         const sepPx = b.sunDistance / r.dist / pa / this.pixelRatio;
         strength = THREE.MathUtils.smoothstep(sepPx, 10, 26);
       }
       if (b === this.selected) strength = 1;
+      // Hidden behind a resolved disc (e.g. an inner planet seen through Saturn).
+      for (const o of this.occList) {
+        if (o === r || o.dist >= r.dist) continue;
+        const R = o.radiusPx / this.pixelRatio;
+        if (Math.hypot(o.sx - r.sx, o.sy - r.sy) < R * 1.02) {
+          strength = 0;
+          break;
+        }
+      }
       c.x = r.sx;
       c.y = r.sy;
       c.radius = Math.max(r.radiusPx / this.pixelRatio, 2);
@@ -761,6 +826,7 @@ export class SolarSystemLayer {
     this.orbits.dispose();
     this.sprites.dispose();
     this.glare.dispose();
+    this.tails.dispose();
     for (const b of Object.values(this.belts)) b.dispose();
     this.labels?.dispose();
   }

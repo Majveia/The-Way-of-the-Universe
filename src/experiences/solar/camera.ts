@@ -27,6 +27,7 @@ interface Flight {
   pitch1: number;
   bump: number;
   target0: THREE.Vector3;
+  target1: THREE.Vector3;
   userTookOver: boolean;
   done?: () => void;
 }
@@ -76,12 +77,12 @@ export class SolarCamera {
   }
 
   /** Jump instantly. */
-  set(body: SolarBody | null, v: { distance?: number; yaw?: number; pitch?: number }, point?: THREE.Vector3): void {
+  set(body: SolarBody | null, v: { distance?: number; yaw?: number; pitch?: number; target?: THREE.Vector3 }, point?: THREE.Vector3): void {
     this.flight = null;
     this.progress = 1;
     this.anchor = body;
     if (point) this.anchorPoint.copy(point);
-    this.rig.set({ target: new THREE.Vector3(), ...v });
+    this.rig.set({ ...v, target: v.target ? v.target.clone() : new THREE.Vector3() });
     this.lastLon = NaN;
   }
 
@@ -89,7 +90,7 @@ export class SolarCamera {
    * Fly to `body`, ending at `distance` (AU) with optional yaw/pitch. Duration grows gently with the
    * logarithm of the zoom ratio.
    */
-  flyTo(body: SolarBody, v: { distance: number; yaw?: number; pitch?: number; duration?: number }, done?: () => void): void {
+  flyTo(body: SolarBody, v: { distance: number; yaw?: number; pitch?: number; duration?: number; target?: THREE.Vector3 }, done?: () => void): void {
     const rig = this.rig;
     const fromPoint = this.anchorWorld(this.tmp).clone();
     const d0 = rig.distance;
@@ -116,6 +117,7 @@ export class SolarCamera {
       pitch1: v.pitch ?? rig.pitch,
       bump,
       target0: rig.target.clone(),
+      target1: v.target ? v.target.clone() : new THREE.Vector3(),
       userTookOver: false,
       done,
     };
@@ -149,7 +151,7 @@ export class SolarCamera {
         const logD = Math.log(f.d0) + (Math.log(f.d1) - Math.log(f.d0)) * e + f.bump * Math.sin(Math.PI * e);
         const yaw = f.yaw0 + (f.yaw1 - f.yaw0) * e;
         const pitch = f.pitch0 + (f.pitch1 - f.pitch0) * e;
-        rig.goal.target.copy(f.target0).multiplyScalar(1 - e);
+        rig.goal.target.copy(f.target0).lerp(f.target1, e);
         rig.target.copy(rig.goal.target);
         rig.goal.logDistance = logD;
         rig.distance = Math.exp(logD);

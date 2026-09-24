@@ -341,9 +341,9 @@ class SolarExperience implements Experience {
     this.cam.rig.minDistance = Math.max(1e-12, body.radius * 1.12);
     this.targetFov = t.fov ?? 50;
     if (instant) {
-      this.cam.set(body, { distance: t.distance, yaw: t.yaw, pitch: t.pitch });
+      this.cam.set(body, { distance: t.distance, yaw: t.yaw, pitch: t.pitch, target: t.target });
       this.cam.fov = this.targetFov;
-    } else this.cam.flyTo(body, { distance: t.distance, yaw: t.yaw, pitch: t.pitch });
+    } else this.cam.flyTo(body, { distance: t.distance, yaw: t.yaw, pitch: t.pitch, target: t.target });
     const i = VIEWS.indexOf(v);
     this.viewButtons?.setActive(i);
     if (this.selected && !instant) {
@@ -431,8 +431,11 @@ class SolarExperience implements Experience {
       const d = Math.max(camSun / sunR, 1);
       target = THREE.MathUtils.clamp(0.08 * Math.pow(d / 6, 0.9), 0.08, 1);
     } else {
+      // Expose for the subject: fully compensate the 1/r² sunlight when a resolved body fills the
+      // view (a camera metering on Saturn), partially for overviews so distance still reads as dimming.
       const r = Math.max(0.3, focus.sunDistance);
-      target = Math.pow(this.layer.sunIntensity(r), -0.75);
+      const close = 1 - THREE.MathUtils.smoothstep(this.cam.position.distanceTo(focus.position) / Math.max(focus.radius, 1e-12), 30, 400);
+      target = Math.pow(this.layer.sunIntensity(r), -(0.75 + 0.25 * close));
     }
     target = THREE.MathUtils.clamp(target, 0.05, 30);
     const k = 1 - Math.exp(-dt / 0.8);
@@ -447,20 +450,24 @@ class SolarExperience implements Experience {
     const show = s.asteroids ? 1 - THREE.MathUtils.smoothstep(s.beltEccentricity, 0.05, 0.4) : 0;
     const camDist = this.cam.position.length();
     const scaleOk = THREE.MathUtils.smoothstep(camDist, 3, 6) * (1 - THREE.MathUtils.smoothstep(camDist, 60, 120));
-    // Anchor the labels on the side of the circle nearest the camera's right.
+    // Each label sits on its own resonance circle, fanned out in angle about the camera's right so
+    // the closely spaced radii (2.50, 2.82, 2.96, 3.28 AU) never collide on screen.
     const right = this.tmpV.set(1, 0, 0).applyQuaternion(this.cam.quaternion);
     right.y = 0;
     if (right.lengthSq() < 1e-6) right.set(1, 0, 0);
     right.normalize();
-    for (const r of this.resonance) {
+    const base = Math.atan2(right.x, right.z);
+    for (let i = 0; i < this.resonance.length; i++) {
+      const r = this.resonance[i];
       const o = show * scaleOk;
       if (o < 0.01) {
         if (r.el.style.opacity !== '0') r.el.style.opacity = '0';
         continue;
       }
-      const p = this.tmpP.copy(right).multiplyScalar(r.a);
+      const ang = base + (i - (this.resonance.length - 1) / 2) * 0.2;
+      const p = this.tmpP.set(Math.sin(ang) * r.a, 0, Math.cos(ang) * r.a);
       if (this.layer.projectPoint(p, this.tmp2)) {
-        r.el.style.transform = `translate3d(${(this.tmp2.x + 4).toFixed(1)}px, ${(this.tmp2.y - 6).toFixed(1)}px, 0)`;
+        r.el.style.transform = `translate3d(${(this.tmp2.x + 4).toFixed(1)}px, ${(this.tmp2.y - 5).toFixed(1)}px, 0)`;
         r.el.style.opacity = (o * 0.9).toFixed(2);
       } else r.el.style.opacity = '0';
     }

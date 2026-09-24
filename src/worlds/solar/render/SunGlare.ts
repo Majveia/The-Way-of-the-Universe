@@ -36,7 +36,7 @@ void main() {
   float r = length(vPx);
   float x = r / uCorePx;
   // Two-component wing: a θ⁻² inner glow and a broad θ⁻¹·⁵ aureole, softly windowed at the quad edge.
-  float wing = 1.0 / (1.0 + x * x) + 0.08 / pow(1.0 + x, 1.5);
+  float wing = 1.0 / (1.0 + x * x) + 0.025 / pow(1.0 + x, 1.5);
   float win = 1.0 - smoothstep(0.55, 1.0, r / uRadiusPx);
   vec3 col = uColor * wing * win * vVis;
   if (max(col.r, max(col.g, col.b)) < 1e-6) discard;

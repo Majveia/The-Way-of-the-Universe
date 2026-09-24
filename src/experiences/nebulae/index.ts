@@ -120,7 +120,7 @@ class Nebulae implements Experience {
     const preset = getPreset(this.variant);
     const view = preset.views.default;
     this.orbit = new OrbitRig(ctx.input, {
-      distance: view.distance,
+      distance: view.distance * this.fit(),
       yaw: view.yaw,
       pitch: view.pitch,
       target: new THREE.Vector3(...(view.target ?? [0, 0, 0])),
@@ -476,7 +476,7 @@ class Nebulae implements Experience {
     if (this.mode === 'fly') this.setMode('orbit');
     this.orbit.minDistance = p.half * 0.01;
     this.orbit.maxDistance = p.half * 30;
-    this.orbit.flyTo({ distance: v.distance, yaw: v.yaw, pitch: v.pitch, target: new THREE.Vector3(...(v.target ?? [0, 0, 0])) }, 2.2);
+    this.orbit.flyTo({ distance: v.distance * this.fit(), yaw: v.yaw, pitch: v.pitch, target: new THREE.Vector3(...(v.target ?? [0, 0, 0])) }, 2.2);
   }
 
   /** Jump without animation (screenshots). */
@@ -484,7 +484,14 @@ class Nebulae implements Experience {
     const v = this.volume?.preset.views[name];
     if (!v) return;
     this.viewName = name;
-    this.orbit.set({ distance: v.distance, yaw: v.yaw, pitch: v.pitch, target: new THREE.Vector3(...(v.target ?? [0, 0, 0])) });
+    this.orbit.set({ distance: v.distance * this.fit(), yaw: v.yaw, pitch: v.pitch, target: new THREE.Vector3(...(v.target ?? [0, 0, 0])) });
+  }
+
+  /** Views are framed for landscape screens; pull back on portrait ones so the object still fits. */
+  private fit(): number {
+    const c = this.ctx.canvas;
+    const aspect = c.clientWidth / Math.max(1, c.clientHeight);
+    return aspect >= 1.3 ? 1 : Math.min(2.2, 1.3 / Math.max(aspect, 0.3)) * 0.75 + 0.25;
   }
 
   setPhysics(o: { density?: number; flux?: number; dust?: number; teff?: number }): void {
@@ -574,7 +581,7 @@ class Nebulae implements Experience {
         const m = Math.max(cr, cg, cb) || 1;
         const css = `rgb(${Math.round(255 * Math.pow(cr / m, 0.45))},${Math.round(255 * Math.pow(cg / m, 0.45))},${Math.round(255 * Math.pow(cb / m, 0.45))})`;
         const w = Math.max(2, Math.round(90 * Math.sqrt(r / max)));
-        html += `<div style="display:flex;align-items:center;gap:8px;height:15px"><span style="width:62px">${l.label}</span><span style="display:inline-block;height:3px;width:${w}px;background:${css};border-radius:2px"></span><span style="margin-left:auto;color:var(--ink-3)">${formatNumber(r * 100, 3)}</span></div>`;
+        html += `<div style="display:flex;align-items:center;gap:8px;height:15px"><span style="width:74px;white-space:nowrap">${l.label}</span><span style="display:inline-block;height:3px;width:${w}px;background:${css};border-radius:2px"></span><span style="margin-left:auto;color:var(--ink-3)">${formatNumber(r * 100, 3)}</span></div>`;
       }
       const dec = L.Ha / hb;
       const av = avFromBalmerDecrement(dec);

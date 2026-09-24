@@ -58,6 +58,8 @@ uniform float uNearScale;
 uniform float uMaxT;
 
 uniform vec2 uDetailFreq;
+uniform vec3 uTexel;       // detail texel size (pc) of the two octaves; z = 1 / texels per tile
+uniform float uPixAngle;   // radians per low-res pixel (0 = full detail)
 uniform vec3 uDrift1;
 uniform vec3 uDrift2;
 uniform float uTurb;
@@ -118,14 +120,17 @@ struct Medium {
   vec4 sheet;   // shock: (d, red, [OIII], Balmer strengths)
 };
 
-Medium medium(vec3 p, vec3 rd) {
+Medium medium(vec3 p, vec3 rd, float tCam) {
   Medium M;
   M.sheet = vec4(0.0);
   vec3 pc = p / uExpand;
   vec3 uvw = pc / (2.0 * uHalf) + 0.5;
   vec4 F = texture(uField, uvw);
-  vec4 D1 = texture(uDetail, pc * uDetailFreq.x + uDrift1);
-  vec4 D2 = texture(uDetail, pc * uDetailFreq.y + uDrift2);
+  // Detail LOD: a 3D texture has no mips here, so fade each octave to its mean once a texel
+  // is smaller than the pixel footprint (otherwise it aliases into a moiré of dots).
+  float fp = tCam * uPixAngle;
+  vec4 D1 = mix(vec4(0.5), texture(uDetail, pc * uDetailFreq.x + uDrift1), 1.0 - smoothstep(0.6, 1.8, fp / uTexel.x));
+  vec4 D2 = mix(vec4(0.5), texture(uDetail, pc * uDetailFreq.y + uDrift2), 1.0 - smoothstep(0.6, 1.8, fp / uTexel.y));
 #ifdef PHOTO
   // Unit-variance sub-voxel fluctuation (the detail channels have σ ≈ 0.1–0.15).
   float turb = (D1.r - 0.5) * 6.0 + (D2.r - 0.5) * 3.5 + (D2.g - 0.45) * 1.5;
@@ -134,7 +139,8 @@ Medium medium(vec3 p, vec3 rd) {
     // so structure is long radially and fine transversally (sampled in source-centred angles).
     vec3 rsv = pc - uSource;
     float rl = length(rsv) + 1e-3;
-    vec4 D3 = texture(uDetail, (rsv / rl) * uStreak.x + vec3(rl * uStreak.y) + uDrift1 * 0.5);
+    vec4 D3 = mix(vec4(0.5), texture(uDetail, (rsv / rl) * uStreak.x + vec3(rl * uStreak.y) + uDrift1 * 0.5),
+                  1.0 - smoothstep(0.6, 1.8, fp * uStreak.x / (rl * uTexel.z)));
     turb = mix(turb, (D3.r - 0.5) * 6.0 + (D3.a - 0.5) * 3.0 + (D2.r - 0.5) * 2.0, uStreak.z);
   }
   turb = clamp(turb, -3.0, 3.0);
@@ -240,7 +246,10 @@ void main() {
 #ifdef PROBE
     float jit = 0.5;
 #else
-    float jit = fract(ign(gl_FragCoord.xy) + uFrame * 0.61803398875);
+    // IGN shifted spatially every frame (Jimenez 2014) plus a golden-ratio offset: the per-pixel
+    // error pattern decorrelates between frames, so the temporal resolve averages it away.
+    float fm = mod(uFrame, 64.0);
+    float jit = fract(ign(gl_FragCoord.xy + 5.588238 * fm) + fm * 0.61803398875);
 #endif
     float N = float(uSteps);
     float c = max(tn, uNearScale);
@@ -262,7 +271,7 @@ void main() {
       float ts = tn + (tf - tn) * (exp(beta * us) - 1.0) / eb;
       float dt = tb2 - ta;
       vec3 p = ro + rd * ts;
-      Medium M = medium(p, rd);
+      Medium M = medium(p, rd, ts);
       float dTau = M.sigma * dt;
       vec3 Tl = exp(-tauV * uKLine);
       vec3 wl = segW(dTau * uKLine) * Tl * dt;
