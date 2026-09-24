@@ -37,11 +37,11 @@ export const PRESETS: Record<NebulaVariant, NebulaPreset> = {
     turbulence: 0.32,
     detailScale: [2.6, 0.7],
     frontNoise: 0.4,
-    streak: [3.2, 0.35, 0.45],
+    streak: [3.2, 0.35, 0.22],
     gain: 1 / 190000,
     palette: 'true',
     views: {
-      default: { distance: 6.4, yaw: 0.06, pitch: -0.01, target: [-0.4, -0.55, -0.35] },
+      default: { distance: 7.0, yaw: 0.06, pitch: -0.01, target: [-0.4, -0.45, -0.35] },
       wide: { distance: 13, yaw: 0.35, pitch: 0.2, target: [0, 0, -0.3] },
       tip: { distance: 2.2, yaw: 0.2, pitch: 0.1, target: [-1.2, 0.35, -0.1] },
       cluster: { distance: 6.5, yaw: 2.5, pitch: 0.55, target: [1.1, 3.0, 0.7] },
@@ -309,11 +309,13 @@ export const PRESETS: Record<NebulaVariant, NebulaPreset> = {
     subtitle: 'Dark nebula against an ionization front',
     half: 3.2,
     layout: 'photo',
-    // σ Orionis (O9.5 V + B0.5 V), a few pc above and behind the front: Q ≈ 10^47.9 (Pound et al. 2003).
+    // σ Orionis (O9.5 V + B0.5 V), ≈ 3.5 pc above the front and slightly behind B33 as seen from
+    // Earth (Abergel et al. 2003): we face the horse's unlit side; only the crest the front wraps
+    // over catches σ Ori's light. Q ≈ 10^47.9 (Pound et al. 2003).
     nRef: 60,
-    source: { pos: [0.6, 3.9, 0.4], Q: 5e47, teff: 33000, lum: 4.5e4 },
+    source: { pos: [0.6, 3.9, -0.8], Q: 5e47, teff: 33000, lum: 4.5e4 },
     // NGC 2023's illuminating star HD 37903 (B1.5 V) lights the cloud from within.
-    scatter: [{ pos: [-2.5, -1.9, 0.5], teff: 22000, lum: 1500 }],
+    scatter: [{ pos: [-2.3, -1.95, -0.3], teff: 22000, lum: 1500 }],
     lines: { O3: 0.25, N2: 1.2, S2: 1.5, He1: 0.06, He2: 0 },
     dustToGas: 1,
     ionDust: 0.35,
@@ -324,7 +326,9 @@ export const PRESETS: Record<NebulaVariant, NebulaPreset> = {
     gain: 1 / 10000,
     palette: 'true',
     views: {
-      default: { distance: 4.4, yaw: 0, pitch: 0.02, target: [-0.15, 0.05, 0.35] },
+      // Slightly below the cloud's edge: like Earth's view, the lit ionization front on top of
+      // L1630 is seen edge-on, and we face the cloud's dark, unlit side.
+      default: { distance: 4.6, yaw: 0, pitch: -0.17, target: [-0.15, -0.05, 0.35] },
       close: { distance: 2.6, yaw: 0.1, pitch: 0.05, target: [-0.3, 0.3, 0.4] },
       side: { distance: 5.5, yaw: 1.35, pitch: 0.15, target: [0, 0, 0] },
       behind: { distance: 5.5, yaw: 3.0, pitch: 0.12, target: [0, 0, 0] },
@@ -367,6 +371,7 @@ export const PRESETS: Record<NebulaVariant, NebulaPreset> = {
     detailScale: [1.6, 0.4],
     frontNoise: 0,
     gain: 1 / 1400,
+    meter: 0.55,
     palette: 'true',
     views: {
       default: { distance: 7.2, yaw: 0, pitch: 0 },

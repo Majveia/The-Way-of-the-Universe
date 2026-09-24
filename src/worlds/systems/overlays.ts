@@ -141,11 +141,11 @@ void main() {
   float opt = band(r, uHZ.x, uHZ.w, soft) - cons;
   // Faint radial texture: the zone is warmest at its inner edge.
   float t = clamp((r - uHZ.x) / max(uHZ.w - uHZ.x, 1e-6), 0.0, 1.0);
-  vec3 col = uHZColor * (cons * (0.85 + 0.3 * (1.0 - t)) + opt * 0.3) * uHZOn;
+  vec3 col = uHZColor * (cons * (0.2 + 0.2 * (1.0 - t)) + opt * 0.05) * uHZOn;
   // Edge hairlines of the conservative zone.
   float rIn = pow(uHZ.y, uGamma), rOut = pow(uHZ.z, uGamma);
   float line = (1.0 - smoothstep(0.0, 1.2 * aa, abs(rd - rIn))) + (1.0 - smoothstep(0.0, 1.2 * aa, abs(rd - rOut)));
-  col += uHZColor * line * 1.4 * uHZOn;
+  col += uHZColor * line * 1.6 * uHZOn;
   // Snow line: a dotted hairline.
   float rs = pow(uSnow, uGamma);
   float ang = atan(vP.y, vP.x);

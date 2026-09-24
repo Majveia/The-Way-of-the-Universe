@@ -71,6 +71,40 @@ function sunlitRingPitch(b: SolarBody, yaw: number): number {
   return best;
 }
 
+/**
+ * A telephoto view over the lunar limb toward Earth. The camera sits `rc` lunar radii from the
+ * Moon's centre, displaced toward the Sun so the near limb is lit; Earth sits just clear of the
+ * limb (angle θ = asin(1/rc) + margin from the Moon's centre) and the frame is aimed a little
+ * below it so the curved horizon fills the lower part of the picture.
+ */
+function earthriseView(m: SolarSystemModel): ViewTarget {
+  const moon = get(m, 'moon');
+  const earth = get(m, 'earth');
+  const Rm = moon.radius;
+  const u = new THREE.Vector3().subVectors(earth.position, moon.position).normalize();
+  // Displacement off the Moon–Earth line, partly across the Sun’s direction and partly sunward
+  // so the limb below Earth is lit and its curve reads cleanly against black. (Lighting follows
+  // the real date: the Earth phase is whatever the Moon saw at that moment.)
+  const sp = new THREE.Vector3().copy(moon.position).negate().normalize();
+  sp.addScaledVector(u, -sp.dot(u));
+  if (sp.lengthSq() < 1e-6) sp.set(0, 1, 0).addScaledVector(u, -u.y);
+  sp.normalize();
+  const across = new THREE.Vector3().crossVectors(u, sp).normalize();
+  if (across.y < 0) across.negate();
+  const n = across.multiplyScalar(0.72).addScaledVector(sp, 0.7).normalize();
+  const rc = 2.3;
+  const fov = 22;
+  const theta = Math.asin(1 / rc) + THREE.MathUtils.degToRad(3.2);
+  const C = new THREE.Vector3().copy(u).multiplyScalar(-Math.cos(theta) * rc * Rm).addScaledVector(n, Math.sin(theta) * rc * Rm);
+  // Aim below Earth (toward the Moon's centre) by a fraction of the field.
+  const delta = THREE.MathUtils.degToRad(fov * 0.26);
+  const w = new THREE.Vector3().copy(u).addScaledVector(n, -Math.tan(delta)).normalize();
+  const Lr = 4 * Rm;
+  const target = C.clone().addScaledVector(w, Lr);
+  _d.copy(w).negate();
+  return { focus: 'moon', distance: Lr, yaw: yawOf(_d), pitch: pitchOf(_d), fov, target };
+}
+
 export const VIEWS: ViewPreset[] = [
   {
     id: 'inner',
@@ -105,7 +139,7 @@ export const VIEWS: ViewPreset[] = [
     label: 'Jupiter’s moons',
     view: (m) => {
       const j = get(m, 'jupiter');
-      return { focus: 'jupiter', distance: 0.03, yaw: yawOf(sunward(j)) + 0.6, pitch: 0.22 };
+      return { focus: 'jupiter', distance: 0.02, yaw: yawOf(sunward(j)) + 0.6, pitch: 0.3 };
     },
   },
   {
@@ -133,7 +167,7 @@ export const VIEWS: ViewPreset[] = [
   {
     id: 'sun',
     label: 'The Sun',
-    view: () => ({ focus: 'sun', distance: 0.03, yaw: 0.4, pitch: 0.18 }),
+    view: () => ({ focus: 'sun', distance: 0.021, yaw: 0.4, pitch: 0.18 }),
   },
   {
     id: 'voyager',
@@ -150,6 +184,14 @@ export const VIEWS: ViewPreset[] = [
 const J = (y: number, mo: number, d: number, h = 0, mi = 0) => calendarToJD(y, mo, d + (h + mi / 60) / 24);
 
 export const EVENTS: ViewPreset[] = [
+  {
+    id: 'earthrise',
+    label: 'Earthrise 1968',
+    caption: 'Apollo 8, 24 December 1968: Earth over the lunar limb, 384 000 km away and four times the Moon’s size in our sky',
+    jdUTC: J(1968, 12, 24, 16, 40),
+    warp: 1,
+    view: (m) => earthriseView(m),
+  },
   {
     id: 'hale-bopp-1997',
     label: 'Hale–Bopp 1997',

@@ -39,17 +39,18 @@ const CLASS_NAME: Record<PlanetData['class'], string> = {
 };
 
 export function planetCard(sys: SystemData, p: PlanetData): InfoCard {
+  const surface = p.atmosphere && p.kind !== 'gas-giant' && p.kind !== 'ice-giant';
+  // The description already covers locked worlds; add the tidal clock for those still spinning.
+  const lockNote = !p.tidallyLocked && p.lockTimeYears < 1e11 ? ` Tides will lock its spin in ~${formatNumber(p.lockTimeYears / 1e9, 2)} Gyr.` : '';
   const rows: Array<[string, string]> = [
     ['Mass', massText(p.mass)],
     ['Radius', radiusText(p.radius)],
-    ['Density', `${n(p.density)} g/cm³ · ${n(p.gravity)} g`],
-    ['Orbit', `${n(p.orbit.a)} AU · e ${p.orbit.e.toFixed(2)}`],
-    ['Year', formatPeriod(p.periodDays)],
-    ['Insolation', `${n(p.insolation)} × Earth`],
-    ['T equilibrium', `${n(p.teq, 3)} K${p.atmosphere && p.kind !== 'gas-giant' && p.kind !== 'ice-giant' ? ` · surface ≈ ${n(p.surfaceTemp, 3)} K` : ''}`],
+    ['Density · gravity', `${n(p.density)} g/cm³ · ${n(p.gravity)} g`],
+    ['Orbit', `${n(p.orbit.a)} AU · ${formatPeriod(p.periodDays)} · e ${p.orbit.e.toFixed(2)}`],
+    ['Starlight', `${n(p.insolation)} × Earth`],
+    ['Temperature', surface ? `${n(p.teq, 3)} K eq · ≈ ${n(p.surfaceTemp, 3)} K surface` : `${n(p.teq, 3)} K equilibrium`],
     ['Habitable zone', p.hz],
-    ['Day', p.spinOrbit === '1:1' ? 'none — tidally locked' : formatHours(p.dayHours)],
-    ['Tidal locking', p.tidallyLocked ? `yes (${p.spinOrbit})` : p.lockTimeYears > 1e12 ? 'never (≫ age of the Universe)' : `in ~${formatNumber(p.lockTimeYears / 1e9, 2)} Gyr`],
+    ['Day', p.spinOrbit === '1:1' ? 'none — tidally locked' : p.spinOrbit ? `${formatHours(p.dayHours)} · ${p.spinOrbit} locked` : formatHours(p.dayHours)],
   ];
   if (p.moons.length) rows.push(['Moons', p.moons.map((m) => m.name.split(' ')[1]).join(' · ')]);
   if (p.resonance) rows.push(['Resonance', `${p.resonance} with inner neighbour`]);
@@ -57,7 +58,7 @@ export function planetCard(sys: SystemData, p: PlanetData): InfoCard {
     title: p.givenName,
     subtitle: `${p.designation} · ${CLASS_NAME[p.class]}`,
     rows,
-    body: `${p.description} Composition (guess from density and formation zone): ${p.composition.toLowerCase()}.`,
+    body: `${p.description}${lockNote} Likely make-up, from density and birthplace: ${p.composition}.`,
   };
 }
 

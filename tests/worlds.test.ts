@@ -225,3 +225,11 @@ describe('Generated systems', () => {
     }
   });
 });
+
+describe('Surface classes', () => {
+  it('keeps rust deserts to worlds warmer than ~100 K', () => {
+    for (let seed = 0; seed < 300; seed++) {
+      for (const p of generateSystem(seed * 104729 + 17).planets) if (p.kind === 'desert') expect(p.teq).toBeGreaterThan(100);
+    }
+  });
+});

@@ -64,6 +64,7 @@ uniform float uTime;
 uniform float uExposure;
 uniform vec3 uBalmer;
 uniform float uSteps;
+uniform float uGain;
 // Plume axis: +Z from z = 0 (throat exit). Bounding cylinder radius:
 float width(float z) { return uR0 + uDiv * max(z, 0.0); }
 
@@ -75,18 +76,22 @@ vec3 emissivity(vec3 p) {
   float zn = z / uLen;
   // Hot core: a narrow, bright blue-white spine that fades within the first third.
   float wc = 0.28 * w;
-  float core = exp(-r2 / (2.0 * wc * wc)) * exp(-zn * 7.0) * (1.0 / (wc * wc));
+  float core = exp(-r2 / (2.0 * wc * wc)) * exp(-zn * 9.0) * (1.0 / (wc * wc));
   // Recombining envelope: Balmer glow, broader and longer.
-  float we = 0.55 * w;
-  float env = exp(-r2 / (2.0 * we * we)) * exp(-zn * 2.6) * (1.0 / (we * we));
+  float we = 0.27 * w;
+  float env = exp(-r2 / (2.0 * we * we)) * exp(-zn * 4.5) * (1.0 / (we * we));
   // Gentle turbulence advected downstream (instabilities in the expanding jet).
   float n = snoise(vec3(p.xy * 1.3 / w, z * 0.18 - uTime * 6.0)) * 0.5 + snoise(vec3(p.xy * 3.1 / w, z * 0.5 - uTime * 11.0)) * 0.25;
   env *= 0.75 + 0.45 * n;
+  env *= 1.0 - smoothstep(0.6 * w, w, sqrt(r2)); // nothing at the bounding surface — no visible edge
   core *= 0.9 + 0.15 * n;
   // Throat flare: the magnetic nozzle's hottest point.
   float throat = exp(-r2 / (2.0 * 0.25 * uR0 * uR0)) * exp(-z * 1.8) * 3.0;
   vec3 cCore = blackbody(16000.0) * 1.2;
-  return cCore * (core * 1.6 + throat) + uBalmer * env * 0.9;
+  // The envelope is a mix of Balmer recombination lines and free–free (bremsstrahlung) continuum,
+  // which dominates while the jet is still hot: pale violet-blue rather than a saturated neon pink.
+  vec3 cEnv = mix(blackbody(14000.0), uBalmer, 0.45 * smoothstep(0.05, 0.6, zn));
+  return uGain * (cCore * (core * 1.6 + throat) + cEnv * env * 0.9);
 }
 
 void main() {
@@ -140,13 +145,13 @@ export class EnginePlume {
   exposure = 1;
   pixelRatio = 1;
   /** Radiant strength used by the hull's engine light (arbitrary display units per unit thrust). */
-  readonly brightness = 3;
-  private maxLen = 110;
+  readonly brightness = 1.2;
+  private maxLen = 60;
 
   constructor(nozzle: THREE.Vector3, radius: number, steps = 28) {
     this.color = balmerColor();
     const R = radius * 0.62;
-    const div = Math.tan(THREE.MathUtils.degToRad(7.5));
+    const div = Math.tan(THREE.MathUtils.degToRad(3.5));
     const Rmax = R + div * this.maxLen;
     // Bounding cone (open cylinder frustum) along +Z starting at the throat exit.
     const g = new THREE.CylinderGeometry(R * 1.3, Rmax * 1.05, this.maxLen, 32, 1, false);
@@ -166,6 +171,7 @@ export class EnginePlume {
         uExposure: { value: 1 },
         uBalmer: { value: this.color },
         uSteps: { value: steps },
+        uGain: { value: 0.032 },
       },
       side: THREE.DoubleSide,
       blending: THREE.AdditiveBlending,
@@ -187,6 +193,11 @@ export class EnginePlume {
   }
   get thrust(): number {
     return this._thrust;
+  }
+
+  /** Overall emissivity scale (display units). */
+  set gain(g: number) {
+    this.mat.uniforms.uGain.value = g;
   }
 
   set steps(n: number) {

@@ -524,7 +524,9 @@ export function generateSystem(seed: number, hint: StarHint = {}): SystemData {
       else if (status === 'optimistic inner HZ') kind = !waterRich && rp.chance(0.5) ? 'desert' : 'venus';
       else if (status === 'habitable zone') kind = cls === 'water-world' || (waterRich && rp.chance(0.6)) ? 'ocean' : m < 0.25 ? 'desert' : 'terrestrial';
       else if (status === 'optimistic outer HZ') kind = m > 0.4 && waterRich ? 'terrestrial' : rp.chance(0.5) ? 'desert' : 'ice';
-      else kind = waterRich || rp.chance(0.5) ? 'ice' : 'desert';
+      // Cold and dry: a Mars-like rust desert down to ~120 K; colder, volatile frosts and a
+      // collapsed atmosphere leave bare, dark rock (Pluto/Triton-like surfaces are 'ice').
+      else kind = waterRich || rp.chance(0.5) ? 'ice' : Teq0 > 120 ? 'desert' : 'barren';
       albedo = { lava: 0.1, ice: 0.62, barren: 0.12, venus: 0.75, desert: 0.25, terrestrial: 0.3, ocean: 0.28 }[kind as 'lava'] ?? 0.3;
       composition =
         cls === 'water-world' ? 'Rock and iron under a deep global water layer'

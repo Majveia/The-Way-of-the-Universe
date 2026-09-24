@@ -57,9 +57,11 @@ void main() {
   float depth = smoothstep(0.05, 1.0, r);                 // the throat recedes into darkness…
   float core = exp(-r * 9.0);                             // …toward a pale far opening
   // Mostly dark, with luminous gas streaming along the spiral: OLED-friendly, not a green wall.
-  vec3 col = uGreen * (0.002 + 0.12 * pow(n, 4.0)) * depth;
-  col += uGreen * (fil * 0.55 + fil2 * 0.35) * (0.25 + 0.75 * depth) * smoothstep(0.02, 0.2, r);
-  col += mix(uGreen, vec3(1.0), 0.6) * core * 1.6;
+  // Filaments thin out toward the throat so the centre stays black until the iris opens.
+  float wall = smoothstep(0.12, 0.7, r);
+  vec3 col = uGreen * (0.001 + 0.05 * pow(n, 5.0)) * depth;
+  col += uGreen * (fil * 0.3 + fil2 * 0.14) * wall * (0.3 + 0.7 * depth);
+  col += mix(uGreen, vec3(1.0), 0.5) * exp(-r * 40.0) * 0.8;
   col *= uIntensity;
 
   // Rims: a thin hot edge and a soft halo (they add light over the scene as well).

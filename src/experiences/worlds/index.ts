@@ -113,7 +113,8 @@ class PossibleWorlds implements Experience {
     this.load(seed, true);
     this.bindInput();
     ctx.audio.setMood('worlds', { intensity: 0.35 });
-    ctx.ui.hint('Click a planet to visit · N next world · Space pause · Esc back', 9000);
+    const touch = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+    ctx.ui.hint(touch ? 'Tap a planet to visit · double-tap to go back' : 'Click a planet to visit · N next world · Space pause · Esc back', 9000);
     if (q.has('view')) this.setView(q.get('view')!);
     ctx.signalReady();
   }
@@ -156,6 +157,12 @@ class PossibleWorlds implements Experience {
     // Orient the sky differently for every system (we are somewhere else in the Galaxy).
     const r = new Rng(seed * 3 + 1);
     this.skyRotation.setFromEuler(new THREE.Euler(r.range(0, Math.PI * 2), r.range(0, Math.PI * 2), r.range(0, Math.PI * 2)));
+    // Look from ~120° around from the largest planet, so it shows a gibbous face rather than
+    // its night side (near-side planets are otherwise backlit dark disks against the star).
+    let big = 0;
+    this.layer.bodies.forEach((b, i) => { if (b.displayRadius > this.layer.bodies[big].displayRadius) big = i; });
+    const bp = this.layer.bodies[big]?.pos;
+    if (bp) this.rig.set({ yaw: Math.atan2(bp.x, bp.z) + 2.1 });
     this.frameSystem(initial ? 0 : -1);
     this.labels.build(this.sys);
     if (this.seedInput) this.seedInput.value = String(seed);
@@ -171,9 +178,18 @@ class PossibleWorlds implements Experience {
     const ext = this.layer.extent;
     this.rig.minDistance = this.layer.starRadius * 3;
     this.rig.maxDistance = Math.max(ext * 12, 1);
-    const d = ext * (this.width < this.height ? 3.6 : 2.05);
-    if (duration <= 0) this.rig.set({ distance: d, pitch: 0.36, yaw: this.rig.yaw });
-    else this.rig.flyTo({ distance: d, pitch: 0.36 }, duration);
+    // Fit the system's diameter across the width (≈ 80%), whatever the aspect ratio; portrait
+    // screens get a steeper view so the ellipse of orbits uses more of the height.
+    const d = ext * this.frameFactor;
+    const pitch = this.cssW < this.cssH ? 0.62 : 0.42;
+    if (duration <= 0) this.rig.set({ distance: d, pitch, yaw: this.rig.yaw });
+    else this.rig.flyTo({ distance: d, pitch }, duration);
+  }
+
+  /** Overview distance in units of the system's extent (fits ~80% of the width). */
+  private get frameFactor(): number {
+    const aspect = this.cssW / Math.max(1, this.cssH);
+    return THREE.MathUtils.clamp(1.27 / (Math.tan((21 * Math.PI) / 180) * aspect), 1.85, 5.2);
   }
 
   /** Natural clock: the innermost planet completes an orbit in ~25 s. */
@@ -317,6 +333,7 @@ class PossibleWorlds implements Experience {
         if (this.mode === 'orbit') {
           this.mode = 'closeup';
           this.rig.enabled = true;
+          this.ctx.ui.info(planetCard(this.sys, this.sys.planets[this.selected]));
           this.viewButtons?.setActive(1);
           this.updateReadoutLabels();
           return;
@@ -338,6 +355,8 @@ class PossibleWorlds implements Experience {
         this.orbitAlt = 0.04;
         this.orbitLook = { yaw: 0, pitch: 0.05 };
         this.viewButtons?.setActive(2);
+        // Low orbit is the cinematic view: the card steps aside (it returns with the planet view).
+        this.ctx.ui.info(null);
         this.updateReadoutLabels();
         break;
       }
@@ -439,7 +458,7 @@ class PossibleWorlds implements Experience {
     if (Math.abs(g - this.gammaGoal) > 1e-4) {
       const ng = g + (this.gammaGoal - g) * (1 - Math.exp(-dt / 0.35));
       this.layer.setCompression(Math.abs(ng - this.gammaGoal) < 2e-3 ? this.gammaGoal : ng);
-      if (this.mode === 'system' && this.focus.to < 0) this.rig.goal.logDistance = Math.log(this.layer.extent * 2.7);
+      if (this.mode === 'system' && this.focus.to < 0) this.rig.goal.logDistance = Math.log(this.layer.extent * this.frameFactor);
     }
     this.layer.setTime(this.timeDays);
     this.rig.update(dt);
@@ -494,7 +513,7 @@ class PossibleWorlds implements Experience {
   private applyOrbitCamera(): void {
     const c = this.closeup!;
     const o = this.oc;
-    const s = c.starDirection(this.tmp);
+    const s = c.skyDirection(this.tmp);
     // A horizontal direction perpendicular to the star: the terminator great circle's tangent.
     const axis = this.tmp2.set(0, 1, 0);
     if (Math.abs(s.dot(axis)) > 0.95) axis.set(1, 0, 0);
@@ -549,11 +568,11 @@ class PossibleWorlds implements Experience {
     this.camera.fov = this.mode === 'orbit' ? 60 : 42;
     r.setRenderTarget(target);
     // Sky at infinity: rotation only, with this system's orientation.
-    const saved = this.camera.quaternion.clone();
+    const saved = this.savedQuat.copy(this.camera.quaternion);
     this.camera.quaternion.premultiply(this.skyRotation);
     this.camera.near = 0.1;
     this.camera.far = 10;
-    const pos = this.camera.position.clone();
+    const pos = this.savedPos.copy(this.camera.position);
     this.camera.position.set(0, 0, 0);
     this.camera.updateMatrixWorld();
     this.camera.updateProjectionMatrix();
@@ -574,6 +593,8 @@ class PossibleWorlds implements Experience {
   }
 
   private frameShift = 0;
+  private savedQuat = new THREE.Quaternion();
+  private savedPos = new THREE.Vector3();
   private cardCheck = 0;
   private cardOpen = false;
 
@@ -681,7 +702,7 @@ class PossibleWorlds implements Experience {
     this.toggles.trueScale = on;
     this.gammaGoal = on ? 1 : 0.5;
     if (syncCtl) this.trueScaleCtl?.set(on);
-    if (this.mode === 'system' && this.focus.to < 0) this.rig.flyTo({ distance: Math.pow(this.layer.extent, this.gammaGoal / this.layer.compression) * 2.7 }, 1.2);
+    if (this.mode === 'system' && this.focus.to < 0) this.rig.flyTo({ distance: Math.pow(this.layer.extent, this.gammaGoal / this.layer.compression) * this.frameFactor }, 1.2);
   }
 
   private rebuildPlanetList(): void {

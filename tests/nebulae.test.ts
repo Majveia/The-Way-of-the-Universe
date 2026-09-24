@@ -305,3 +305,34 @@ describe('stellar populations', () => {
     expect(msTemperature(20)).toBeGreaterThan(30000);
   });
 });
+
+describe('optical depths that set the look', () => {
+  // The GLSL generators are not runnable here; these pin the densities they use (density.ts).
+  it('the Horsehead (n ≈ 2 × 10⁴ cm⁻³ over ≈ 0.5 pc) is opaque: A_V > 10 mag — a silhouette', () => {
+    const tau = tauVPerPc(2e4, PRESETS.horsehead.dustToGas) * 0.5;
+    expect(tau / 0.921).toBeGreaterThan(10);
+  });
+
+  it('the Pleiades veil (≈ 20–60 cm⁻³ over ≈ 2 pc) is thin: A_V well below 1 mag toward the stars', () => {
+    const av = (tauVPerPc(45, PRESETS.pleiades.dustToGas) * 2) / 0.921;
+    expect(av).toBeGreaterThan(0.05);
+    expect(av).toBeLessThan(0.6);
+  });
+
+  it('the Butterfly torus is resolved by the lighting bake (≥ 4 voxels at the default tier)', () => {
+    const L = buildLayout(PRESETS.butterfly, 0);
+    const shape = L.densityUniforms.uShape.value as { w: number };
+    const voxel = (2 * PRESETS.butterfly.half) / 128;
+    expect(shape.w / voxel).toBeGreaterThanOrEqual(4);
+  });
+
+  it('reflection nebulae are metered darker than emission nebulae so their stars stay visible', () => {
+    expect(PRESETS.pleiades.meter ?? 1.6).toBeLessThan(PRESETS.pillars.meter ?? 1.6);
+  });
+
+  it('σ Ori sits above B33 (it lights the crest, not the face we see)', () => {
+    const src = PRESETS.horsehead.source.pos;
+    expect(src[1]).toBeGreaterThan(3);
+    expect(src[2]).toBeLessThan(0.35); // no nearer to us than the horse (z = 0.35)
+  });
+});

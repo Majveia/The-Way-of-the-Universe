@@ -260,7 +260,11 @@ export class NebulaVolume {
         uAlpha: { value: 1 },
         uClip: { value: 1 },
         uHasHist: { value: 0 },
-        uSharp: { value: 2.0 },
+        // The low tier marches few steps: reconstruct fully with the Gaussian so its step noise
+        // never shows as a lattice (or as shimmer while the camera drifts).
+        uSharp: { value: this.quality.steps < 50 ? 0.8 : 1.1 },
+        uDenoise: { value: this.quality.steps < 50 ? 1 : 0.85 },
+        uStill: { value: 0 },
       },
     });
     const kExt = this.kExt();
@@ -378,7 +382,7 @@ export class NebulaVolume {
    * every seed lands at a good exposure: the 99.5th-percentile pixel maps to `target`.
    * Resolves after a tiny GPU readback; later calls are no-ops.
    */
-  async calibrate(renderer: THREE.WebGLRenderer, target = 1.6): Promise<void> {
+  async calibrate(renderer: THREE.WebGLRenderer, target = this.preset.meter ?? 1.6): Promise<void> {
     if (this.calibrated || !this.hasField) return;
     this.calibrated = true;
     try {
@@ -591,6 +595,7 @@ export class NebulaVolume {
     ru.uAlpha.value = alpha;
     ru.uClip.value = clip;
     ru.uHasHist.value = cut ? 0 : 1;
+    ru.uStill.value = moved ? 0 : 1;
     this.quad.material = this.matResolve;
     renderer.setRenderTarget(dst);
     renderer.render(this.quad.scene, this.quad.camera);

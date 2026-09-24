@@ -24,11 +24,13 @@ export class ShipCamera {
   /** Extra free-look angles in chase view (radians), decaying back to zero. */
   lookYaw = 0;
   lookPitch = 0;
+  /** Persistent framing offsets for chase view (radians) — a cinematic 3/4 angle for presets. Cleared by free look. */
+  yawBias = 0;
+  pitchBias = 0;
   private idle = 10;
   private follow = new THREE.Quaternion();
   private followInit = false;
   private tmpV = new THREE.Vector3();
-  private tmpV2 = new THREE.Vector3();
   private tmpQ = new THREE.Quaternion();
   private m = new THREE.Matrix4();
   private euler = new THREE.Euler();
@@ -61,6 +63,12 @@ export class ShipCamera {
 
   /** Free look in chase view (called by the experience when the drag is not steering). */
   look(dx: number, dy: number): void {
+    if (this.yawBias || this.pitchBias) {
+      // Hand the preset framing over to the (decaying) free look.
+      this.lookYaw += this.yawBias;
+      this.lookPitch += this.pitchBias;
+      this.yawBias = this.pitchBias = 0;
+    }
     this.lookYaw -= dx * 0.005;
     this.lookPitch = THREE.MathUtils.clamp(this.lookPitch - dy * 0.005, -1.2, 1.2);
     this.idle = 0;
@@ -89,7 +97,7 @@ export class ShipCamera {
     if (this.mode === 'cockpit') {
       cam.position.copy(cockpit).applyQuaternion(shipQuat);
       // Slight look-down so the nose frames the bottom of the view.
-      this.euler.set(-0.06 + this.lookPitch, this.lookYaw, 0, 'YXZ');
+      this.euler.set(0.02 + this.lookPitch, this.lookYaw, 0, 'YXZ');
       this.tmpQ.setFromEuler(this.euler);
       cam.quaternion.copy(shipQuat).multiply(this.tmpQ);
       this.decayLook(dt);
@@ -113,11 +121,11 @@ export class ShipCamera {
       this.follow.slerp(goal, k).normalize();
     }
     // Free-look offset applied in the follow frame.
-    this.euler.set(this.lookPitch, this.lookYaw, 0, 'YXZ');
-    const frame = this.tmpV2;
-    void frame;
+    this.euler.set(this.lookPitch + this.pitchBias, this.lookYaw + this.yawBias, 0, 'YXZ');
     const q = _q.copy(this.follow).multiply(_q2.setFromEuler(this.euler));
-    const want = this.tmpV.set(0, this.height * (this.distance / 36), this.distance).applyQuaternion(q);
+    // Portrait screens: back off so the ship keeps a similar share of the (narrow) width.
+    const dist = this.distance * THREE.MathUtils.clamp(1.3 / aspect, 1, 2.4);
+    const want = this.tmpV.set(0, this.height * (dist / 36), dist).applyQuaternion(q);
     if (!this.posInit) {
       this.pos.copy(want);
       this.posInit = true;
@@ -127,7 +135,7 @@ export class ShipCamera {
     }
     cam.position.copy(this.pos);
     // Look slightly ahead of the ship so it sits in the lower third.
-    const ahead = _v.set(0, this.height * 0.35 * (this.distance / 36), -this.distance * 0.55).applyQuaternion(q);
+    const ahead = _v.set(0, this.height * 0.35 * (dist / 36), -dist * 0.55).applyQuaternion(q);
     const upv = _v2.set(0, 1, 0).applyQuaternion(q);
     this.m.lookAt(cam.position, ahead, upv);
     cam.quaternion.setFromRotationMatrix(this.m);

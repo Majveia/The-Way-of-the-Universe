@@ -271,7 +271,7 @@ export class SystemLayer {
       // Light from the primary (the dominant source); a circumbinary pair acts as one lamp at
       // its luminosity-weighted centre, with the summed colour.
       const sunPos = sys.companion?.config === 'P' ? this.lampPosition(tmpB) : tmpB.copy(this.starPos);
-      tmpC.copy(this.lightColorAt(b.truePos)).multiplyScalar(b.irradiance);
+      this.lightColorAt(b.truePos, tmpC).multiplyScalar(b.irradiance);
       const dTrue = b.truePos.distanceTo(this.starTruePos);
       b.planet.update({ time: timeSec, sunPosition: sunPos, sunColor: tmpC, camera, sunAngularRadius: (sys.star.radius * R_SUN_AU) / Math.max(dTrue, 1e-6), renderer });
       if (b.eyeball) b.eyeball.update(tmpA.copy(sunPos).sub(b.pos).normalize(), tmpC);

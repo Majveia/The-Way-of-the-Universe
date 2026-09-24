@@ -174,7 +174,9 @@ function butterflyLayout(p: NebulaPreset, seed: number): VariantLayout {
       uAxis: { value: axis },
       uAxis2: { value: axis.clone() },
       // Lobe length, lobe half-width, torus radius, torus width (pc).
-      uShape: { value: new THREE.Vector4(0.58, c ? 0.2 : rng.range(0.14, 0.26), 0.035, 0.022) },
+      // The torus is kept ≥ 4 bake voxels thick so it can shadow itself (an unresolved torus
+      // leaks the central star's light into its outer skin and glows instead of forming a lane).
+      uShape: { value: new THREE.Vector4(0.58, c ? 0.2 : rng.range(0.14, 0.26), 0.07, 0.045) },
       uShape2: { value: new THREE.Vector4() },
     },
     source: [0, 0, 0],

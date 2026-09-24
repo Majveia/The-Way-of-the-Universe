@@ -26,6 +26,8 @@ uniform float uAlpha;
 uniform float uClip;
 uniform float uHasHist;
 uniform float uSharp;
+uniform float uStill;
+uniform float uDenoise;
 out vec4 outColor;
 
 vec3 ctm(vec3 c) { return c / (1.0 + luma(c)); }
@@ -83,6 +85,11 @@ void main() {
   // measure how well this pixel is covered this frame.
   vec4 cur = catmullRom(uCur, uv - uJitter / uLowSize, uLowSize);
   cur.rgb = ctm(cur.rgb);
+  // The ray-march jitter is interleaved gradient noise, which is built to cancel under a 3×3
+  // neighbourhood filter (Jimenez 2014). Blend toward the Gaussian reconstruction of the nine
+  // jittered samples: it removes the per-frame step noise at the low-res pixel frequency that
+  // the exponential history alone cannot average below ~√α of its amplitude.
+  cur = mix(cur, sum / max(wsum, 1e-6), uDenoise);
   vec4 res = cur;
   if (uHasHist > 0.5) {
     float depth = texture(uCurAux, uv).x;
@@ -98,7 +105,7 @@ void main() {
       // constant sub-pixel offset (float round-off in the reprojection) acts as a sharpening
       // filter and grows a checkerboard. Snap to the pixel when the motion is negligible.
       vec2 dpx = (puv - uv) * uFullSize;
-      vec4 hist = dot(dpx, dpx) < 1e-3 ? texelFetch(uHist, ivec2(gl_FragCoord.xy), 0) : catmullRom(uHist, puv, uFullSize);
+      vec4 hist = (uStill > 0.5 || dot(dpx, dpx) < 1e-3) ? texelFetch(uHist, ivec2(gl_FragCoord.xy), 0) : catmullRom(uHist, puv, uFullSize);
       vec4 mean = m1 / 9.0;
       vec4 sd = sqrt(max(m2 / 9.0 - mean * mean, vec4(0.0)));
       vec4 lo = mean - 1.25 * sd - vec4(vec3(0.002), 0.01);

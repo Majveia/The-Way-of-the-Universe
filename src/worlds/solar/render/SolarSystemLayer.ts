@@ -513,7 +513,10 @@ export class SolarSystemLayer {
     if (sunR.front) {
       const d = Math.max(sunR.dist, 1e-6);
       const corePx = Math.max(9 * Math.pow(Math.min(d, 400) / 3.9, -0.3), sunR.radiusPx * 1.15) ;
-      const strength = (0.42 * Math.pow(Math.max(d, 0.05) / 3.9, -0.45)) / expo;
+      // Once the photosphere is resolved the star renderer carries limb darkening, granulation and
+      // the corona itself: the lens-glare wings fade to a faint aureole so they don't veil the disc.
+      const resolved = THREE.MathUtils.smoothstep(sunR.radiusPx, 6, 70);
+      const strength = ((0.42 * Math.pow(Math.max(d, 0.05) / 3.9, -0.45)) / expo) * (1 - 0.94 * resolved);
       this.glare.update(this.sunRel, this.starRGB, strength, corePx * this.pixelRatio, corePx * this.pixelRatio * 9 + 220 * this.pixelRatio, this.width, this.height);
     } else this.glare.update(this.sunRel, this.starRGB, 0, 1, 1, this.width, this.height);
 
@@ -630,6 +633,12 @@ export class SolarSystemLayer {
     const s = this.settings;
     const pa = this.pixelAngle;
     let slot = 0;
+    const f = this.focus;
+    let heliocentricFade = 1;
+    if (f && f.def.kind !== 'star') {
+      const fr = this.byId.get(f.id)!;
+      heliocentricFade = 0.06 + 0.94 * THREE.MathUtils.smoothstep(fr.dist, 0.025, 0.4);
+    }
     for (const r of this.bodies) {
       const b = r.body;
       if (slot >= MAX_ORBITS) break;
@@ -643,9 +652,12 @@ export class SolarSystemLayer {
       const sizePx = (_geom.hyperbolic ? Math.max(_geom.a, b.local.length()) : _geom.a) / dParent / pa / this.pixelRatio;
       let alpha = THREE.MathUtils.smoothstep(sizePx, 10, 70);
       // Close to a body its own orbit degenerates into a straight line through it: fade it out.
-      alpha *= THREE.MathUtils.smoothstep(r.dist / Math.max(_geom.a, 1e-12), 0.002, 0.012);
+      alpha *= THREE.MathUtils.smoothstep(r.dist / Math.max(_geom.a, 1e-12), 0.004, 0.03);
       // Orbits of moons of an enlarged planet cannot be drawn honestly.
       if (b.def.kind === 'moon' && parent.scale > 1.5) alpha = 0;
+      // Close to a focused world the heliocentric orbits of everything else are lines through
+      // space far behind it: fade them so a planet close-up is not sliced by the ecliptic.
+      if (heliocentricFade < 1 && b.parent.def.kind === 'star' && b !== this.focus && b !== this.selected) alpha *= heliocentricFade;
       if (alpha <= 0.001) continue;
       const kind = b.def.kind;
       const base = kind === 'planet' ? 0.42 : kind === 'dwarf' ? 0.3 : kind === 'moon' ? 0.3 : kind === 'comet' ? (b === this.selected ? 0.34 : 0.16) : kind === 'spacecraft' ? 0.36 : 0.2;
@@ -666,7 +678,8 @@ export class SolarSystemLayer {
         // the incoming asymptote of the escape hyperbola is fictitious.
         if (b.def.kind === 'spacecraft' && b.conic && b.def.orbit.type === 'state') Hmin = Math.max(Hmin, hyperbolicAnomaly(b.conic, b.def.orbit.jd));
         _slot.rangeBack = Math.min(0, Hmin - _geom.anomaly);
-        _slot.rangeAhead = Math.max(0, Hmax - _geom.anomaly);
+        // Spacecraft trace the path flown so far; comets show where they are heading too.
+        _slot.rangeAhead = b.def.kind === 'spacecraft' ? 0 : Math.max(0, Hmax - _geom.anomaly);
       } else if (kind === 'comet' && _geom.a * (1 + _geom.e) > 40 && b !== this.selected) {
         // Long-period comets: draw only the inner arc (r < 40 AU) instead of a line to the Oort cloud.
         const cosMax = (1 - 40 / _geom.a) / _geom.e;
@@ -764,9 +777,12 @@ export class SolarSystemLayer {
       }
       if (b === this.selected) strength = 1;
       // Hidden behind a resolved disc (e.g. an inner planet seen through Saturn).
+      // A large disc also hides the labels of small bodies in front of it (a moon's point crossing
+      // Saturn is visible; its name written across the globe is just clutter).
       for (const o of this.occList) {
-        if (o === r || o.dist >= r.dist) continue;
+        if (o === r) continue;
         const R = o.radiusPx / this.pixelRatio;
+        if (o.dist >= r.dist && (b === this.selected || R < 24 || r.radiusPx >= o.radiusPx)) continue;
         if (Math.hypot(o.sx - r.sx, o.sy - r.sy) < R * 1.02) {
           strength = 0;
           break;
@@ -782,6 +798,11 @@ export class SolarSystemLayer {
       n++;
     }
     this.labels.update(this.labelList, n, dt, this.cssW, this.cssH);
+  }
+
+  /** Make labels jump to their new state on the next update (after an instant view change). */
+  snapLabels(): void {
+    this.labels?.snap();
   }
 
   /** Nearest pickable body to a CSS-pixel position, or null. */

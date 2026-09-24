@@ -461,3 +461,31 @@ describe('comets (Finson–Probstein dust, solar-wind ions)', () => {
     expect(betaForGrain(1, 1)).toBeCloseTo(0.57, 6);
   });
 });
+
+describe('curated views', () => {
+  it('Earthrise 1968: Earth clears the lunar limb, inside the frame, and is gibbous-to-half lit', async () => {
+    const { EVENTS } = await import('../src/experiences/solar/views');
+    const ev = EVENTS.find((e) => e.id === 'earthrise')!;
+    const m = new SolarSystemModel();
+    m.update(utcToTT(ev.jdUTC!));
+    const t = ev.view(m);
+    const moon = m.get('moon')!;
+    const earth = m.get('earth')!;
+    const look = moon.position.clone().add(t.target!);
+    const dir = V(Math.cos(t.pitch) * Math.sin(t.yaw), Math.sin(t.pitch), Math.cos(t.pitch) * Math.cos(t.yaw));
+    const cam = look.clone().addScaledVector(dir, t.distance);
+    const toEarth = earth.position.clone().sub(cam);
+    const toMoon = moon.position.clone().sub(cam);
+    const limb = Math.asin(moon.radius / toMoon.length());
+    // Earth's centre is beyond the Moon's limb (by more than its own angular radius).
+    expect(toEarth.angleTo(toMoon) - limb).toBeGreaterThan(Math.asin(earth.radius / toEarth.length()));
+    // …and within the vertical field of view around the line of sight.
+    const fwd = dir.clone().negate();
+    expect((toEarth.angleTo(fwd) * 180) / Math.PI).toBeLessThan((t.fov ?? 50) / 2);
+    // Phase of Earth seen from the Moon (Sun–Earth–camera angle): lit fraction (1 + cos α) / 2.
+    const alpha = earth.position.clone().negate().angleTo(cam.clone().sub(earth.position));
+    const lit = (1 + Math.cos(alpha)) / 2;
+    expect(lit).toBeGreaterThan(0.3);
+    expect(lit).toBeLessThan(0.9);
+  });
+});

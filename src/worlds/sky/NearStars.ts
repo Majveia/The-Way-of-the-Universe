@@ -109,6 +109,8 @@ export class NearStars {
   limit = 2.5e-3;
   brightness = 1;
   starSize = 1;
+  /** Display energy (× pr²) above which a point source saturates (log compression). */
+  saturation = 1500;
 
   constructor() {
     const g = new THREE.InstancedBufferGeometry();
@@ -152,9 +154,14 @@ export class NearStars {
       const s = stars[i];
       this.aDir.setXYZ(i, s.dir.x, s.dir.y, s.dir.z);
       // Same calibration as Sky's STAR3D sprites: E = 3.17 · 10^(−0.4 (m − 1)) · pr² display·px².
-      const E = 3.17 * Math.pow(10, -0.4 * (Math.max(s.mag, -40) - 1)) * this.brightness * exposure * pr * pr;
+      let E = 3.17 * Math.pow(10, -0.4 * (Math.max(s.mag, -40) - 1)) * this.brightness * exposure * pr * pr;
       const sigma = 0.85 * Math.sqrt(pr) * this.starSize;
       const rho = s.angularRadius / pxAngle;
+      // Detector saturation: above ~Ecap the pixel well is full and the eye/camera records glare, not
+      // more light. Log-compress the recorded energy so a −16 mag Sun seen from 150 AU does not flood
+      // the (energy-conserving) bloom with a grey veil. The cap scales with the resolved disc area.
+      const Ecap = this.saturation * pr * pr * Math.max(1, (rho * rho) / (9 * sigma * sigma));
+      if (E > Ecap) E = Ecap * (1 + Math.log(E / Ecap));
       const a = 2.0 * pr * this.starSize;
       const h0 = (0.03 * E * 1.4) / (Math.PI * a * a);
       let R = Math.max(3.2 * sigma, rho * 1.25 + 2);

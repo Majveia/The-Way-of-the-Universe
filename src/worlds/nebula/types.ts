@@ -85,6 +85,12 @@ export interface NebulaPreset {
   streak?: [number, number, number];
   /** Exposure normalisation: 1 / typical emission measure (pc cm⁻⁶) of the object (fallback; see NebulaVolume.calibrate). */
   gain: number;
+  /**
+   * Auto-exposure target for the metered 99.5th-percentile pixel (default 1.6). Reflection
+   * nebulae use less: their brightest pixels are the scattered-light halos hugging the stars,
+   * which would otherwise burn to white and swallow the stars themselves.
+   */
+  meter?: number;
   /** Representative density (cm⁻³) of the ionized gas, for the Strömgren-radius readout. */
   nRef?: number;
   /** Default palette. */

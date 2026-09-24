@@ -15,6 +15,7 @@ export class Labels {
   private selected = -1;
   private tmp = new THREE.Vector3();
   private tmp2 = new THREE.Vector3();
+  private starScreen = new THREE.Vector3();
 
   constructor(parent: HTMLElement, onPlanet: (i: number) => void, onStar: () => void) {
     this.root.style.cssText = 'position:absolute;inset:0;pointer-events:none;overflow:hidden';
@@ -56,6 +57,7 @@ export class Labels {
     this.star.textContent = sys.name;
     this.selected = -1;
     this.widths = [];
+    this.starW = 0;
   }
 
   setVisible(v: boolean): void {
@@ -70,6 +72,7 @@ export class Labels {
 
   private boxes: number[] = [];
   private widths: number[] = [];
+  private starW = 0;
 
   /** Greedy de-cluttering: labels are placed by priority and hidden when they would overlap. */
   private fits(x: number, y: number, w: number, h: number): boolean {
@@ -86,9 +89,9 @@ export class Labels {
     if (this.widths.length !== this.planets.length) this.widths = this.planets.map((e) => e.offsetWidth || 80);
     this.boxes.length = 0;
     // Reserve the planets' own disks and the star so labels do not cover them.
-    const s = layer.project(layer.starPos, camera, w, h, this.tmp);
+    const s = layer.project(layer.starPos, camera, w, h, this.starScreen);
     const srpx = Math.max(4, layer.pixelRadius(layer.starPos, layer.starRadius, camera, h));
-    if (s.z <= 1) this.boxes.push(s.x - srpx * 1.6, s.y - srpx * 1.6, s.x + srpx * 1.6, s.y + srpx * 1.6);
+    if (s.z <= 1) this.boxes.push(s.x - srpx, s.y - srpx, s.x + srpx, s.y + srpx);
     const order = layer.bodies.map((_, i) => i).sort((a, b) => (a === this.selected ? -1 : b === this.selected ? 1 : layer.bodies[b].data.radius - layer.bodies[a].data.radius));
     for (const i of order) {
       const b = layer.bodies[i];
@@ -102,8 +105,10 @@ export class Labels {
       e.style.pointerEvents = off ? 'none' : 'auto';
       if (!off) e.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
     }
-    const sx = s.x - 20, sy = s.y + srpx + 10;
-    const starOk = s.z <= 1 && this.fits(sx, sy, 70, 12);
+    if (!this.starW) this.starW = this.star.offsetWidth;
+    const sw = this.starW || 50;
+    const sx = s.x - sw / 2, sy = s.y + srpx * 0.75 + 8;
+    const starOk = s.z <= 1 && this.fits(sx, sy, sw, 12);
     this.star.style.opacity = starOk ? '0.7' : '0';
     if (starOk) this.star.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px)`;
     // Zone labels where each ring meets the screen's right-hand side (camera right, in-plane).
@@ -120,7 +125,7 @@ export class Labels {
     const p = this.tmp.copy(dir).multiplyScalar(r);
     const sp = layer.project(p, camera, w, h, p);
     const x = sp.x + 6, y = sp.y - 14;
-    const off = !ok || sp.z > 1 || sp.x < 0 || sp.x > w || sp.y < 0 || sp.y > h || !this.fits(x, y, 90, 12);
+    const off = !ok || sp.z > 1 || sp.x < 0 || x + 96 > w || sp.y < 0 || sp.y > h || !this.fits(x, y, 90, 12);
     el.style.opacity = off ? '0' : '1';
     if (!off) el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
   }

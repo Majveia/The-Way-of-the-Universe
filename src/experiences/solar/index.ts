@@ -38,6 +38,8 @@ class SolarExperience implements Experience {
   private live = false;
   private selected: SolarBody | null = null;
   private exposure = 1;
+  /** Jump straight to the metered exposure on the next frame (after an instant cut). */
+  private snapExposure = true;
   private readouts: Record<string, Readout> = {};
   private readoutTimer = 0;
   private infoTimer = 0;
@@ -92,7 +94,13 @@ class SolarExperience implements Experience {
 
     // Default composition: the inner system, today.
     this.applyView(VIEWS[0], true);
-    ctx.ui.hint('Drag to orbit · Scroll or pinch to zoom · Click a world to fly there · Double-click to follow · Space pauses · [ ] time warp', 9000);
+    const touch = typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
+    ctx.ui.hint(
+      touch
+        ? 'Drag to orbit · Pinch to zoom · Tap a world to fly there · Double-tap to follow'
+        : 'Drag to orbit · Scroll to zoom · Click a world to fly there · Double-click to follow · Space pauses · [ ] time warp · 0–9 planets',
+      9000,
+    );
     // Expose debug hooks through the experience object (window.__universe.experience).
     ctx.progress(1);
     void this.sky.ready.then(() => (this.ready = true));
@@ -334,6 +342,9 @@ class SolarExperience implements Experience {
       }
     }
     const t: ViewTarget = v.view(this.model);
+    // Portrait screens: pull back so what was composed for landscape still fits the width.
+    const aspect = this.ctx.engine.width / Math.max(1, this.ctx.engine.height);
+    if (aspect < 1.2 && !t.target) t.distance *= Math.pow(1.2 / aspect, 0.8);
     const body = this.model.get(t.focus)!;
     this.selected = t.focus === 'sun' ? null : body;
     this.layer.selected = this.selected;
@@ -343,6 +354,8 @@ class SolarExperience implements Experience {
     if (instant) {
       this.cam.set(body, { distance: t.distance, yaw: t.yaw, pitch: t.pitch, target: t.target });
       this.cam.fov = this.targetFov;
+      this.layer.snapLabels();
+      this.snapExposure = true;
     } else this.cam.flyTo(body, { distance: t.distance, yaw: t.yaw, pitch: t.pitch, target: t.target });
     const i = VIEWS.indexOf(v);
     this.viewButtons?.setActive(i);
@@ -429,7 +442,9 @@ class SolarExperience implements Experience {
     const sunR = this.model.sun.radius;
     if (focus.def.kind === 'star' || camSun < sunR * 40) {
       const d = Math.max(camSun / sunR, 1);
-      target = THREE.MathUtils.clamp(0.08 * Math.pow(d / 6, 0.9), 0.08, 1);
+      // The photosphere's disc-centre radiance is ~40 (createStar): meter so the centre sits just past
+      // white and the limb darkening, granulation and faculae read.
+      target = THREE.MathUtils.clamp(0.045 * Math.pow(d / 6, 0.9), 0.04, 1);
     } else {
       // Expose for the subject: fully compensate the 1/r² sunlight when a resolved body fills the
       // view (a camera metering on Saturn), partially for overviews so distance still reads as dimming.
@@ -437,9 +452,10 @@ class SolarExperience implements Experience {
       const close = 1 - THREE.MathUtils.smoothstep(this.cam.position.distanceTo(focus.position) / Math.max(focus.radius, 1e-12), 30, 400);
       target = Math.pow(this.layer.sunIntensity(r), -(0.75 + 0.25 * close));
     }
-    target = THREE.MathUtils.clamp(target, 0.05, 30);
-    const k = 1 - Math.exp(-dt / 0.8);
-    this.exposure = this.exposure * Math.exp((Math.log(target) - Math.log(this.exposure)) * (dt > 0 ? k : 1));
+    target = THREE.MathUtils.clamp(target, 0.015, 30);
+    const k = this.snapExposure || dt <= 0 ? 1 : 1 - Math.exp(-dt / 0.8);
+    this.snapExposure = false;
+    this.exposure = this.exposure * Math.exp((Math.log(target) - Math.log(this.exposure)) * k);
     this.ctx.post.exposure = this.exposure;
     // The star field keeps its display brightness (as a long exposure would), so divide it back out.
     this.sky.exposure = this.skyBase / this.exposure;
@@ -543,7 +559,11 @@ class SolarExperience implements Experience {
     const b = this.model.get(id);
     if (!b) return;
     this.select(b, !instant);
-    if (instant) this.cam.set(b, { distance: distance ?? this.frameDistance(b), yaw: Math.atan2(-b.position.x, -b.position.z) + 0.7, pitch: 0.28 });
+    if (instant) {
+      this.cam.set(b, { distance: distance ?? this.frameDistance(b), yaw: Math.atan2(-b.position.x, -b.position.z) + 0.7, pitch: 0.28 });
+      this.layer.snapLabels();
+      this.snapExposure = true;
+    }
   }
   set(key: keyof SolarLayerSettings, value: unknown): void {
     (this.layer.settings as unknown as Record<string, unknown>)[key] = value;

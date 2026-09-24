@@ -56,8 +56,10 @@ vec4 nebDensity(vec3 p) {
   float inCloud = max(inFloor, inBack);
   // Ragged outer edge: the cloud thins along fractal lanes instead of ending on a surface.
   float edgeN = fbm3(s * 0.5 + 21.0, 5);
-  vec3 ec = (p - vec3(-0.4, -0.2, -1.6)) / vec3(1.45, 1.25, 0.8);
-  float envelope = 1.0 - smoothstep(0.75 * uHalf, 1.1 * uHalf, length(ec) * (1.0 + 0.45 * edgeN));
+  // The envelope closes well inside the cube (the camera sees a wider field than the cube at the
+  // wall's depth), with a strongly fractal rim: the cloud frays into black sky on every side.
+  vec3 ec = (p - vec3(-0.25, -0.25, -1.6)) / vec3(1.05, 1.0, 0.8);
+  float envelope = 1.0 - smoothstep(0.58 * uHalf, 0.95 * uHalf, length(ec) * (1.0 + 0.6 * edgeN + 0.2 * g1));
   inCloud *= envelope;
   // Cavity blown by the cluster's winds and radiation pressure.
   float rs = length(p - uSource);
@@ -186,7 +188,9 @@ vec4 nebDensity(vec3 p) {
   float n = 700.0 * (shell + fill) * tipFade * exp(0.9 * g2 + 0.6 * streak);
   // Dense, dusty equatorial torus that hides the star behind a dark lane.
   float torus = exp(-sq((rho - uShape.z) / uShape.w)) * exp(-sq(h / (0.6 * uShape.w)));
-  float dustMod = 1.0 + 3.0 * torus;
+  // The torus is where the AGB wind was densest and grains formed: A_V of several magnitudes
+  // across it (Matsuura et al. 2005) — the dark lane that hides the central star.
+  float dustMod = 1.0 + 14.0 * torus;
   n = max(n, 12000.0 * torus * exp(0.6 * g2));
   return vec4(n, dustMod, 0.0, 0.0);
 }
@@ -326,7 +330,10 @@ vec4 nebDensity(vec3 p) {
   // Cloud surface: ragged, lower toward the left.
   float yE = -0.95 + 0.12 * p.x + 0.35 * fbm3(vec3(p.x * 0.4, 0.5, p.z * 0.4) + uSeedOff, 5) + 0.2 * g2;
   float cloud = smoothstep(0.12, -0.12, p.y - yE);
-  float n = 2600.0 * cloud * exp(0.9 * g2 + 0.35 * g3);
+  // L1630 ends toward us in a ragged face that σ Ori's light (from above, behind B33) never
+  // reaches: seen from Earth the photodissociation front is edge-on and the cloud's near side dark.
+  cloud *= smoothstep(1.45, 1.0, p.z + 0.35 * g1 + 0.15 * g3);
+  float n = 6000.0 * cloud * exp(0.7 * g2 + 0.3 * g3);
   // NGC 2023's cavity around the embedded B star.
   float cav = length(p - uScat0);
   n *= 0.12 + 0.88 * smoothstep(0.25, 0.75, cav * (1.0 + 0.3 * g3));
@@ -341,7 +348,9 @@ vec4 nebDensity(vec3 p) {
   n += flow;
   // The horse itself: dense, clumpy dust (B33).
   float d = horseDist(p + 0.05 * vec3(g3, g2, g1)) + 0.03 * g3;
-  n = max(n, 5200.0 * smoothstep(0.035, -0.035, d) * exp(0.4 * g2));
+  // n_H ≈ 2 × 10⁴ cm⁻³ (dense-core values, Pound et al. 2003; Hily-Blant et al. 2005): A_V > 10 mag
+  // across the head, so it stays black except for the skin that σ Ori's light actually reaches.
+  n = max(n, 20000.0 * smoothstep(0.035, -0.035, d) * exp(0.4 * g2));
   return vec4(n, 1.0, 0.0, 0.0);
 }
 `;
@@ -366,10 +375,14 @@ vec4 nebDensity(vec3 p) {
   float fil = 1.0 - abs(snoise(vec3(q.x * 0.15, q.y * 3.8, q.z * 1.6) + o.zxy));
   float slab = exp(-sq((dot(p, normalize(vec3(0.15, 0.3, 1.0))) + 0.2 + 0.6 * g1) / 1.1));
   float env = 1.0 - smoothstep(1.2, 3.3, length(p * vec3(0.8, 1.0, 1.0)) * (1.0 + 0.7 * g1));
-  float n = 120.0 * slab * env * exp(1.4 * st + 1.1 * fil * fil - 0.4);
+  // ≈ 20–60 cm⁻³ in the striations: A_V ≈ 0.1–0.5 mag toward the cluster (Gibson & Nordsieck
+  // 2003) — a thin veil the stars shine through, bright only because they are so close.
+  float n = 22.0 * slab * env * exp(1.4 * st + 1.1 * fil * fil - 0.4);
   for (int i = 0; i < 8; i++) {
     float r = length(p - uStarsA[i].xyz);
-    n *= 0.25 + 0.75 * smoothstep(0.04, 0.22, r);
+    // Radiation pressure on the grains clears a small cavity around each bright star (the
+    // "bow" of IC 349 near Merope, ≈ 0.06 pc; White 2003), so the halos stay finite.
+    n *= 0.06 + 0.94 * smoothstep(0.05, 0.32, r);
   }
   return vec4(n, 1.0, 0.0, 0.0);
 }

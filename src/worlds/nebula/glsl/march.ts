@@ -214,9 +214,19 @@ Medium medium(vec3 p, vec3 rd, float tCam) {
     M.cont += uWisp.w * wisp * uSynCore;
   }
 #endif
-  M.eA *= uEmission;
-  M.eB *= uEmission;
-  M.cont *= uEmission;
+  // OLED rule: nothing may reveal the simulation cube. Fade all gas and dust over the outer
+  // ~12 % of the box so a density field that reaches the walls ends in soft, ragged wisps
+  // (the detail noise modulates the fade) instead of on a straight face.
+  vec3 ab = abs(pc) / uHalf;
+  float edgeR = max(max(ab.x, ab.y), ab.z) + 0.05 * (D1.g - 0.5);
+  float edge = 1.0 - smoothstep(0.86, 0.985, edgeR);
+  edge *= edge;
+  M.sigma *= edge;
+  M.sheet.yzw *= edge;
+  float em = uEmission * edge;
+  M.eA *= em;
+  M.eB *= em;
+  M.cont *= em;
   return M;
 }
 
@@ -248,8 +258,12 @@ void main() {
 #else
     // IGN shifted spatially every frame (Jimenez 2014) plus a golden-ratio offset: the per-pixel
     // error pattern decorrelates between frames, so the temporal resolve averages it away.
-    float fm = mod(uFrame, 64.0);
-    float jit = fract(ign(gl_FragCoord.xy + 5.588238 * fm) + fm * 0.61803398875);
+    // Per-pixel IGN phase plus a per-frame golden-ratio (R1) offset: every pixel walks the most
+    // uniform 1D low-discrepancy sequence, so its running mean converges ~1/N. (Shifting the IGN
+    // pattern spatially as well would add ≈ 0.6 per frame and collapse the combined increment
+    // to ≈ 0.22 ≈ 1/5, which leaves a visible lattice after accumulation.)
+    float fm = mod(uFrame, 4096.0);
+    float jit = fract(ign(gl_FragCoord.xy) + fm * 0.61803398875);
 #endif
     float N = float(uSteps);
     float c = max(tn, uNearScale);
