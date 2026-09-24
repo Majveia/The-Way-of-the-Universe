@@ -62,6 +62,7 @@ uniform vec3 uDrift1;
 uniform vec3 uDrift2;
 uniform float uTurb;
 uniform float uFrontNoise;
+uniform vec3 uStreak;      // radial streaks: (angular frequency, radial frequency, weight)
 
 uniform vec3 uLnZone;      // ln C at the edge of the He⁺, O²⁺, He²⁺ zones
 uniform vec4 uRatiosA;     // Hα, Hβ, Hγ (Case B), [OIII]
@@ -125,6 +126,14 @@ Medium medium(vec3 p, vec3 rd) {
   vec4 D2 = texture(uDetail, pc * uDetailFreq.y + uDrift2);
 #ifdef PHOTO
   float turb = (D1.r - 0.5) * 1.4 + (D2.g - 0.45) * 1.1;
+  if (uStreak.z > 0.0) {
+    // Streaks along the radiation: photoevaporation flows and trunks point back at the source,
+    // so structure is long radially and fine transversally (sampled in source-centred angles).
+    vec3 rsv = pc - uSource;
+    float rl = length(rsv) + 1e-3;
+    vec4 D3 = texture(uDetail, (rsv / rl) * uStreak.x + vec3(rl * uStreak.y) + uDrift1 * 0.5);
+    turb = mix(turb, (D3.b - 0.5) * 2.2 + (D2.g - 0.45) * 0.6, uStreak.z);
+  }
   float m = exp(uTurb * turb);
   float xi = F.y + uFrontNoise * ((D1.a - 0.5) * 1.6 + (D2.r - 0.5) * 0.9);
   float g2 = F.z * F.z * m;

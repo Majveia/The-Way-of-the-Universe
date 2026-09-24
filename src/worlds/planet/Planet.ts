@@ -35,6 +35,13 @@ export interface PlanetRenderer extends PlanetView {
   readonly meanAlbedo: THREE.Color;
 }
 
+/**
+ * Radiance of a saturated city-light pixel. Real night lights are ~10⁻⁵ of daylight; like every
+ * image of Earth at night they are shown far brighter than a daylight exposure would record
+ * (the Earth experience says so in its info card).
+ */
+export const LIGHTS_SCALE = 0.9;
+
 const tmpM = new THREE.Matrix4();
 const tmpV = new THREE.Vector3();
 const tmpV2 = new THREE.Vector3();
@@ -183,7 +190,7 @@ export class Planet implements PlanetRenderer {
       uCloudOpacity: { value: hasClouds ? 1 : 0 },
       uCloudTime: { value: 0 },
       uCloudDensityScale: { value: kind === 'earth' ? 1 : 0.8 },
-      uLights: { value: (spec.cityLights ?? (kind === 'earth' ? 1 : 0)) * 0.05 },
+      uLights: { value: (spec.cityLights ?? (kind === 'earth' ? 1 : 0)) * LIGHTS_SCALE },
       uLightsColorA: { value: new THREE.Vector3(1.0, 0.56, 0.22) },
       uLightsColorB: { value: new THREE.Vector3(1.0, 0.82, 0.6) },
       uRoughness: { value: Math.sqrt(0.003 + 5.12e-3 * (spec.windSpeed ?? 7)) },
@@ -516,7 +523,7 @@ export class Planet implements PlanetRenderer {
     const c = this.common;
     if (o.clouds !== undefined) c.uCloudOpacity.value = o.clouds;
     if (o.atmosphere !== undefined) c.uAtmoIntensity.value = o.atmosphere * (this.atmo?.intensity ?? 1);
-    if (o.cityLights !== undefined) c.uLights.value = o.cityLights * 0.05;
+    if (o.cityLights !== undefined) c.uLights.value = o.cityLights * LIGHTS_SCALE;
     if (o.aurora !== undefined) c.uAurora.value = o.aurora;
     if (o.airglow !== undefined) c.uAirglow.value = o.airglow;
     if (o.relief !== undefined) c.uRelief.value = o.relief;

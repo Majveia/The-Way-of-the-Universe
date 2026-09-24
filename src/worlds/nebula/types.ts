@@ -81,6 +81,8 @@ export interface NebulaPreset {
   detailScale: [number, number];
   /** Amplitude of sub-voxel ionization-front perturbation (in ln C). */
   frontNoise: number;
+  /** Radial streak detail around the source: [angular freq, radial freq (1/pc), weight 0–1]. */
+  streak?: [number, number, number];
   /** Exposure normalisation: 1 / typical emission measure (pc cm⁻⁶) of the object. */
   gain: number;
   /** Default palette. */

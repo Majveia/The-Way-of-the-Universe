@@ -819,7 +819,7 @@ class Voyage implements Experience {
     // The brightest sprites (e.g. a star just outside the near radius).
     for (let i = 0; i < 7; i++) {
       if (this.nearList.some((e) => e.index === i)) continue;
-      if (this.sky.apparent(i, this.app) && this.app.mag < -3) push(this.app.dir, this.app.mag, this.app.temperature);
+      if (this.sky.apparent(i, this.app) && this.app.distance > 1e-9 && this.app.mag < -3) push(this.app.dir, this.app.mag, this.app.temperature);
     }
     L.sort((a, b) => b.illum - a.illum);
     let total = 0;
@@ -901,7 +901,7 @@ class Voyage implements Experience {
     r.setRenderTarget(target);
     this.sky.render(r, this.skyCam, eng.pixelRatio);
     const pxAngle = (2 * Math.tan(THREE.MathUtils.degToRad(this.skyCam.fov) / 2)) / target.height;
-    this.near.set(this.nearViews, pxAngle, eng.pixelRatio, this.exposure, target.width, target.height, Math.max(target.width, target.height) * 0.6);
+    this.near.set(this.nearViews, pxAngle, eng.pixelRatio, this.exposure, target.width, target.height, target.height * 0.28);
     this.near.render(r, this.skyCam);
     // Ship layer.
     if (this.view !== 'sky') {
@@ -967,6 +967,10 @@ class Voyage implements Experience {
       const tl = formatDuration(tauLeft * YEAR, 2);
       eta = `${tl.value} ${tl.unit} ship time to go · ${describeWarp(fl.warp)}`;
       p.tag.textContent = '';
+    } else if (this.view === 'sky' && fl.position.lengthSq() < 1e-16) {
+      phase = 'The sky from Earth';
+      eta = `${this.cat.count.toLocaleString('en-US').replace(/,/g, ' ')} catalogued stars · parallax from here`;
+      progress = 0;
     } else if (fl.phase === 'arrived' || dist < d.standoffAU * AU_PC * 1.2) {
       phase = 'Arrived';
       eta = `${formatNumber(dist / AU_PC, 3)} AU from ${d.name}`;
@@ -1022,7 +1026,28 @@ class Voyage implements Experience {
       this.targetLabel.sub = distLy < 0.01 ? `${formatNumber(dist / AU_PC, 3)} AU` : `${formatNumber(distLy, 3)} ly`;
       tgt = this.targetLabel;
     }
-    this.hud.update(items, tgt, cam, eng.cssWidth, eng.cssHeight);
+    // Keep labels off the ship.
+    const reserved = this.reservedBoxes;
+    reserved.length = 0;
+    if (this.view !== 'sky' && this.view !== 'cockpit') {
+      const pc = cam as THREE.PerspectiveCamera;
+      const c = _v3.set(0, 0, 0).applyMatrix4(pc.matrixWorldInverse);
+      if (c.z < 0) {
+        const dist = -c.z;
+        c.applyMatrix4(pc.projectionMatrix);
+        const sx = (c.x * 0.5 + 0.5) * eng.cssWidth, sy = (-c.y * 0.5 + 0.5) * eng.cssHeight;
+        const rpx = (this.ship.geometry.boundingRadius * 0.8 / dist) * (eng.cssHeight / 2) / Math.tan(THREE.MathUtils.degToRad(pc.fov) / 2);
+        reserved.push([sx - rpx, sy - rpx * 0.7, sx + rpx, sy + rpx * 0.7]);
+      }
+    }
+    this.hud.update(items, tgt, cam, eng.cssWidth, eng.cssHeight, reserved);
+  }
+  private reservedBoxes: [number, number, number, number][] = [];
+
+  /** Debug: place the orbit camera (radians, metres). */
+  orbitView(yaw: number, pitch: number, distance: number): void {
+    this.setView('orbit');
+    this.shipCam.orbit.set({ yaw, pitch, distance });
   }
 
   unmount(): void {

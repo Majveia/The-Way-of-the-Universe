@@ -61,8 +61,8 @@ export class DepthSlicer {
     }
   }
 
-  /** Build slices (far → near) between `minNear` and `maxFar`. Allocation-free. */
-  build(minNear: number, maxFar: number): Slice[] {
+  /** Build slices (far → near) between `minNear` and `maxFar` (fill = also cover the gaps). Allocation-free. */
+  build(minNear: number, maxFar: number, fill = false): Slice[] {
     this.slices.length = 0;
     const iv = this.iv;
     const n = this.ivN;
@@ -94,11 +94,11 @@ export class DepthSlicer {
       const f = Math.min(iv[i][1] * 1.001, cursor);
       const nn = Math.max(iv[i][0] * 0.999, minNear);
       if (f <= nn) continue;
-      if (cursor > f) this.range(f, cursor, MAX_FILL_RATIO, false);
+      if (fill && cursor > f) this.range(f, cursor, MAX_FILL_RATIO, false);
       this.range(nn, f, MAX_SOLID_RATIO, true);
       cursor = nn;
     }
-    if (cursor > minNear) this.range(minNear, cursor, MAX_FILL_RATIO, false);
+    if (fill && cursor > minNear) this.range(minNear, cursor, MAX_FILL_RATIO, false);
     return this.slices;
   }
 }

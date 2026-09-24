@@ -645,6 +645,7 @@ export class NebulaVolume {
       uDrift2: { value: new THREE.Vector3() },
       uTurb: { value: p.turbulence },
       uFrontNoise: { value: p.frontNoise },
+      uStreak: { value: new THREE.Vector3(p.streak?.[0] ?? 0, p.streak?.[1] ?? 0, p.streak?.[2] ?? 0) },
       uLnZone: { value: new THREE.Vector3() },
       uRatiosA: { value: new THREE.Vector4() },
       uRatiosB: { value: new THREE.Vector4() },

@@ -28,6 +28,7 @@ import { BeltPoints } from './BeltPoints';
 import { DepthSlicer } from './DepthSlices';
 import { Labels, type LabelCandidate } from './Labels';
 import { rockGeometry, rockMaterial } from './Rocks';
+import { SunGlare } from './SunGlare';
 import { sampleHildas, sampleKuiper, sampleMainBelt, sampleNEAs, sampleOort, sampleTrojans } from '../belts';
 
 export type ScaleMode = 'true' | 'enlarged';
@@ -123,7 +124,10 @@ const srgbToLinear = (hex: string) => new THREE.Color(hex); // three.Color parse
 
 export class SolarSystemLayer {
   readonly model: SolarSystemModel;
-  readonly scene = new THREE.Scene();
+  /** Resolved bodies (rendered per depth slice). */
+  readonly bodyScene = new THREE.Scene();
+  /** Lines, points, sprites and tails (one pass, analytic occlusion by the bodies). */
+  readonly overlayScene = new THREE.Scene();
   /** Camera at the origin (camera-relative rendering); near/far are set per depth slice. */
   readonly camera = new THREE.PerspectiveCamera(50, 1, 1e-9, 1e7);
   /** Camera position, heliocentric J2000-ecliptic (three.js axes), AU — float64. */
@@ -144,8 +148,13 @@ export class SolarSystemLayer {
 
   private renderer: THREE.WebGLRenderer;
   private detail: number;
-  private orbits = new OrbitLines();
+  /** Shared occluder uniforms (resolved bodies as spheres) for every overlay material. */
+  private occ = { uOcc: { value: Array.from({ length: 8 }, () => new THREE.Vector4()) }, uOccN: { value: 0 } };
+  private orbits = new OrbitLines(this.occ);
   private sprites: BodySprites;
+  private glare: SunGlare;
+  private occList: BodyRender[] = [];
+  private overlayNear = 1e-9;
   private slicer = new DepthSlicer();
   private width = 1;
   private height = 1;
@@ -157,6 +166,7 @@ export class SolarSystemLayer {
   private sunColor = new THREE.Color();
   private starRGB: [number, number, number];
   private labelCands: LabelCandidate[] = [];
+  private labelList: LabelCandidate[] = [];
   private creationsThisFrame = 0;
   private maxPointSize = 64;
   private orbitAlpha = new Float32Array(256);
@@ -201,21 +211,22 @@ export class SolarSystemLayer {
       this.byId.set(b.id, r);
       this.labelCands.push({ id: b.id, text: b.def.name, x: 0, y: 0, priority: b.def.priority, strength: 0, radius: 0, selected: false, tint: b.def.color });
     }
-    this.sprites = new BodySprites(model.bodies.length + 4);
-    this.scene.add(this.orbits.object, this.sprites.object);
+    this.sprites = new BodySprites(model.bodies.length + 4, this.occ);
+    this.glare = new SunGlare(this.occ);
+    this.overlayScene.add(this.glare.object, this.orbits.object, this.sprites.object);
     const d = this.detail;
     const n = (x: number) => Math.max(500, Math.round(x * d));
     // Reference fluxes chosen so a 10 km, p = 0.1 asteroid at r = 2.7 AU, Δ = 2 AU is display ≈ 1.
     const fluxRef = 0.1 * (10 * 6.6845871e-9) ** 2 / (2.7 * 2.7 * 2 * 2);
     this.belts = {
-      main: new BeltPoints(sampleMainBelt(n(60000)), { brightness: 0.05, gamma: 0.42, fluxRef }, 6),
-      hildas: new BeltPoints(sampleHildas(n(3500)), { brightness: 0.055, gamma: 0.42, fluxRef }, 6),
-      trojans: new BeltPoints(sampleTrojans(n(9000)), { brightness: 0.055, gamma: 0.42, fluxRef }, 7),
-      neas: new BeltPoints(sampleNEAs(n(1500)), { brightness: 0.04, gamma: 0.42, fluxRef }, 5),
-      kuiper: new BeltPoints(sampleKuiper(n(36000)), { brightness: 0.05, gamma: 0.36, fluxRef: fluxRef * 1e-4 }, 1200),
-      oort: new BeltPoints(sampleOort(n(16000)), { brightness: 0.05, gamma: 0.3, fluxRef: fluxRef * 1e-9 }, 2e5),
+      main: new BeltPoints(sampleMainBelt(n(60000)), { brightness: 0.05, gamma: 0.42, fluxRef }, 6, this.occ),
+      hildas: new BeltPoints(sampleHildas(n(3500)), { brightness: 0.055, gamma: 0.42, fluxRef }, 6, this.occ),
+      trojans: new BeltPoints(sampleTrojans(n(9000)), { brightness: 0.055, gamma: 0.42, fluxRef }, 7, this.occ),
+      neas: new BeltPoints(sampleNEAs(n(1500)), { brightness: 0.04, gamma: 0.42, fluxRef }, 5, this.occ),
+      kuiper: new BeltPoints(sampleKuiper(n(36000)), { brightness: 0.05, gamma: 0.36, fluxRef: fluxRef * 1e-4 }, 1200, this.occ),
+      oort: new BeltPoints(sampleOort(n(16000)), { brightness: 0.05, gamma: 0.3, fluxRef: fluxRef * 1e-9 }, 2e5, this.occ),
     };
-    for (const b of Object.values(this.belts)) this.scene.add(b.object);
+    for (const b of Object.values(this.belts)) this.overlayScene.add(b.object);
     this.labels = o.overlay ? new Labels(o.overlay, (id) => o.onLabelPick?.(id)) : null;
     const gl = renderer.getContext();
     const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array | number[] | null;
@@ -339,7 +350,7 @@ export class SolarSystemLayer {
       }
       if (r.object) {
         r.object.matrixAutoUpdate = true;
-        this.scene.add(r.object);
+        this.bodyScene.add(r.object);
         // Bounding radius relative to the created radius (rings, atmosphere, corona).
         if (!r.rock) {
           const box = new THREE.Box3().setFromObject(r.object);
@@ -453,15 +464,37 @@ export class SolarSystemLayer {
     }
     this.sprites.end();
 
-    // 3. Depth intervals of every visible mesh.
+    // 3. Depth intervals of every visible mesh; occluder spheres for the overlay pass.
+    const occ = this.occList;
+    occ.length = 0;
+    let nearest = Infinity;
     for (const r of this.bodies) {
       if (!r.object || !r.object.visible) continue;
-      const R = r.body.radius * r.scale * r.bound;
-      this.slicer.add(r.dist, R, 1e-12);
+      const R = r.body.radius * r.scale;
+      this.slicer.add(r.dist, R * r.bound, 1e-12);
+      nearest = Math.min(nearest, r.dist - R * r.bound);
+      if (r.radiusPx > 2) occ.push(r);
     }
+    occ.sort((a, b) => b.radiusPx - a.radiusPx);
+    const nOcc = Math.min(8, occ.length);
+    for (let i = 0; i < nOcc; i++) {
+      const r = occ[i];
+      // Oblate planets occlude with their polar radius (conservative for lines grazing the limb).
+      const rad = r.body.radius * r.scale * (r.body.radii.y / Math.max(r.body.radius, 1e-30) < 1 ? r.body.radii.y / r.body.radius : 1);
+      this.occ.uOcc.value[i].set(r.rel.x, r.rel.y, r.rel.z, rad * 0.999);
+    }
+    this.occ.uOccN.value = nOcc;
+    this.overlayNear = THREE.MathUtils.clamp(Math.min(isFinite(nearest) ? nearest * 0.02 : Infinity, cam.length() * 1e-6), 1e-12, 1e-3);
 
-    // 4. Orbits.
+    // 4. Orbits and the Sun's glare.
     this.updateOrbits(expo);
+    const sunR = this.byId.get('sun')!;
+    if (sunR.front) {
+      const d = Math.max(sunR.dist, 1e-6);
+      const corePx = Math.max(9 * Math.pow(Math.min(d, 400) / 3.9, -0.3), sunR.radiusPx * 1.15) ;
+      const strength = (0.42 * Math.pow(Math.max(d, 0.05) / 3.9, -0.45)) / expo;
+      this.glare.update(this.sunRel, this.starRGB, strength, corePx * this.pixelRatio, corePx * this.pixelRatio * 9 + 220 * this.pixelRatio, this.width, this.height);
+    } else this.glare.update(this.sunRel, this.starRGB, 0, 1, 1, this.width, this.height);
 
     // 5. Belts.
     const s = this.settings;
@@ -471,7 +504,8 @@ export class SolarSystemLayer {
       const belt = bm[k];
       let fade: number;
       if (k === 'oort') fade = s.oort ? THREE.MathUtils.smoothstep(camR, 400, 3000) : 0;
-      else if (k === 'kuiper') fade = s.kuiper ? 1 : 0;
+      // From inside ~15 AU the Kuiper belt surrounds us and is far too faint to see: fade it in from afar.
+      else if (k === 'kuiper') fade = s.kuiper ? THREE.MathUtils.smoothstep(camR, 12, 30) : 0;
       else fade = s.asteroids ? 1 - THREE.MathUtils.smoothstep(camR, 400, 3000) : 0;
       belt.fade = fade / expo;
       if (fade > 0) {
@@ -516,6 +550,35 @@ export class SolarSystemLayer {
     }
   }
 
+  /**
+   * How strongly to draw a body's orbit (0 = not at all). Planets always; moons by apparent size;
+   * dwarf planets, comets, asteroids and spacecraft only when they matter to the current view, so
+   * the default picture stays uncluttered.
+   */
+  private orbitPolicy(r: BodyRender): number {
+    const b = r.body;
+    if (b === this.selected || b === this.focus) return 1;
+    const camSun = this.cameraPosition.length();
+    const inFocus = this.focus !== null && (b.parent === this.focus || (this.focus.parent !== null && b.parent === this.focus.parent && b.parent.def.kind !== 'star'));
+    switch (b.def.kind) {
+      case 'planet':
+        return 1;
+      case 'moon':
+        return 1;
+      case 'dwarf': {
+        if (b.id === 'pluto' || b.id === 'ceres' || b.id === 'eris') return 0.8;
+        return THREE.MathUtils.smoothstep(camSun, 25, 60) * 0.7;
+      }
+      case 'comet':
+        // Active comets (inside ~6 AU) show their path; the rest only when selected.
+        return 1 - THREE.MathUtils.smoothstep(b.sunDistance, 4, 7);
+      case 'spacecraft':
+        return THREE.MathUtils.smoothstep(camSun, 20, 60) * 0.8;
+      default:
+        return inFocus ? 1 : 0;
+    }
+  }
+
   private updateOrbits(expo: number): void {
     const s = this.settings;
     const pa = this.pixelAngle;
@@ -524,6 +587,8 @@ export class SolarSystemLayer {
       const b = r.body;
       if (slot >= MAX_ORBITS) break;
       if (!s.orbits || !r.shown || !b.parent || b.def.kind === 'star') continue;
+      const policy = this.orbitPolicy(r);
+      if (policy <= 0) continue;
       if (!this.model.orbitGeometry(b, _geom)) continue;
       const parent = this.byId.get(b.parent.id)!;
       // Apparent size of the orbit: hide when sub-pixel, fade in by 60 px.
@@ -535,7 +600,7 @@ export class SolarSystemLayer {
       if (alpha <= 0.001) continue;
       const kind = b.def.kind;
       const base = kind === 'planet' ? 0.42 : kind === 'dwarf' ? 0.3 : kind === 'moon' ? 0.3 : kind === 'comet' ? 0.34 : kind === 'spacecraft' ? 0.36 : 0.2;
-      alpha *= base * (b === this.selected ? 1.9 : 1);
+      alpha *= base * policy * (b === this.selected ? 1.9 : 1);
       _slot.P.copy(_geom.P);
       _slot.Q.copy(_geom.Q);
       _slot.a = _geom.a;
@@ -551,6 +616,17 @@ export class SolarSystemLayer {
         if (b.def.kind === 'spacecraft' && b.def.visibleFrom) Hmin = Math.max(Hmin, _geom.anomaly - 60); // (whole post-flyby path)
         _slot.rangeBack = Math.min(0, Hmin - _geom.anomaly);
         _slot.rangeAhead = Math.max(0, Hmax - _geom.anomaly);
+      } else if (kind === 'comet' && _geom.a * (1 + _geom.e) > 40 && b !== this.selected) {
+        // Long-period comets: draw only the inner arc (r < 40 AU) instead of a line to the Oort cloud.
+        const cosMax = (1 - 40 / _geom.a) / _geom.e;
+        const Emax = Math.acos(THREE.MathUtils.clamp(cosMax, -1, 1));
+        let Eb = _geom.anomaly % (2 * Math.PI);
+        if (Eb > Math.PI) Eb -= 2 * Math.PI;
+        if (Eb < -Math.PI) Eb += 2 * Math.PI;
+        if (Math.abs(Eb) > Emax) continue;
+        _slot.anomaly = Eb;
+        _slot.rangeBack = -Emax - Eb;
+        _slot.rangeAhead = Emax - Eb;
       } else {
         _slot.rangeBack = -Math.PI;
         _slot.rangeAhead = Math.PI;
@@ -561,10 +637,10 @@ export class SolarSystemLayer {
       const lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
       const t = kind === 'comet' ? 0.3 : 0.5;
       const k = 1 / Math.max(lum, 0.05);
-      _slot.color.setRGB((lum + (c.r - lum) * t) * k, (lum + (c.g - lum) * t) * k, (lum + (c.b - lum) * t) * k).multiplyScalar(0.16 / expo);
+      _slot.color.setRGB((lum + (c.r - lum) * t) * k, (lum + (c.g - lum) * t) * k, (lum + (c.b - lum) * t) * k).multiplyScalar(0.12 / expo);
       _slot.alpha = alpha;
       _slot.bodyRadius = b.radius * r.scale;
-      _slot.trail = kind === 'planet' ? 1 : 0.8;
+      _slot.trail = kind === 'comet' || kind === 'spacecraft' ? 0 : kind === 'planet' ? 1 : 0.8;
       this.orbits.set(slot, _slot);
       this.orbitAlpha[slot] = alpha;
       slot++;
@@ -572,7 +648,10 @@ export class SolarSystemLayer {
     this.orbits.commit(slot);
   }
 
-  /** Draw every slice far → near into `target` (the caller has drawn the sky and cleared depth). */
+  /**
+   * Draw into `target` (the caller has drawn the sky and cleared depth): the resolved bodies slice by
+   * slice far → near, then every line, point and tail in one pass with analytic occlusion.
+   */
   render(target: THREE.WebGLRenderTarget): void {
     const r = this.renderer;
     r.setRenderTarget(target);
@@ -584,10 +663,14 @@ export class SolarSystemLayer {
       cam.near = s.near;
       cam.far = s.far;
       cam.updateProjectionMatrix();
-      this.orbits.near = s.near;
       r.clearDepth();
-      r.render(this.scene, cam);
+      r.render(this.bodyScene, cam);
     }
+    cam.near = this.overlayNear;
+    cam.far = maxFar;
+    cam.updateProjectionMatrix();
+    this.orbits.near = this.overlayNear * 1.001;
+    r.render(this.overlayScene, cam);
     cam.near = 1e-9;
     cam.far = 1e7;
     cam.updateProjectionMatrix();
@@ -629,15 +712,11 @@ export class SolarSystemLayer {
       c.radius = Math.max(r.radiusPx / this.pixelRatio, 2);
       c.strength = strength;
       c.selected = b === this.selected;
-      // Swap into the compact prefix.
-      if (n !== i) {
-        const tmp = this.labelCands[n];
-        this.labelCands[n] = c;
-        this.labelCands[i] = tmp;
-      }
+      if (n < this.labelList.length) this.labelList[n] = c;
+      else this.labelList.push(c);
       n++;
     }
-    this.labels.update(this.labelCands, n, dt, this.cssW, this.cssH);
+    this.labels.update(this.labelList, n, dt, this.cssW, this.cssH);
   }
 
   /** Nearest pickable body to a CSS-pixel position, or null. */
@@ -675,12 +754,13 @@ export class SolarSystemLayer {
       r.planet?.dispose();
       r.star?.dispose();
       if (r.rock) (r.rock.material as THREE.Material).dispose();
-      if (r.object) this.scene.remove(r.object);
+      if (r.object) this.bodyScene.remove(r.object);
     }
     for (const g of this.rockGeos.values()) g.dispose();
     this.rockGeos.clear();
     this.orbits.dispose();
     this.sprites.dispose();
+    this.glare.dispose();
     for (const b of Object.values(this.belts)) b.dispose();
     this.labels?.dispose();
   }

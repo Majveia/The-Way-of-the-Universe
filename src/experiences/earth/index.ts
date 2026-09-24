@@ -35,6 +35,16 @@ class EarthExperience implements Experience {
     c.normalize();
     this.rig.set({ distance, yaw: Math.atan2(c.x, c.z), pitch: Math.asin(c.y) });
   }
+  /** Debug: camera above a geographic point (deg), at `distance` Earth radii. */
+  lookAt(latDeg: number, lonDeg: number, distance = 2.6): void {
+    this.update({ dt: 0, time: 0, frame: 0 });
+    const s = sunState(msToJD(this.simMs));
+    const lat = (latDeg * Math.PI) / 180;
+    const ra = (lonDeg * Math.PI) / 180 + s.gmst;
+    radecToVector(ra, lat, this.astro);
+    const c = astroToThree(this.tmp.set(this.astro.x, this.astro.y, this.astro.z), new THREE.Vector3());
+    this.rig.set({ distance, yaw: Math.atan2(c.x, c.z), pitch: Math.asin(c.y) });
+  }
   setTime(iso: string): void {
     this.simMs = Date.parse(iso);
   }
@@ -55,6 +65,7 @@ class EarthExperience implements Experience {
     await this.earth.ready;
     ctx.progress(0.8, 'Atmosphere');
     this.update({ dt: 0, time: 0, frame: 0 });
+    if (ctx.params.has('lat')) this.lookAt(Number(ctx.params.get('lat')), Number(ctx.params.get('lon') ?? 0), Number(ctx.params.get('dist') ?? 2.6));
     const ph = ctx.params.get('phase');
     if (ph) this.setPhase(Number(ph), Number(ctx.params.get('elev') ?? 10), Number(ctx.params.get('dist') ?? 3.2));
     const opt = (k: string) => (ctx.params.has(k) ? Number(ctx.params.get(k)) : undefined);

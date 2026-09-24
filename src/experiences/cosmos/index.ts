@@ -193,7 +193,7 @@ class CosmicWebExperience implements Experience {
 
     const L = this.box / this.cosmo.h;
     this.orbit = new OrbitRig(ctx.input, {
-      distance: 1.72 * L,
+      distance: 2.05 * L,
       yaw: 0.62,
       pitch: 0.36,
       minDistance: 0.5,
@@ -612,7 +612,7 @@ class CosmicWebExperience implements Experience {
         case 'volume':
           this.state.wrap = false;
           this.state.slab = null;
-          o.flyTo({ target: new THREE.Vector3(), distance: 1.72 * L, pitch: 0.36 }, 2.6);
+          o.flyTo({ target: new THREE.Vector3(), distance: 2.05 * L, pitch: 0.36 }, 2.6);
           o.autoRotate = 0.028;
           break;
         case 'slice':
@@ -1153,6 +1153,10 @@ class CosmicWebExperience implements Experience {
       };
       check();
     });
+  }
+
+  debugGPU(): Record<string, number> | null {
+    return this.web ? this.web.debugStats() : null;
   }
 
   /** Snapshot of the state for automated checks. */

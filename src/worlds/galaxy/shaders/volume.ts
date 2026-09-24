@@ -182,7 +182,9 @@ void main() {
 
     // Young stars (diffuse, clumped into associations) and HII regions ([OIII] cores where brightest).
     if ((uMask & 16) != 0) {
-      float clump = 0.3 + 1.6 * n2.r * n2.r * (0.6 + 0.8 * n.b);
+      // OB associations and star complexes: strongly clumped (mean ≈ 1).
+      float c4 = n2.r * n2.r;
+      float clump = 0.12 + 11.0 * c4 * c4 * (0.6 + 0.8 * n.b);
       j += uColYoung * (uYoungP.x * mp.g * clump * exp(-abs(h) / uYoungP.y) / (2.0 * uYoungP.y));
     }
     if ((uMask & 32) != 0) {

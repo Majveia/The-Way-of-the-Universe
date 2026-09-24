@@ -445,7 +445,7 @@ export class GalaxyLayer {
     const youngVol = Math.max(0, p.young.lum - youngPart) * Math.min(2, p.young.sfr * this.live.sfr);
     (vu.uYoungP.value as THREE.Vector2).set(this.youngInt > 0 ? youngVol / this.youngInt / fourPi : 0, Math.max(40, p.young.scaleHeight * 1.6));
     // Hα + [NII] + Hβ… of ionised gas: a few per cent of the young stars' light, very concentrated.
-    const hiiL = 0.1 * p.young.lum * p.gas.hii * Math.min(2, p.young.sfr * this.live.sfr);
+    const hiiL = 0.2 * p.young.lum * p.gas.hii * Math.min(2, p.young.sfr * this.live.sfr);
     (vu.uHIIP.value as THREE.Vector2).set(this.hiiInt > 0 ? hiiL / this.hiiInt / fourPi : 0, 60);
   }
 

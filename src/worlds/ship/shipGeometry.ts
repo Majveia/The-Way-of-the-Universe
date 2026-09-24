@@ -67,8 +67,9 @@ const SP = 0.46; // station of maximum width
 export function fuselageHalfWidth(s: number): number {
   const { halfWidth } = SHIP_DIMENSIONS;
   if (s < SP) {
+    // A rounded "seed" nose: superelliptic ogive (blunter than a jet's).
     const t = 1 - s / SP;
-    return halfWidth * Math.pow(Math.max(0, 1 - t * t), 0.62);
+    return halfWidth * Math.pow(Math.max(0, 1 - Math.pow(t, 2.3)), 0.5);
   }
   return halfWidth * (1 - 0.6 * Math.pow(smooth(SP, 1, s), 1.15));
 }
@@ -78,7 +79,7 @@ export function fuselageHalfHeight(s: number): number {
   const sp = 0.38;
   if (s < sp) {
     const t = 1 - s / sp;
-    return halfHeight * Math.pow(Math.max(0, 1 - t * t), 0.58);
+    return halfHeight * Math.pow(Math.max(0, 1 - Math.pow(t, 2.2)), 0.5);
   }
   return halfHeight * (1 - 0.62 * Math.pow(smooth(sp, 1, s), 1.1));
 }
@@ -196,7 +197,7 @@ function buildCanopy(detail: number): Part {
   const p = newPart(SHIP_PART.canopy);
   const nu = Math.round(40 * detail);
   const nv = Math.round(36 * detail);
-  const s0 = 0.12, s1 = 0.42;
+  const s0 = 0.1, s1 = 0.43;
   loft(
     p,
     nu,
@@ -205,13 +206,13 @@ function buildCanopy(detail: number): Part {
       const s = s0 + (s1 - s0) * u;
       // Teardrop plan and profile.
       const tt = u < 0.35 ? Math.sqrt(Math.max(0, 1 - Math.pow(1 - u / 0.35, 2))) : 1 - 0.85 * Math.pow(smooth(0.35, 1, u), 1.4);
-      const halfW = 0.78 * tt + 0.001;
-      const bulge = 0.62 * tt;
+      const halfW = 1.0 * tt + 0.001;
+      const bulge = 1.0 * tt;
       const top = fuselageCenterY(s) + fuselageHalfHeight(s) * 0.97;
       const th = v * Math.PI; // 0 → starboard, π → port
       const c = Math.cos(th), sn = Math.sin(th);
       const x = halfW * Math.sign(c) * Math.pow(Math.abs(c), 0.8);
-      const y = top - 0.25 + (bulge + 0.25) * Math.pow(sn, 0.7);
+      const y = top - 0.3 + (bulge + 0.3) * Math.pow(sn, 0.62);
       return [x, y, stationZ(s)];
     },
     false,
@@ -222,7 +223,7 @@ function buildCanopy(detail: number): Part {
 
 function buildRing(detail: number): Part {
   const p = newPart(SHIP_PART.ring);
-  const R = 1.18, r = 0.2;
+  const R = 1.34, r = 0.25;
   const z0 = SHIP_DIMENSIONS.tailZ + 0.35;
   const cy = fuselageCenterY(1) - 0.02;
   loft(
@@ -251,7 +252,7 @@ function buildNozzle(detail: number): Part {
     Math.round(64 * detail),
     (u, v) => {
       const a = v * Math.PI * 2;
-      const r = 0.42 + 0.6 * Math.pow(u, 1.6);
+      const r = 0.42 + 0.76 * Math.pow(u, 1.6);
       return [r * Math.cos(a), cy + r * Math.sin(a), z0 + 0.95 * u];
     },
     true,
@@ -343,8 +344,8 @@ export function buildShipGeometry(detail = 1): ShipGeometry {
       { position: new THREE.Vector3(0, fuselageCenterY(0.55) - fuselageHalfHeight(0.55) * 0.86 - 0.05, stationZ(0.55)), kind: 'beacon' },
     ],
     nozzle: new THREE.Vector3(0, cy, SHIP_DIMENSIONS.tailZ - 0.2),
-    nozzleRadius: 1.02,
-    cockpit: new THREE.Vector3(0, fuselageCenterY(0.24) + fuselageHalfHeight(0.24) + 0.18, stationZ(0.24)),
+    nozzleRadius: 1.18,
+    cockpit: new THREE.Vector3(0, fuselageCenterY(0.25) + fuselageHalfHeight(0.25) + 0.42, stationZ(0.25)),
     boundingRadius: 14.5,
   };
 }

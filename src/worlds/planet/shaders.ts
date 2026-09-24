@@ -158,8 +158,8 @@ struct Surf {
 vec3 cityGlow(vec3 d, float footprint) {
 #if defined(KIND_EARTH)
   vec2 uv = equirectUV(d);
-  float l = textureLod(uNight, uv, 5.0).r;
-  return mix(uLightsColorA, uLightsColorB, 0.35) * l * l * uLights;
+  float l = pow(textureLod(uNight, uv, 4.0).r, 2.2);
+  return mix(uLightsColorA, uLightsColorB, 0.35) * l * uLights;
 #else
   return vec3(0.0);
 #endif
@@ -207,8 +207,9 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
     float sy = (hN - hS) / (2.0 * dv * PI * 6.371e6);
     s.N = normalize(n - uRelief * (sx * east + sy * north));
   }
-  float lights = sampleEqui(uNight, e).r;
-  s.emission = lights * lights * (1.0 - water * 0.9);
+  // Black Marble radiance, stored as L^(1/2.2).
+  float lights = pow(sampleEqui(uNight, e).r, 2.2);
+  s.emission = lights * (1.0 - water * 0.9);
 #elif defined(TEX_MOON)
   EquiUV e = equirect(d);
   s.albedo = sampleEqui(uMoonColor, e).rgb * 0.62 * uTintRT;

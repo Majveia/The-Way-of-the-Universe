@@ -86,8 +86,8 @@ void main() {
     disc = edge * limb * gran / (3.14159265 * rho * rho * (1.0 - 0.6 / 3.0));
   }
   float body = mix(core, disc, kDisc) * E;
-  // Glare halo (Moffat β = 1.8), tapered to zero at the quad edge.
-  float halo = vEnergy.y * pow(1.0 + r * r / (a * a), -1.8);
+  // Glare halo (Moffat β = 2.4), tapered to zero at the quad edge.
+  float halo = vEnergy.y * pow(1.0 + r * r / (a * a), -2.4);
   float t = 1.0 - (r * r) / (R * R);
   halo *= t * t;
   // Limb reddening: the outer photosphere is cooler.
@@ -155,13 +155,13 @@ export class NearStars {
       const E = 3.17 * Math.pow(10, -0.4 * (Math.max(s.mag, -40) - 1)) * this.brightness * exposure * pr * pr;
       const sigma = 0.85 * Math.sqrt(pr) * this.starSize;
       const rho = s.angularRadius / pxAngle;
-      const a = 2.2 * pr * this.starSize;
-      const h0 = (0.1 * E * 0.8) / (Math.PI * a * a);
+      const a = 2.0 * pr * this.starSize;
+      const h0 = (0.03 * E * 1.4) / (Math.PI * a * a);
       let R = Math.max(3.2 * sigma, rho * 1.25 + 2);
-      if (h0 > this.limit) R = Math.max(R, a * Math.sqrt(Math.pow(h0 / this.limit, 1 / 1.8) - 1));
+      if (h0 > this.limit) R = Math.max(R, a * Math.sqrt(Math.pow(h0 / this.limit, 1 / 2.4) - 1));
       R = Math.min(R, Math.max(maxRadiusPx, rho * 1.25 + 2));
       this.aSize.setXYZW(i, R, rho, sigma, a);
-      this.aEnergy.setXYZW(i, 0.9 * E, h0, s.seed, E > 1e-7 ? 1 : 0);
+      this.aEnergy.setXYZW(i, 0.97 * E, h0, s.seed, E > 1e-7 ? 1 : 0);
       this.blackbody(s.temperature, this.col);
       this.aColor.setXYZ(i, this.col.r, this.col.g, this.col.b);
     }

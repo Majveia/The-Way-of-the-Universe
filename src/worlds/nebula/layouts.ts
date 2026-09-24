@@ -39,9 +39,9 @@ function pillarsLayout(p: NebulaPreset, seed: number): VariantLayout {
   // Pillars: [base x, base z, length fraction, radius]
   const specs: Array<[number, number, number, number]> = curated
     ? [
-        [-1.85, -0.35, 0.56, 0.4],
-        [-0.45, 0.2, 0.42, 0.3],
-        [0.55, -0.75, 0.33, 0.24],
+        [-1.9, -0.45, 0.55, 0.4],
+        [-0.55, 0.15, 0.44, 0.3],
+        [0.5, -0.8, 0.34, 0.24],
       ]
     : Array.from({ length: rng.chance(0.4) ? 4 : 3 }, (_, i, ) => [
         -2.3 + i * 1.15 + rng.normal(0, 0.25),

@@ -61,9 +61,9 @@ void main() {
     float wig = uFloc * (0.22 * nLarge + 0.1 * nMid);
     float d = wrapPi(phi - armPhiK(k, R) + wig) * R * sinI;
     float brk = mix(1.0, smoothstep(-0.35, 0.25, nLarge + 0.3 * nMid), uFloc * 0.8);
-    young += w * brk * exp(-0.5 * sq((d - sd * 0.45 * sig) / (0.95 * sig)));
-    hii += w * brk * exp(-0.5 * sq((d - sd * 0.55 * sig) / (0.7 * sig)));
-    lane += w * mix(1.0, brk, 0.6) * exp(-0.5 * sq((d + sd * 0.6 * sig) / (0.5 * sig)));
+    young += w * brk * exp(-0.5 * sq((d - sd * 0.35 * sig) / (0.85 * sig)));
+    hii += w * brk * exp(-0.5 * sq((d - sd * 0.3 * sig) / (0.6 * sig)));
+    lane += w * mix(1.0, brk, 0.6) * exp(-0.5 * sq((d + sd * 0.55 * sig) / (0.5 * sig)));
     armGas += w * exp(-0.5 * sq((d + sd * 0.15 * sig) / (1.4 * sig)));
   }
 

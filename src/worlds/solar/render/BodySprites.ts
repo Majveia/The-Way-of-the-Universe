@@ -6,15 +6,20 @@
  * sphere hides its own sprite and only the soft wing remains while they cross-fade.
  */
 import * as THREE from 'three';
-import { PSF_GLSL } from './glsl';
+import { OCCLUDE_GLSL, PSF_GLSL } from './glsl';
 
 const VERT = /* glsl */ `
 precision highp float;
+${OCCLUDE_GLSL}
 in vec4 aColor;   // rgb × intensity, a = sigma (device px)
 out vec3 vColor;
 out float vSigma;
 out float vSize;
 void main() {
+  vColor = vec3(0.0);
+  vSigma = 1.0;
+  vSize = 1.0;
+  if (occlusion(position) > 0.5) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
   vec4 mv = modelViewMatrix * vec4(position, 1.0);
   gl_Position = projectionMatrix * mv;
   vSigma = aColor.a;
@@ -46,7 +51,7 @@ export class BodySprites {
   private n = 0;
   readonly max: number;
 
-  constructor(max: number) {
+  constructor(max: number, shared: Record<string, THREE.IUniform>) {
     this.max = max;
     this.pos = new Float32Array(max * 3);
     this.col = new Float32Array(max * 4);
@@ -60,8 +65,9 @@ export class BodySprites {
       glslVersion: THREE.GLSL3,
       vertexShader: VERT,
       fragmentShader: FRAG,
+      uniforms: { ...shared },
       transparent: true,
-      depthTest: true,
+      depthTest: false,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });

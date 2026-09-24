@@ -81,9 +81,10 @@ export class Hud {
     return [x, y];
   }
 
-  update(items: readonly LabelItem[], target: LabelItem | null, camera: THREE.Camera, w: number, h: number): void {
-    // Reticle first (it reserves its space).
+  update(items: readonly LabelItem[], target: LabelItem | null, camera: THREE.Camera, w: number, h: number, reserved?: readonly [number, number, number, number][]): void {
+    // Reserved areas (e.g. the ship), then the reticle.
     this.boxes.length = 0;
+    if (reserved) for (const b of reserved) this.boxes.push(b);
     let rp: [number, number] | null = null;
     if (target) rp = this.project(target.dir, camera, w, h);
     if (rp) {

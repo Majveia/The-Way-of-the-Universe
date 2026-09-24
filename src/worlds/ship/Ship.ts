@@ -196,8 +196,10 @@ Mat hullMaterial() {
     m.metal = 1.0;
     m.rough = 0.45;
     float depth = 1.0 - vUv.x;
-    m.emit += blackbody(1100.0 + 900.0 * uThrust) * (0.02 + 0.3 * uThrust) * pow(depth, 2.0);
-    m.emit += uEngineColor * 0.02 * pow(depth, 3.0);
+    // Standby: the magnetic nozzle's faint cool glow; under thrust the throat runs white-hot.
+    m.emit += vec3(0.35, 0.5, 1.0) * 0.012 * pow(depth, 3.0);
+    m.emit += blackbody(1400.0 + 1800.0 * uThrust) * 0.35 * uThrust * pow(depth, 2.0);
+    m.emit += uEngineColor * 0.03 * uThrust * pow(depth, 3.0);
   } else {
     // Tail cap: ceramic, heat-tinted near the drive.
     m.albedo = ceramic * 1.4;

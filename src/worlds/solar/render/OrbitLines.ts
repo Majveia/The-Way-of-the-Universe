@@ -12,6 +12,7 @@
  * Per-orbit parameters live in a float texture (8 texels × MAX_ORBITS).
  */
 import * as THREE from 'three';
+import { OCCLUDE_GLSL } from './glsl';
 
 export const MAX_ORBITS = 128;
 const SEGMENTS = 720;
@@ -29,6 +30,7 @@ uniform float uNear;
 out vec3 vColor;
 out float vSide;
 out float vHalf;
+out vec3 vRel;
 
 vec4 T(int k, int o) { return texelFetch(uData, ivec2(k, o), 0); }
 
@@ -54,7 +56,7 @@ vec4 conicOffset(float u, int o, out float alongFade) {
   float tr = T(5, o).z;
   float span = max(abs(t4.z), abs(t4.w));
   float x = abs(d) / max(span, 1e-6);
-  alongFade = d < 0.0 ? mix(0.22, 1.0, exp(-x * tr * 3.2)) : mix(0.22, 0.6, exp(-x * tr * 9.0));
+  alongFade = tr <= 0.0 ? 1.0 : d < 0.0 ? mix(0.22, 1.0, exp(-x * tr * 3.2)) : mix(0.22, 0.6, exp(-x * tr * 9.0));
   return vec4(off, d);
 }
 
@@ -67,16 +69,19 @@ void main() {
   vColor = vec3(0.0);
   vSide = 0.0;
   vHalf = 1.0;
+  vRel = vec3(0.0);
   if (alpha <= 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   float f0, f1;
   vec4 o0 = conicOffset(aSeg.x, o, f0);
   vec4 o1 = conicOffset(aSeg.y, o, f1);
-  vec4 v0 = modelViewMatrix * vec4(bodyRel + o0.xyz, 1.0);
-  vec4 v1 = modelViewMatrix * vec4(bodyRel + o1.xyz, 1.0);
+  vec3 w0 = bodyRel + o0.xyz;
+  vec3 w1 = bodyRel + o1.xyz;
+  vec4 v0 = modelViewMatrix * vec4(w0, 1.0);
+  vec4 v1 = modelViewMatrix * vec4(w1, 1.0);
   float nz = -uNear;
   if (v0.z > nz && v1.z > nz) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
-  if (v0.z > nz) v0 = mix(v0, v1, (nz - v0.z) / (v1.z - v0.z));
-  if (v1.z > nz) v1 = mix(v1, v0, (nz - v1.z) / (v0.z - v1.z));
+  if (v0.z > nz) { float t = (nz - v0.z) / (v1.z - v0.z); v0 = mix(v0, v1, t); w0 = mix(w0, w1, t); }
+  if (v1.z > nz) { float t = (nz - v1.z) / (v0.z - v1.z); v1 = mix(v1, v0, t); w1 = mix(w1, w0, t); }
   vec4 c0 = projectionMatrix * v0;
   vec4 c1 = projectionMatrix * v1;
   vec2 s0 = c0.xy / c0.w * 0.5 * uViewport;
@@ -88,7 +93,7 @@ void main() {
   bool end = position.x > 0.5;
   vec4 c = end ? c1 : c0;
   float hw = 0.5 * uWidth + 1.0;
-  vec2 offPx = nrm * position.y * hw + dir * (end ? 0.5 : -0.5);
+  vec2 offPx = nrm * position.y * hw;
   gl_Position = c + vec4(offPx / (0.5 * uViewport) * c.w, 0.0, 0.0);
   // Near-body fade: the line emerges from the body instead of crossing its disc.
   float rb = t5.x;
@@ -98,17 +103,20 @@ void main() {
   vColor = t3.rgb * alpha * along * nearFade;
   vSide = position.y * hw;
   vHalf = 0.5 * uWidth;
+  vRel = end ? w1 : w0;
 }`;
 
 const FRAG = /* glsl */ `
 precision highp float;
+${OCCLUDE_GLSL}
 in vec3 vColor;
 in float vSide;
 in float vHalf;
+in vec3 vRel;
 out vec4 outColor;
 void main() {
   float cov = clamp(vHalf + 0.5 - abs(vSide), 0.0, 1.0);
-  if (cov <= 0.0) discard;
+  if (cov <= 0.0 || occlusion(vRel) > 0.5) discard;
   outColor = vec4(vColor * cov, 1.0);
 }`;
 
@@ -144,7 +152,7 @@ export class OrbitLines {
   private geo: THREE.InstancedBufferGeometry;
   private used = 0;
 
-  constructor() {
+  constructor(shared: Record<string, THREE.IUniform>) {
     this.data = new Float32Array(TEXELS * MAX_ORBITS * 4);
     this.tex = new THREE.DataTexture(this.data, TEXELS, MAX_ORBITS, THREE.RGBAFormat, THREE.FloatType);
     this.tex.minFilter = THREE.NearestFilter;
@@ -178,11 +186,16 @@ export class OrbitLines {
         uViewport: { value: new THREE.Vector2(1, 1) },
         uWidth: { value: 1.1 },
         uNear: { value: 1e-9 },
+        ...shared,
       },
       transparent: true,
-      depthTest: true,
+      depthTest: false,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
+      // MAX blending: overlapping segment quads (and crossing orbits) never double-count.
+      blending: THREE.CustomBlending,
+      blendEquation: THREE.MaxEquation,
+      blendSrc: THREE.OneFactor,
+      blendDst: THREE.OneFactor,
     });
     this.object = new THREE.Mesh(g, this.mat);
     this.object.frustumCulled = false;

@@ -21,7 +21,7 @@ export class CollisionExperience implements Experience {
   private sky!: Sky;
   private rig!: OrbitRig;
   private camera = new THREE.PerspectiveCamera(40, 1, 0.05, 50000);
-  private scene = new THREE.Scene();
+  private tmpV = new THREE.Vector3();
   private sim: NBodySystem | null = null;
   private galaxyRenderer: GalaxyRenderer | null = null;
   private preset!: Preset;
@@ -107,13 +107,11 @@ export class CollisionExperience implements Experience {
     if (!supportsGpuNBody(ctx.renderer)) throw new Error('This device cannot render to float textures (EXT_color_buffer_float).');
     this.sim?.dispose();
     this.galaxyRenderer?.dispose();
-    this.scene.clear();
     const sim = new NBodySystem(ctx.renderer, data, { dt: 1, substeps: 4 });
     // Screenshots must be deterministic: read back synchronously (tiny textures).
     sim.syncReads = ctx.engine.shotMode;
     this.sim = sim;
-    this.galaxyRenderer = new GalaxyRenderer({ count: data.tracers.n, exposure: 20 });
-    this.scene.add(this.galaxyRenderer.points);
+    this.galaxyRenderer = new GalaxyRenderer({ data, exposure: 20 });
     this.owed = 0;
     const warmup = warm ? preset.warmup : 0;
     const chunk = 8;
@@ -189,18 +187,22 @@ export class CollisionExperience implements Experience {
     r.clearDepth();
     const sim = this.sim;
     if (sim && this.galaxyRenderer) {
-      this.galaxyRenderer.update({
+      // View-depth range holding the pair (for the dust slices).
+      const [a, b] = sim.galaxies;
+      const mid = this.tmpV.copy(a.center).add(b.center).multiplyScalar(0.5);
+      const dCenter = mid.applyMatrix4(this.camera.matrixWorldInverse).z * -1;
+      const radius = 0.5 * a.center.distanceTo(b.center) + 40;
+      this.galaxyRenderer.render(r, this.camera, target, {
         pos: sim.tracerPosition,
         vel: sim.tracerVelocity,
         attr: sim.tracerAttributes,
+        skeletonPos: sim.skeletonPosition,
         time: sim.time,
         extrapolate: this.paused ? 0 : Math.min(this.owed, sim.dt),
-        camera: this.camera,
-        heightPx: target.height,
+        depthNear: dCenter - radius,
+        depthFar: dCenter + radius,
         pixelRatio: this.ctx.engine.pixelRatio,
       });
-      r.setRenderTarget(target);
-      r.render(this.scene, this.camera);
     }
   }
 

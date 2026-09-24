@@ -12,7 +12,7 @@
  * Time is re-based on the CPU every few thousand days so float32 stays smooth at any date.
  */
 import * as THREE from 'three';
-import { KEPLER_GLSL, PHOTOMETRY_GLSL, PSF_GLSL } from './glsl';
+import { KEPLER_GLSL, OCCLUDE_GLSL, PHOTOMETRY_GLSL, PSF_GLSL } from './glsl';
 import { BELT_EPOCH, TAXON_COLOR, type Population } from '../belts';
 import { COMMON_GLSL } from '../../../shaders/lib/common';
 
@@ -20,6 +20,7 @@ const VERT = /* glsl */ `
 precision highp float;
 ${KEPLER_GLSL}
 ${PHOTOMETRY_GLSL}
+${OCCLUDE_GLSL}
 in vec4 aOrbA;
 in vec4 aOrbB;
 in vec4 aPhys;
@@ -57,6 +58,7 @@ void main() {
   float e = aOrbA.y * uEcc;
   float E = solveKeplerE(M, e);
   vec3 h = orbitPoint(aOrbA.x, e, aOrbA.z * uFlat, aOrbA.w, aOrbB.x, E);
+  if (occlusion((modelMatrix * vec4(h, 1.0)).xyz) > 0.5) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
   vec4 mv = modelViewMatrix * vec4(h, 1.0);
   gl_Position = projectionMatrix * mv;
   // Geometry for photometry (view space): sun at the object origin.
@@ -138,7 +140,7 @@ export class BeltPoints {
   private epoch = BELT_EPOCH;
   private hideInts = new Int32Array(16).fill(-1);
 
-  constructor(pop: Population, style: BeltStyle, boundRadius: number) {
+  constructor(pop: Population, style: BeltStyle, boundRadius: number, shared: Record<string, THREE.IUniform>) {
     this.pop = pop;
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pop.count * 3), 3));
@@ -165,9 +167,10 @@ export class BeltPoints {
         uTaxon: { value: TAXON_COLOR.map((c) => new THREE.Vector3(c[0], c[1], c[2])) },
         uHide: { value: this.hideInts },
         uFade: { value: 1 },
+        ...shared,
       },
       transparent: true,
-      depthTest: true,
+      depthTest: false,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });

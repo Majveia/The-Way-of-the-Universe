@@ -52,3 +52,34 @@ float lommelSeeliger(float mu0, float mu) { return mu0 > 0.0 ? mu0 / max(mu0 + m
 float lambertPhase(float alpha) { return (sin(alpha) + (3.14159265 - alpha) * cos(alpha)) / 3.14159265; }
 #endif
 `;
+
+/**
+ * Analytic occlusion for overlay geometry (lines, points, sprites, tails) drawn in one pass after
+ * the bodies: a camera-relative point is hidden when the ray to it enters a resolved body first.
+ * Occluders are spheres (xyz = camera-relative centre, w = radius), nearest-important first.
+ */
+export const OCCLUDE_GLSL = /* glsl */ `
+#ifndef SOLAR_OCCLUDE
+#define SOLAR_OCCLUDE
+uniform vec4 uOcc[8];
+uniform int uOccN;
+float occlusion(vec3 p) {
+  float dp = length(p);
+  if (dp <= 0.0) return 0.0;
+  vec3 dir = p / dp;
+  for (int i = 0; i < 8; i++) {
+    if (i >= uOccN) break;
+    vec3 c = uOcc[i].xyz;
+    float r = uOcc[i].w;
+    float tc = dot(c, dir);
+    if (tc <= 0.0) continue;
+    vec3 perp = c - dir * tc;
+    float d2 = dot(perp, perp);
+    if (d2 >= r * r) continue;
+    float t0 = tc - sqrt(r * r - d2);
+    if (t0 < dp) return 1.0;
+  }
+  return 0.0;
+}
+#endif
+`;

@@ -85,6 +85,16 @@ interface Slot {
 
 const tmpV = new THREE.Vector3();
 
+/** Pure additive blending (ONE, ONE): three's AdditiveBlending multiplies by source alpha. */
+const ADDITIVE = {
+  blending: THREE.CustomBlending,
+  blendEquation: THREE.AddEquation,
+  blendSrc: THREE.OneFactor,
+  blendDst: THREE.OneFactor,
+  blendSrcAlpha: THREE.OneFactor,
+  blendDstAlpha: THREE.OneFactor,
+} as const;
+
 export class WebRenderer {
   readonly opts: WebRendererOptions;
   private renderer: THREE.WebGLRenderer;
@@ -226,7 +236,7 @@ export class WebRenderer {
         uAtlas: { value: new THREE.Vector2(this.tilesX * G, this.tilesY * G) },
         uWeight: { value: (G * G * G) / N },
       },
-      blending: THREE.AdditiveBlending,
+      ...ADDITIVE,
       depthTest: false,
       depthWrite: false,
       transparent: true,
@@ -259,7 +269,7 @@ export class WebRenderer {
         uStrideOffset: { value: 0 },
         uGain: { value: 1 },
       },
-      blending: THREE.AdditiveBlending,
+      ...ADDITIVE,
       depthTest: false,
       depthWrite: false,
       transparent: true,
@@ -279,7 +289,7 @@ export class WebRenderer {
         uFloor: { value: 0.0 },
         uSat: { value: 1.0 },
       },
-      blending: THREE.AdditiveBlending,
+      ...ADDITIVE,
       depthTest: false,
       depthWrite: false,
       transparent: true,
@@ -297,7 +307,7 @@ export class WebRenderer {
         uMinPx: { value: 1.4 },
         uSfrBoost: { value: 0 },
       },
-      blending: THREE.AdditiveBlending,
+      ...ADDITIVE,
       depthTest: false,
       depthWrite: false,
       transparent: true,
@@ -330,7 +340,7 @@ export class WebRenderer {
         uSfrBoost: { value: 0 },
         uCount: { value: idx.length / N },
       },
-      blending: THREE.AdditiveBlending,
+      ...ADDITIVE,
       depthTest: false,
       depthWrite: false,
       transparent: true,
@@ -345,7 +355,7 @@ export class WebRenderer {
     box.dispose();
     this.outlineMat = new THREE.LineBasicMaterial({
       color: new THREE.Color(0.02, 0.02, 0.025),
-      blending: THREE.AdditiveBlending,
+      ...ADDITIVE,
       depthTest: false,
       depthWrite: false,
       transparent: true,
@@ -595,6 +605,35 @@ export class WebRenderer {
       r.setRenderTarget(target);
       r.render(this.outlineScene, camera);
     }
+  }
+
+  /** Debug: statistics of the accumulation and density targets (slow; GPU readback). */
+  debugStats(): Record<string, number> {
+    const r = this.renderer;
+    const read = (rt: THREE.WebGLRenderTarget, ch: number) => {
+      const w = rt.width, h = rt.height;
+      const buf = rt.texture.type === THREE.FloatType ? new Float32Array(w * h * ch) : new Uint16Array(w * h * ch);
+      r.readRenderTargetPixels(rt, 0, 0, w, h, buf as Float32Array);
+      let sum = 0, max = 0, nz = 0;
+      for (let i = 0; i < w * h; i++) {
+        let v = buf[i * ch];
+        if (buf instanceof Uint16Array) v = THREE.DataUtils.fromHalfFloat(v);
+        sum += v;
+        if (v > max) max = v;
+        if (v > 0) nz++;
+      }
+      return { mean: sum / (w * h), max, nz: nz / (w * h) };
+    };
+    const a = read(this.accum, 4);
+    const d = read(this.atlasB, 1);
+    const u = this.accumMat.uniforms;
+    return {
+      accumMean: a.mean, accumMax: a.max, accumNZ: a.nz, densMean: d.mean, densMax: d.max, densNZ: d.nz,
+      boundA: this.boundA, boundB: this.boundB, float: this.floatBlend ? 1 : 0,
+      accW: this.accum.width, accH: this.accum.height,
+      uFlux: u.uFlux.value, uMinPx: u.uMinPx.value, uMaxPx: u.uMaxPx.value, uFocal: this.shared.uFocalPx.value,
+      uGain: u.uGain.value, uSpacing: u.uSpacing.value, uNear: this.shared.uNear.value, uBox: this.shared.uBoxWorld.value,
+    };
   }
 
   dispose(): void {
