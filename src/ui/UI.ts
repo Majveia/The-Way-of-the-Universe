@@ -219,7 +219,9 @@ export class UI {
   private syncSound(on: boolean): void {
     this.soundBtn.innerHTML = on ? ICONS.soundOn : ICONS.soundOff;
     this.soundBtn.classList.toggle('is-active', on);
-    this.soundBtn.setAttribute('aria-label', on ? 'Mute sound' : 'Play sound');
+    const label = this.handlers.sound ? `Sound ${on ? 'on' : 'off'} — settings` : on ? 'Mute sound' : 'Play sound';
+    this.soundBtn.setAttribute('aria-label', label);
+    this.soundBtn.title = label;
   }
 
   toggleFullscreen(): void {
@@ -280,6 +282,20 @@ export class UI {
       else b.removeAttribute('aria-current');
     }
     document.title = meta ? `${meta.title} · The Way of the Universe` : 'The Way of the Universe';
+    if (meta && !this.neverIdle) this.teachOnce();
+  }
+
+  /** The first time someone enters a world this session, mention help and the palette once. */
+  private teachOnce(): void {
+    try {
+      if (window.sessionStorage?.getItem('twu.taught') === '1') return;
+      window.sessionStorage?.setItem('twu.taught', '1');
+    } catch {
+      return;
+    }
+    const mod = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? '⌘K' : 'Ctrl K';
+    const coarse = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+    window.setTimeout(() => this.toast(coarse ? 'Tap the sliders icon for controls' : `Press ? for controls · ${mod} to go anywhere`, 5200), 3800);
   }
 
   openMenu(): void {

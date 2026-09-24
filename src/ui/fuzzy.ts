@@ -37,6 +37,20 @@ function isWordStart(t: string, i: number): boolean {
   return i === 0 || /[\s·\-—/(]/.test(t[i - 1]);
 }
 
+/** Every query word must occur in the text (as a substring); earlier, word-start hits score higher. */
+export function wordScore(query: string, text: string): number {
+  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return 1;
+  const t = text.toLowerCase();
+  let score = 0;
+  for (const w of words) {
+    const i = t.indexOf(w);
+    if (i < 0) return 0;
+    score += 400 - Math.min(300, i) + (isWordStart(t, i) ? 150 : 0);
+  }
+  return score / words.length;
+}
+
 export interface Rankable {
   label: string;
   keywords?: string;
@@ -48,7 +62,8 @@ export function rankCommands<T extends Rankable>(query: string, items: readonly 
   if (!query.trim()) return items.slice();
   const scored: Array<{ item: T; s: number; i: number }> = [];
   items.forEach((item, i) => {
-    const s = Math.max(fuzzyScore(query, item.label), fuzzyScore(query, item.keywords ?? '') * 0.8, fuzzyScore(query, `${item.group ?? ''} ${item.label}`) * 0.6);
+    // Scattered-letter matching only on the label; descriptions must contain the words.
+    const s = Math.max(fuzzyScore(query, item.label), wordScore(query, item.keywords ?? '') * 0.8, wordScore(query, `${item.group ?? ''} ${item.label}`) * 0.6);
     if (s > 0) scored.push({ item, s, i });
   });
   scored.sort((a, b) => b.s - a.s || a.i - b.i);

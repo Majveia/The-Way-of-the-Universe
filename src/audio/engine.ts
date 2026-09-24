@@ -538,7 +538,7 @@ class GenerativeEngine implements SoundEngine {
     switch (name) {
       case 'portal':
         sweep(180, 2600, 700, 2.6, 0.35);
-        this.chime([0, 7, 14, 19], t + 0.9, 0.05, 0.22);
+        this.chime(this.degrees([0, 4, 8, 11]), t + 0.9, 0.05, 0.22);
         break;
       case 'whoosh':
         sweep(260, 1900, 320, 1.4, 0.28);
@@ -552,7 +552,7 @@ class GenerativeEngine implements SoundEngine {
         rumble(0.5, 1.8);
         break;
       case 'arrive':
-        this.chime([0, 7, 12, 16, 21], t + 0.05, 0.06, 0.28);
+        this.chime(this.degrees([0, 4, 7, 9, 11]), t + 0.05, 0.06, 0.28); // root, 5th, octave, 10th, 12th of the mode
         break;
       case 'select':
         this.bellNote(midiToHz(root + 24 + degreeToSemitone(s.mode, 4)), t, 0.05, 1.5, 3.5, 0.6);
@@ -569,7 +569,7 @@ class GenerativeEngine implements SoundEngine {
         this.bellNote(midiToHz(root + 13), t, 0.05, 3, 3.5, 2);
         break;
       case 'restore':
-        this.chime([0, 2, 4, 6, 8].map((d) => degreeToSemitone(s.mode, d)), t, 0.09, 0.24);
+        this.chime(this.degrees([0, 2, 4, 6, 8]), t, 0.09, 0.24);
         break;
       case 'pulsar':
         this.tick(t, 0.25);
@@ -609,6 +609,11 @@ class GenerativeEngine implements SoundEngine {
     strike(v.out.gain, t, level, 0.006, decay);
     v.free = t + decay * 3;
     v.sleep.wake(t + decay * 5);
+  }
+
+  /** Scale degrees of the current mode → semitones (so chimes are always diatonic). */
+  private degrees(ds: number[]): number[] {
+    return ds.map((d) => degreeToSemitone(this.spec.mode, d));
   }
 
   private chime(semis: number[], t: number, gap: number, level: number): void {

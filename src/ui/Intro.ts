@@ -58,7 +58,7 @@ export const INTRO_MARK = `
       <circle cx="80" cy="80" r="26" fill="url(#twu-lit)"/>
       <ellipse cx="81.5" cy="85" rx="72" ry="20" fill="none" stroke="#000" stroke-width="3.2" stroke-opacity="0.7" clip-path="url(#twu-disc)"/>
     </g>
-    <ellipse clip-path="url(#twu-front)" cx="80" cy="80" rx="72" ry="20" fill="none" stroke="#000" stroke-width="5"/>
+    <ellipse class="intro-ring" clip-path="url(#twu-front)" cx="80" cy="80" rx="72" ry="20" pathLength="1" fill="none" stroke="#000" stroke-width="5"/>
     <ellipse class="intro-ring" clip-path="url(#twu-front)" cx="80" cy="80" rx="72" ry="20" pathLength="1" fill="none" stroke="#ffc690" stroke-width="1.1"/>
   </g>
 </svg>`;

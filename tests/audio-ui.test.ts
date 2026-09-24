@@ -261,6 +261,9 @@ describe('command palette ranking', () => {
     expect(rankCommands('black', items)[0].label).toBe('Gargantua');
     expect(rankCommands('sun', items)[0].label).toBe('Solar System');
     expect(rankCommands('', items).map((x) => x.label)).toEqual(items.map((x) => x.label));
+    // long descriptions must not match on scattered letters
+    const more = [...items, { label: 'Nebulae', keywords: 'Interstellar medium Stellar nurseries and death shrouds glowing' }, { label: 'Edge-on', keywords: 'View' }];
+    expect(rankCommands('edge', more).map((x) => x.label)).toEqual(['Edge-on']);
   });
 });
 
