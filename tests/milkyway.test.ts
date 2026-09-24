@@ -11,7 +11,7 @@ import {
 } from '../src/physics/galaxyPotential';
 import { ccmExtinction, msLifetime, sampleKroupa, hiiRGB, visualEfficacy, visualEfficacyFit, stromgrenRadius, hiiLineLuminosity } from '../src/physics/galaxyStars';
 import { densityParams, lumDensity, mwReference, nearestLocalStars, LOCAL_TIERS } from '../src/worlds/galaxy/localStars';
-import { generateParticles, Kinematics, particleState, KIND_DISK, STRIDE, KIND_YOUNG, type ParticleState } from '../src/worlds/galaxy/model';
+import { generateParticles, GalaxyModel, Kinematics, particleState, KIND_DISK, STRIDE, KIND_YOUNG, type ParticleState } from '../src/worlds/galaxy/model';
 import { milkyWay, preset, armPhi, wrapPi } from '../src/worlds/galaxy/params';
 import { pcg, hash2u, u01 } from '../src/worlds/galaxy/hash';
 
@@ -279,5 +279,15 @@ describe('visual efficacy', () => {
     const L = hiiLineLuminosity(1e49);
     expect(L).toBeGreaterThan(3e3);
     expect(L).toBeLessThan(1e4);
+  });
+});
+
+describe('GalaxyModel facade', () => {
+  it('wraps generation, kinematics and the potential', () => {
+    const g = new GalaxyModel(milkyWay(2), 5000);
+    expect(g.count).toBeGreaterThan(4500);
+    const s = g.stateAt(0, 42);
+    expect(Number.isFinite(s.x + s.y + s.z)).toBe(true);
+    expect(g.potential.vcKms(8200)).toBeGreaterThan(220);
   });
 });

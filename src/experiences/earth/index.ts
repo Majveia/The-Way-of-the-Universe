@@ -331,7 +331,7 @@ class EarthExperience implements Experience {
     // Gallery exposure: the star is ~40× a lit planet; backlit scenes are faint (forward scattering
     // and ringshine), so they get a longer exposure — as Cassini's did.
     const giant = w.preset === 'jupiter' || w.preset === 'saturn';
-    this.ctx.post.exposure = w.preset === 'sun' ? 0.03 : this.exposureBase * (l === 'backlit' ? 3.5 : giant ? 0.85 : 1);
+    this.ctx.post.exposure = w.preset === 'sun' ? 0.02 : this.exposureBase * (l === 'backlit' ? 3.5 : giant ? 0.85 : 1);
     this.uiClock = 0;
   }
 

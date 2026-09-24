@@ -69,6 +69,7 @@ class Gargantua implements Experience {
   private plunge: PlungeTrajectory | null = null;
   private plungeLook = 0;
   private plungeEnd = 0;
+  private plungeFrozen = false;
   private wasInside = false;
   private shadowWidth = NaN;
   private shadowKey = '';
@@ -527,11 +528,14 @@ class Gargantua implements Experience {
     }
     this.bh.setObserverVelocity(pl.velocity());
     this.bh.resetHistory();
+    // Screenshots: hold this moment so the (CPU-emulated) trace can converge.
+    this.plungeFrozen = this.ctx.engine.shotMode;
   }
 
   private cancelPlunge(returnToView = false): void {
     if (!this.plunge) return;
     this.plunge = null;
+    this.plungeFrozen = false;
     this.bh.setObserverVelocity(null);
     this.bh.setParams({ observer: 'static' });
     this.rig.enabled = true;
@@ -549,7 +553,7 @@ class Gargantua implements Experience {
     const te = 2.2 * linger;
     const vr = Math.abs(pl.radialSpeed());
     const dTau = Math.min((dt * r) / (te * Math.max(vr, 1e-3)), 0.5 * r);
-    if (this.plungeEnd === 0) pl.step(dTau);
+    if (this.plungeEnd === 0 && !this.plungeFrozen) pl.step(dTau);
     const inside = pl.inside;
     if (inside && !this.wasInside) {
       this.wasInside = true;
@@ -740,7 +744,7 @@ class Gargantua implements Experience {
     if (shot) {
       const q = cam.quaternion;
       const sig = `${this.bh.version}|${this.camPos.x.toFixed(4)},${this.camPos.y.toFixed(4)},${this.camPos.z.toFixed(4)}|${q.x.toFixed(5)},${q.y.toFixed(5)},${q.z.toFixed(5)}|${target.width}`;
-      if (sig !== this.shotSig || this.plunge) this.shotStill = 0;
+      if (sig !== this.shotSig || (this.plunge && !this.plungeFrozen)) this.shotStill = 0;
       else this.shotStill++;
       this.shotSig = sig;
       reuse = this.shotStill > 6;

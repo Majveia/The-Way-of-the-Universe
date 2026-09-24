@@ -752,3 +752,47 @@ export function youngState(
 
 /** Wrap helper re-export for consumers. */
 export { wrapPi };
+
+// ——— Convenience facade ————————————————————————————————————————————————————
+
+/**
+ * GalaxyModel: parameters + seed → a deterministic galaxy you can query without a GPU.
+ *   const g = new GalaxyModel(milkyWay(1), 250_000);
+ *   g.stateAt(i, tMyr)             // render-frame position (pc) and current light of particle i
+ *   g.potential.vcKms(8200)        // rotation curve, κ, ν, resonances… (physics/galaxyPotential)
+ *   g.toRender(x, y, h, out)       // model (disk) frame → three.js frame
+ * The GalaxyLayer renders the same particles (and mirrors this code on the GPU).
+ */
+export class GalaxyModel {
+  readonly params: GalaxyParams;
+  readonly particles: GalaxyParticles;
+  readonly kin: Kinematics;
+  private readonly st: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+
+  constructor(params: GalaxyParams, count = 250_000, particles?: GalaxyParticles) {
+    this.params = params;
+    this.particles = particles ?? generateParticles(params, count);
+    this.kin = new Kinematics(params);
+  }
+
+  get potential() {
+    return this.kin.potential;
+  }
+  get count(): number {
+    return this.particles.count;
+  }
+  /** Population kind of particle i (KIND_*). */
+  kind(i: number): number {
+    return this.particles.data[i * STRIDE];
+  }
+  /** Position (render frame, pc) and current luminosity/temperature of particle i at t (Myr). */
+  stateAt(i: number, t: number, out: ParticleState = this.st): ParticleState {
+    return particleState(this.kin, this.particles.data, i, t, out);
+  }
+  toRender(x: number, y: number, h: number, out: Vec3Like): Vec3Like {
+    return this.kin.toRender(x, y, h, out);
+  }
+  fromRender(x: number, y: number, z: number, out: Vec3Like): Vec3Like {
+    return this.kin.fromRender(x, y, z, out);
+  }
+}

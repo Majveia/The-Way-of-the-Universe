@@ -429,9 +429,14 @@ export class BlackHoleRenderer {
       stencilBuffer: false,
       generateMipmaps: false,
     } as const;
-    this.traceRT = new THREE.WebGLRenderTarget(tw, th, { ...opts, count: 2 });
-    const sky = this.traceRT.textures[1];
-    sky.minFilter = sky.magFilter = THREE.NearestFilter;
+    // 32-bit floats where renderable: the sky target stores the deflection Δ, whose finite
+    // differences give the lens Jacobian — half-float rounding (~1e-4 at Δ ≈ 0.1) is comparable to a
+    // pixel's angle and would smear the analytically lensed stars into streaks.
+    const full = this.renderer.extensions.has('EXT_color_buffer_float');
+    this.traceRT = new THREE.WebGLRenderTarget(tw, th, { ...opts, type: full ? THREE.FloatType : THREE.HalfFloatType, count: 2 });
+    // Both are read at texel centres (accumulation) or with texelFetch (composite): nearest
+    // filtering keeps float32 targets valid without OES_texture_float_linear.
+    for (const t of this.traceRT.textures) t.minFilter = t.magFilter = THREE.NearestFilter;
     this.accum = [new THREE.WebGLRenderTarget(tw, th, opts), new THREE.WebGLRenderTarget(tw, th, opts)];
     this.historyValid = false;
   }

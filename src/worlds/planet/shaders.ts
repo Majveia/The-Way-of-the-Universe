@@ -268,7 +268,7 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
     float h0 = moonCraters(q, g1, g2);
     float hx = moonCraters(normalize(q + east * e), g1, g2);
     float hy = moonCraters(normalize(q + north * e), g1, g2);
-    N = normalize(N - (east * (hx - h0) + north * (hy - h0)) / e * 0.3);
+    N = normalize(N - (east * (hx - h0) + north * (hy - h0)) / e * 0.16);
     s.albedo *= 1.0 + 0.12 * g1 * (fbm3(q * 700.0, 3) * nyquist(1400.0, footprint));
   }
   s.N = N;

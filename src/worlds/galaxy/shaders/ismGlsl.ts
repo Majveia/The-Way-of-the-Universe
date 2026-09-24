@@ -68,12 +68,15 @@ float barDust(vec2 XY) {
 }
 
 // Local dust clouds (Milky Way: the Great Rift, Ophiuchus, Taurus, Orion…) and the Local Bubble.
+// Cloud complexes are oblate (flattened toward the plane): vertical semi-axis CLOUD_FLAT × radius.
+#define CLOUD_FLAT 0.45
 float localDustRho(vec3 m) {
   float rho = 0.0;
   for (int i = 0; i < 8; i++) {
     if (i >= uCloudCount) break;
     vec4 c = uClouds[i];
     vec3 d = m - c.xyz;
+    d.z /= CLOUD_FLAT;
     float r2 = dot(d, d) / (c.w * c.w);
     if (r2 < 9.0) rho += uCloudTau[i] / (1.772 * c.w) * exp(-r2);
   }
@@ -143,16 +146,22 @@ export const ISM_LOCAL_COLUMN_GLSL = /* glsl */ `
 #define TWU_ISM_LOCALCOL
 // Column through the local Gaussian clouds: exact line integral of each Gaussian,
 // τ_peak · e^{−b²/w²} · ½[erf((L − s_c)/w) − erf(−s_c/w)].
+// Oblate clouds: work in coordinates stretched by 1/CLOUD_FLAT vertically, where they are spheres;
+// the line integral picks up the Jacobian |d| / |d'| (τ = ∫ρ ds, ds = ds' |d|/|d'|).
 float localDustColumn(vec3 C, vec3 P) {
   float tau = 0.0;
-  vec3 d = P - C;
+  const vec3 S = vec3(1.0, 1.0, 1.0 / 0.45);
+  vec3 d0 = P - C;
+  float len0 = length(d0);
+  if (len0 < 1e-3) return 0.0;
+  vec3 d = d0 * S;
   float len = length(d);
-  if (len < 1e-3) return 0.0;
+  float jac = len0 / len;
   vec3 u = d / len;
   for (int i = 0; i < 8; i++) {
     if (i >= uCloudCount) break;
     vec4 c = uClouds[i];
-    vec3 oc = c.xyz - C;
+    vec3 oc = (c.xyz - C) * S;
     float sc = dot(oc, u);
     vec3 perp = oc - u * sc;
     float b2 = dot(perp, perp) / (c.w * c.w);
@@ -160,7 +169,7 @@ float localDustColumn(vec3 C, vec3 P) {
     float along = 0.5 * (erfApprox((len - sc) / c.w) - erfApprox(-sc / c.w));
     tau += uCloudTau[i] * exp(-b2) * along;
   }
-  return tau;
+  return tau * jac;
 }
 #endif
 `;
