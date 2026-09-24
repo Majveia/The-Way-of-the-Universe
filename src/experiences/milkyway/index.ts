@@ -122,7 +122,7 @@ class MilkyWay implements Experience {
     await this.layer.ready;
     this.curve.setPotential(this.layer.kin.potential, this.plotRadius(p), p.id === 'milkyway', p.sun?.R);
     ctx.progress(1);
-    ctx.ui.hint('Drag to orbit · Scroll to zoom · Space pause · [ ] time warp · 1–5 views · G dark matter · C rotation curve · F fly', 9000);
+    ctx.ui.hint('Drag to orbit · Scroll to zoom · Space pause · [ ] time warp · 1–5 views · G dark matter · C rotation curve · V fly', 9000);
     ctx.signalReady();
   }
 
@@ -130,7 +130,7 @@ class MilkyWay implements Experience {
    * Eye adaptation. Surface brightness does not depend on distance, so a galaxy's centre or the
    * sky from inside the disk is as bright as the whole galaxy seen from afar — only more of the view
    * is filled. The layer meters the diffuse light (log-mean of lit pixels); exposure follows it
-   * partially, (L_ref / L)^0.6, as the eye (and a photographer) would; L_ref is the metered value
+   * partially, (L_ref / L)^0.7, as the eye (and a photographer) would; L_ref is the metered value
    * of the default Milky Way view. When the sky fills the view the background sets the exposure.
    */
   private adaptExposure(dt: number): void {
@@ -139,7 +139,7 @@ class MilkyWay implements Experience {
     let target = base;
     if (Number.isFinite(lum) && lum > 0) {
       // Looking at a galaxy: adapt to the bright parts it is made of.
-      const outside = base * THREE.MathUtils.clamp(Math.pow(11.4 / lum, 0.6), 0.3, 1.5);
+      const outside = base * THREE.MathUtils.clamp(Math.pow(1.08 / lum, 0.7), 0.25, 1.1);
       // Surrounded by sky (inside the disk): keep the typical background dark (scene ≈ 0.05) so the
       // band glows and the stars stand out, as in an unprocessed dark-site photograph.
       const inside = Number.isFinite(sky) && sky > 0 ? THREE.MathUtils.clamp(0.05 / sky, 0.1 * base, 1.5 * base) : outside;
@@ -307,7 +307,7 @@ class MilkyWay implements Experience {
     this.controls.curve = d.toggle({ label: 'Rotation curve', value: this.showCurve, onChange: (v) => this.setCurve(v) });
     d.toggle({ label: 'You are here', value: this.showSun, onChange: (v) => (this.showSun = v) });
     d.toggle({ label: 'Labels', value: this.showLabels, onChange: (v) => (this.showLabels = v) });
-    this.controls.fly = d.toggle({ label: 'Fly (WASD)', value: false, onChange: (v) => this.setFly(v) });
+    this.controls.fly = d.toggle({ label: 'Fly (V)', value: false, onChange: (v) => this.setFly(v) });
 
     // Keys.
     this.ctx.input.onKeyDown((e) => {
@@ -318,7 +318,7 @@ class MilkyWay implements Experience {
         e.preventDefault();
       } else if (/^Digit[1-5]$/.test(e.code)) {
         this.setView(VIEW_KEYS[Number(e.code.slice(5)) - 1], 2.6);
-      } else if (e.code === 'KeyF') {
+      } else if (e.code === 'KeyV') {
         this.setFly(!this.flying);
         this.controls.fly?.set(this.flying);
       } else if (e.code === 'KeyG') {
@@ -530,7 +530,7 @@ class MilkyWay implements Experience {
       this.fly.velocity.set(0, 0, 0);
       this.fly.enabled = true;
       this.orbit.enabled = false;
-      this.ctx.ui.hint('W/S forward · A/D strafe · R/F up/down · Q/E roll · drag to look · Shift boost', 7000);
+      this.ctx.ui.hint('W/S forward · A/D strafe · R/F up/down · Q/E roll · drag to look · Shift boost · V to orbit', 7000);
     } else if (this.fly) {
       this.fly.enabled = false;
       this.orbit.enabled = true;
@@ -625,7 +625,8 @@ class MilkyWay implements Experience {
     const dm = this.layer.darkMatter;
     place(this.sunMark, this.sunPos, this.showSun && !!params.sun && dm, 20);
     this.v2.set(0, 0, 0);
-    place(this.bhMark, this.v2, this.showLabels && params.id === 'milkyway' && camPos.length() < 16000 && camPos.length() > 300);
+    const dGC = camPos.length();
+    place(this.bhMark, this.v2, this.showLabels && params.id === 'milkyway' && dGC > 300 && dGC < 16000 && (Math.abs(camPos.y) > 800 || dGC < 3000));
 
     // Arm names (Milky Way), riding with the pattern.
     const k = this.layer.kin;

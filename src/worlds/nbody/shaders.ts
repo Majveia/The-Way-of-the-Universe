@@ -1,8 +1,23 @@
+import { SF_EFFICIENCY, SF_GLSL, SF_GRID_CELL, SF_GRID_N, SF_MASS_SCALE, SF_REFRACTORY } from './starformation';
+
 /**
  * GLSL (ES 3.00) for the GPU N-body integrator. Every pass is a full-screen triangle over a
  * float32 state texture; each fragment owns one particle (texel). See cpu.ts for the reference
  * algorithm these shaders reproduce.
  */
+
+const N = SF_GRID_N;
+/** Grid addressing shared by the deposit and the tracer passes. */
+const GRID_GLSL = /* glsl */ `
+bool gridCell(vec3 x, vec3 c, out ivec3 cell) {
+  vec3 u = (x - c) / ${SF_GRID_CELL.toFixed(4)} + ${(N / 2).toFixed(1)};
+  cell = ivec3(floor(u));
+  return all(greaterThanEqual(cell, ivec3(0))) && all(lessThan(cell, ivec3(${N})));
+}
+ivec2 gridTexel(ivec3 cell, int g) {
+  return ivec2(cell.x + (cell.z % 8) * ${N} + g * ${N * 8}, cell.y + (cell.z / 8) * ${N});
+}
+`;
 
 /** Copy two textures into an MRT target (used to upload initial conditions / snapshots). */
 export const COPY2_FRAG = /* glsl */ `
@@ -218,21 +233,48 @@ vec3 galaxyAcc(vec3 d, int g) {
 
 /**
  * Tracers: K leapfrog sub-steps per skeleton step in the smooth field, galaxy centres
- * interpolated linearly between the previous and new filtered centres.
+ * interpolated linearly between the previous and new filtered centres. Gas parcels then roll for
+ * star formation against the local gas density (see starformation.ts); pos.w holds the time of a
+ * parcel's latest burst.
  */
 export const TRACER_FRAG = /* glsl */ `
 uniform sampler2D tPos;
 uniform sampler2D tVel;
 uniform sampler2D tM0;
 uniform sampler2D tM3;
+uniform sampler2D tAttr;
+uniform sampler2D tGrid;
 uniform float uDt;
+uniform float uTime;
+uniform float uStep;
+uniform float uSfOn;
 uniform int uK;
 ${SMOOTH_GLSL}
+${SF_GLSL}
+${GRID_GLSL}
 layout(location = 0) out vec4 oPos;
 layout(location = 1) out vec4 oVel;
 vec3 c0a, c0b, c1a, c1b;
+float gridRho(vec3 x, vec3 c, int g) {
+  ivec3 cell;
+  if (!gridCell(x, c, cell)) return 0.0;
+  return texelFetch(tGrid, gridTexel(cell, g), 0).r;
+}
+// Gas density (10¹⁰ M☉ kpc⁻³): both grids see all gas, so take whichever covers x (max).
+float gasDensity(vec3 x, vec3 ca, vec3 cb) {
+  float m = max(gridRho(x, ca, 0), gridRho(x, cb, 1));
+  return m * ${(1 / (SF_MASS_SCALE * SF_GRID_CELL ** 3)).toExponential(8)};
+}
 vec3 fieldAt(vec3 x, float f) {
   return galaxyAcc(x - mix(c0a, c0b, f), 0) + galaxyAcc(x - mix(c1a, c1b, f), 1);
+}
+float hash12(uvec2 q) {
+  q = q * uvec2(1597334673u, 3812015801u);
+  uint n = (q.x ^ q.y) * 1597334673u;
+  n ^= n >> 16u;
+  n *= 2246822519u;
+  n ^= n >> 13u;
+  return float(n) * (1.0 / 4294967296.0);
 }
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
@@ -251,9 +293,44 @@ void main() {
     a = fieldAt(x.xyz, float(k + 1) / float(uK));
     v.xyz += 0.5 * h * a;
   }
+  if (uSfOn > 0.5 && texelFetch(tAttr, p, 0).x > 1.5 && uTime - x.w > ${SF_REFRACTORY.toFixed(1)}) {
+    float rho = gasDensity(x.xyz, c0b, c1b);
+    float prob = 1.0 - exp(-sfRate(rho) * uDt / ${SF_EFFICIENCY.toFixed(4)});
+    if (hash12(uvec2(p.x + p.y * 4096, int(uStep))) < prob) x.w = uTime - hash12(uvec2(p.y, p.x + 7919)) * uDt;
+  }
   oPos = x;
   oVel = v;
 }`;
+
+/**
+ * Gas deposit into the star-formation grids: one point per gas parcel and grid, additive
+ * (nearest grid point). Grid g is a 64³ block of 0.75 kpc cells centred on galaxy g, stored as
+ * an 8×8 atlas of 64×64 slices; the two atlases sit side by side (1024×512).
+ */
+export const DEPOSIT_VERT = /* glsl */ `
+uniform sampler2D tPos;
+uniform sampler2D tAttr;
+uniform sampler2D tM0;
+uniform int uWidth;
+uniform int uGrid;
+${GRID_GLSL}
+out float vMass;
+void main() {
+  int id = gl_VertexID;
+  ivec2 t = ivec2(id % uWidth, id / uWidth);
+  vec3 x = texelFetch(tPos, t, 0).xyz;
+  vec3 c = texelFetch(tM0, ivec2(0, uGrid), 0).xyz;
+  ivec3 cell;
+  gl_PointSize = 1.0;
+  vMass = texelFetch(tAttr, t, 0).w * ${SF_MASS_SCALE.toFixed(1)};
+  if (!gridCell(x, c, cell)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  vec2 px = vec2(gridTexel(cell, uGrid)) + 0.5;
+  gl_Position = vec4(px / vec2(${2 * SF_GRID_N * 8}.0, ${SF_GRID_N * 8}.0) * 2.0 - 1.0, 0.0, 1.0);
+}`;
+export const DEPOSIT_FRAG = /* glsl */ `
+in float vMass;
+out vec4 outColor;
+void main() { outColor = vec4(vMass, 0.0, 0.0, 0.0); }`;
 
 /** Per-row sums for the skeleton's energy, momentum and angular momentum. */
 export const DIAG_FRAG = /* glsl */ `
@@ -324,4 +401,28 @@ void main() {
   o0 = vec4(wIn, wG, L.xy);
   o1 = vec4(L.z, Sd);
   o2 = vec4(So, 0.0);
+}`;
+
+/** Per-row star-formation sums over gas parcels: mass that burst within the last uWindow Myr. */
+export const SFR_FRAG = /* glsl */ `
+uniform sampler2D tPos;
+uniform sampler2D tAttr;
+uniform float uTime;
+uniform float uWindow;
+uniform int uWidth;
+uniform int uSplitRow;
+out vec4 outColor;
+void main() {
+  int r = int(gl_FragCoord.y);
+  float m = 0.0, n = 0.0, gas = 0.0;
+  for (int x = 0; x < 1024; x++) {
+    if (x >= uWidth) break;
+    ivec2 t = ivec2(x, r);
+    vec4 at = texelFetch(tAttr, t, 0);
+    if (at.x < 1.5) continue;
+    gas += at.w;
+    float age = uTime - texelFetch(tPos, t, 0).w;
+    if (age >= 0.0 && age < uWindow) { m += at.w; n += 1.0; }
+  }
+  outColor = vec4(m, n, gas, r < uSplitRow ? 0.0 : 1.0);
 }`;

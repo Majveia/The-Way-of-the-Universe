@@ -119,8 +119,8 @@ void main() {
     return;
   }
   // Sprite diameter grows slowly with brightness (the visible wings of a bright PSF), combined in
-  // quadrature with the particle's own projected extent. When that exceeds the largest sprite the
-  // particle fades out: up close its light belongs to the smooth volume, not to a fake point star.
+  // quadrature with the particle's own projected extent. When that exceeds 12 px the particle fades
+  // out: up close its light belongs to the smooth volume, not to a fake point star.
   float psf = clamp(2.6 + 1.1 * log2(1.0 + lum / uSizeRef), 2.6, uMaxSize) / 6.0;
   float hpx = 0.75 * smoothingLength(a0.x, a1, a2.x, P) * uPxPerRad / sqrt(d2);
   if (young && uYoungMult > 1.5) {
@@ -131,7 +131,9 @@ void main() {
     hpx *= 1.0 - f;
   }
   float sigma = sqrt(psf * psf + hpx * hpx);
-  float sMax = uMaxSize / 6.0;
+  // Aggregate particles never exceed a 12 px sprite (fill rate: an elliptical is ~10⁶ of them);
+  // only a genuinely bright point source may spread its PSF wider.
+  float sMax = max(psf, 2.0);
   if (sigma > sMax) {
     float k = sMax / sigma;
     col *= k * k * k;

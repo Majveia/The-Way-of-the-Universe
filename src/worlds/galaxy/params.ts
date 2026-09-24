@@ -274,7 +274,7 @@ export function preset(id: MorphologyId, seed = 1): GalaxyParams {
       p.gas = { ...p.gas, dust: 0, dustLane: 0, hii: 0, nuclearRing: 0 };
       p.halo = { lum: 2e9, rMin: 4000, rMax: 90000, flatten: flat * 0.9 + 0.1 };
       p.globulars = { count: 700, rCore: 4000, rMax: 70000 };
-      p.look = { exposure: 0.9, viewDistance: 40000 };
+      p.look = { exposure: 0.6, viewDistance: 60000 };
       return p;
     }
     case 'S0': {
@@ -372,6 +372,8 @@ export function preset(id: MorphologyId, seed = 1): GalaxyParams {
           strength: 1,
           colorT: 4350,
         };
+        // Much of a barred galaxy's "bulge" is the bar's own boxy/peanut inner part.
+        p.bulge.lum *= 0.45;
         // The arms leave the ends of the bar: gas arms start there and the bar's major axis points
         // at arm 0's locus at R = bar half-length.
         const L = p.bar.halfLength;

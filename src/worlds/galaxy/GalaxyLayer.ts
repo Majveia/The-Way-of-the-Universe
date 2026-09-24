@@ -85,8 +85,8 @@ export class GalaxyLayer {
   }
   particles: GalaxyParticles | null = null;
   /**
-   * Metered radiance of the diffuse light: `lum` brightness-weighted log-mean (what the eye fixates
-   * on), `sky` plain log-mean of the whole view, `lit` fraction of the view above the floor; NaN
+   * Metered radiance of the diffuse light: `lum` log-mean over lit pixels (what the eye looks at),
+   * `sky` plain log-mean of the whole view, `lit` fraction of the view above the floor; NaN
    * until the first readback. Volume units. See METER_FRAG.
    */
   readonly meter = { lum: NaN, lit: 0, sky: NaN };
@@ -1204,7 +1204,7 @@ export interface StarRecord {
 
 /**
  * Exposure metering: each texel of a 16 × 9 target summarises a block of the volume image as
- * (Σ w·ln L, Σ w, max L) with w = L²/(L + L_floor), so empty sky does not drag the average down —
+ * (Σ w·ln L, Σ w, Σ ln L, n_lit) with w = L/(L + L_floor), so empty sky does not drag the average down —
  * the eye adapts to what it is looking at, and surface brightness does not depend on distance.
  */
 const METER_FRAG = /* glsl */ `
@@ -1222,8 +1222,8 @@ void main() {
       vec2 uv = o + (vec2(float(i), float(j)) + 0.5) * cell * 0.25;
       vec3 c = texture(tVol, uv).rgb;
       float L = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0);
-      // Brightness-weighted: the eye fixates on what is bright (the band, the bulge), not the gaps.
-      float w = L * L / (L + uFloor);
+      // Lit pixels only: empty space does not count, faint outskirts count a little.
+      float w = L / (L + uFloor);
       sl += w * log(L + 1e-12);
       sw += w;
       sa += log(L + uFloor * 0.05);

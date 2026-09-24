@@ -83,8 +83,10 @@ export interface NebulaPreset {
   frontNoise: number;
   /** Radial streak detail around the source: [angular freq, radial freq (1/pc), weight 0–1]. */
   streak?: [number, number, number];
-  /** Exposure normalisation: 1 / typical emission measure (pc cm⁻⁶) of the object. */
+  /** Exposure normalisation: 1 / typical emission measure (pc cm⁻⁶) of the object (fallback; see NebulaVolume.calibrate). */
   gain: number;
+  /** Representative density (cm⁻³) of the ionized gas, for the Strömgren-radius readout. */
+  nRef?: number;
   /** Default palette. */
   palette: Palette;
   /** Camera presets; `default` is the first view. */

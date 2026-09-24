@@ -79,6 +79,8 @@ uniform vec3 uStarRGB;     // source luminosity in emission-measure units × col
 uniform int uScatCount;
 uniform vec4 uScatPos[8];  // xyz, softening² (pc²)
 uniform vec3 uScatRGB[8];
+uniform int uScatShadow;     // shadow samples toward scatter stars (0 = unshadowed)
+uniform float uScatShadowLen; // pc
 uniform float uEmission;   // global emission multiplier (fade in/out)
 
 #ifdef SHOCK
@@ -125,19 +127,26 @@ Medium medium(vec3 p, vec3 rd) {
   vec4 D1 = texture(uDetail, pc * uDetailFreq.x + uDrift1);
   vec4 D2 = texture(uDetail, pc * uDetailFreq.y + uDrift2);
 #ifdef PHOTO
-  float turb = (D1.r - 0.5) * 1.4 + (D2.g - 0.45) * 1.1;
+  // Unit-variance sub-voxel fluctuation (the detail channels have σ ≈ 0.1–0.15).
+  float turb = (D1.r - 0.5) * 6.0 + (D2.r - 0.5) * 3.5 + (D2.g - 0.45) * 1.5;
   if (uStreak.z > 0.0) {
     // Streaks along the radiation: photoevaporation flows and trunks point back at the source,
     // so structure is long radially and fine transversally (sampled in source-centred angles).
     vec3 rsv = pc - uSource;
     float rl = length(rsv) + 1e-3;
     vec4 D3 = texture(uDetail, (rsv / rl) * uStreak.x + vec3(rl * uStreak.y) + uDrift1 * 0.5);
-    turb = mix(turb, (D3.b - 0.5) * 2.2 + (D2.g - 0.45) * 0.6, uStreak.z);
+    turb = mix(turb, (D3.r - 0.5) * 6.0 + (D3.a - 0.5) * 3.0 + (D2.r - 0.5) * 2.0, uStreak.z);
   }
-  float m = exp(uTurb * turb);
-  float xi = F.y + uFrontNoise * ((D1.a - 0.5) * 1.6 + (D2.r - 0.5) * 0.9);
-  float g2 = F.z * F.z * m;
+  turb = clamp(turb, -3.0, 3.0);
+  // Lognormal density PDF of supersonic turbulence, mean-preserving: <m> = 1, <m²> = e^{σ²}.
+  float m = exp(uTurb * turb - 0.5 * uTurb * uTurb);
+  float xi = F.y + uFrontNoise * ((D1.a - 0.5) * 7.0 + (D2.r - 0.5) * 4.0);
   float zH = 1.0 - smoothstep(-0.3, 0.3, xi);
+  // The baked recombination rate is a voxel average; the front inside the voxel is much thinner.
+  // Put that emission on the ionized side of the (noise-perturbed) sub-voxel front, keeping the
+  // voxel's total: ∫ n_eff² dV is photon-conserving, only its placement is refined.
+  // Emission ∝ n²: clumping raises it by m² / <m²> (the photon budget is fixed).
+  float g2 = F.z * F.z * m * m * exp(-uTurb * uTurb) * zH * (1.0 + 0.9 * exp(-xi * xi));
   float zHe1 = 1.0 - smoothstep(uLnZone.x - 0.35, uLnZone.x + 0.35, xi);
   float zHe2 = 1.0 - smoothstep(uLnZone.z - 0.35, uLnZone.z + 0.35, xi);
   float zO3 = (1.0 - smoothstep(uLnZone.y - 0.35, uLnZone.y + 0.35, xi)) * (1.0 - 0.85 * zHe2);
@@ -154,7 +163,10 @@ Medium medium(vec3 p, vec3 rd) {
 #else
   // Shock layout: F = (ambient n, signed distance to the shell [pc, comoving], brightness, [OIII] share).
   float dist = (F.y + uRipple * ((D1.b - 0.5) * 1.3 + (D2.r - 0.5) * 0.7)) * uExpand;
-  float bright = F.z * (0.35 + 1.3 * D1.g) * (0.6 + 0.8 * D2.b);
+  // Break each sheet into strands: ridged detail lines on the sheet (thin cooling filaments and
+  // Rayleigh–Taylor fingers), so face-on parts stay dark and edge-on parts become threads.
+  float strand = D1.b * D1.b * D1.b;
+  float bright = F.z * (0.15 + 3.2 * strand) * (0.5 + 0.9 * D2.b) * (0.6 + 0.8 * D2.g);
   M.sheet = vec4(dist, bright * uSheetR.z, bright * F.w * uSheetO.z, (0.5 + D2.a) * uSheetB.z * F.z);
   M.eA = vec4(0.0);
   M.eB = vec4(0.0);
@@ -166,7 +178,20 @@ Medium medium(vec3 p, vec3 rd) {
     vec3 e = p - uScatPos[i].xyz;
     float q2 = dot(e, e) + uScatPos[i].w;
     float c2 = dot(e, -rd) * inversesqrt(q2);
-    M.cont += M.sigma * uAlbedo * uKScat * uScatRGB[i] * phaseHG(c2, uHG) / q2;
+    vec3 Ts = vec3(1.0);
+    if (uScatShadow > 0 && M.sigma > 0.0) {
+      // Short shadow ray toward the star through the dust field (τ_V → reddened per channel).
+      float L = min(sqrt(q2), uScatShadowLen);
+      vec3 dir = -e * inversesqrt(q2);
+      float tau = 0.0;
+      for (int k = 0; k < 6; k++) {
+        if (k >= uScatShadow) break;
+        vec3 q = (p + dir * (L * (float(k) + 0.5) / float(uScatShadow))) / uExpand;
+        tau += texture(uField, q / (2.0 * uHalf) + 0.5).x;
+      }
+      Ts = exp(-tau * uKappa * L / float(uScatShadow) * uKExt);
+    }
+    M.cont += M.sigma * uAlbedo * uKScat * uScatRGB[i] * Ts * phaseHG(c2, uHG) / q2;
   }
 #ifdef SYNCHROTRON
   {
@@ -196,7 +221,7 @@ void main() {
   vec2 frag = gl_FragCoord.xy + uJitter;
   vec2 ndc = frag / uRes * 2.0 - 1.0;
 #endif
-  vec4 v = uProjInv * vec4(ndc, 1.0, 1.0);
+  vec4 v = uProjInv * vec4(ndc, -1.0, 1.0);
   vec3 dirV = normalize(v.xyz / v.w);
   vec3 rd = normalize(uViewToLocal * dirV);
   vec3 ro = uCamLocal;
@@ -224,6 +249,9 @@ void main() {
     float tPrev = tn;
     float dPrev = 0.0;
     bool havePrev = false;
+    bool haveP2 = false;
+    float dP2 = 0.0;
+    float tP2 = tn;
     for (int i = 0; i < MAX_STEPS; i++) {
       if (i >= uSteps) break;
       float u0 = float(i) / N;
@@ -245,13 +273,45 @@ void main() {
 #ifdef SHOCK
       if (havePrev) {
         float seg = ts - tPrev;
-        float sR = sheetSeg(dPrev + uSheetR.x, M.sheet.x + uSheetR.x, seg, uSheetR.y) * M.sheet.y;
-        float sO = sheetSeg(dPrev + uSheetO.x, M.sheet.x + uSheetO.x, seg, uSheetO.y) * M.sheet.z;
-        float sB = sheetSeg(dPrev + uSheetB.x, M.sheet.x + uSheetB.x, seg, uSheetB.y) * M.sheet.w;
+        // A ray grazing a sheet between two samples never sees d change sign. Fit a parabola
+        // through the last three samples; if |d| has a turning point inside this segment, split
+        // the segment there so the linear-in-d sheet integral catches the (limb-brightened) graze.
+        float tv = -1.0;
+        float dv = 0.0;
+        if (haveP2) {
+          float s01 = (dPrev - dP2) / max(tPrev - tP2, 1e-6);
+          float s12 = (M.sheet.x - dPrev) / max(seg, 1e-6);
+          float a = (s12 - s01) / max(ts - tP2, 1e-6);
+          if (abs(a) > 1e-9) {
+            float tStar = 0.5 * (tPrev + ts) - s12 / (2.0 * a);
+            if (tStar > tPrev && tStar < ts) {
+              tv = tStar;
+              dv = dPrev + s12 * (tStar - tPrev) + a * (tStar - tPrev) * (tStar - ts);
+            }
+          }
+        }
+        float wmin = 0.03 * seg;
+        float sR, sO, sB;
+        if (tv > 0.0) {
+          float l1 = tv - tPrev, l2 = ts - tv;
+          sR = sheetSeg(dPrev + uSheetR.x, dv + uSheetR.x, l1, max(uSheetR.y, wmin)) + sheetSeg(dv + uSheetR.x, M.sheet.x + uSheetR.x, l2, max(uSheetR.y, wmin));
+          sO = sheetSeg(dPrev + uSheetO.x, dv + uSheetO.x, l1, max(uSheetO.y, wmin)) + sheetSeg(dv + uSheetO.x, M.sheet.x + uSheetO.x, l2, max(uSheetO.y, wmin));
+          sB = sheetSeg(dPrev + uSheetB.x, dv + uSheetB.x, l1, max(uSheetB.y, wmin)) + sheetSeg(dv + uSheetB.x, M.sheet.x + uSheetB.x, l2, max(uSheetB.y, wmin));
+        } else {
+          sR = sheetSeg(dPrev + uSheetR.x, M.sheet.x + uSheetR.x, seg, max(uSheetR.y, wmin));
+          sO = sheetSeg(dPrev + uSheetO.x, M.sheet.x + uSheetO.x, seg, max(uSheetO.y, wmin));
+          sB = sheetSeg(dPrev + uSheetB.x, M.sheet.x + uSheetB.x, seg, max(uSheetB.y, wmin));
+        }
+        sR *= M.sheet.y;
+        sO *= M.sheet.z;
+        sB *= M.sheet.w;
         vec3 Ts = exp(-tauV * uKLine);
         dA += vec4((sR + sB) * uRatiosA.x * Ts.x, (sR + sB) * uRatiosA.y * Ts.y, (sR + sB) * uRatiosA.z * Ts.z, sO * uRatiosA.w * Ts.y);
         dB += vec4(sR * uRatiosB.x * Ts.x, sR * uRatiosB.y * Ts.x, sR * uRatiosB.z * Ts.y, 0.0);
       }
+      haveP2 = havePrev;
+      dP2 = dPrev;
+      tP2 = tPrev;
       dPrev = M.sheet.x;
       havePrev = true;
       tPrev = ts;

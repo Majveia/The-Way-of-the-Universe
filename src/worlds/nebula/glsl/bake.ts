@@ -127,5 +127,5 @@ void main() {
     g2 = (min(Cout, 1.0) - min(Cin, 1.0)) / (uK * max(vol, 1e-9));
   }
   // x carries the dust-bearing column (n × dust modifier): the only use of n at render time is extinction.
-  outColor = vec4(nx * D.y, clamp(xi, -30.0, 30.0), sqrt(max(g2, 0.0)), tau * uKappa);
+  outColor = vec4(min(nx * D.y, 6.0e4), clamp(xi, -30.0, 30.0), min(sqrt(max(g2, 0.0)), 6.0e4), min(tau * uKappa, 6.0e4));
 }`;

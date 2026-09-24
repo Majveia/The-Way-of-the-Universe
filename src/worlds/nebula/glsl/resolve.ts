@@ -84,7 +84,7 @@ void main() {
     float depth = texture(uCurAux, uv).x;
     depth = min(depth, closest * 1.5 + 1e-3);
     vec2 ndc = uv * 2.0 - 1.0;
-    vec4 v = uProjInv * vec4(ndc, 1.0, 1.0);
+    vec4 v = uProjInv * vec4(ndc, -1.0, 1.0);
     vec3 rd = normalize(uViewToLocal * normalize(v.xyz / v.w));
     vec3 P = uCamLocal + rd * depth;
     vec4 pc = uPrevVP * vec4(P, 1.0);

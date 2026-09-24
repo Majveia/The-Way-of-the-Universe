@@ -194,3 +194,111 @@ describe('collision · hybrid integrator (CPU reference)', () => {
     expect(tMin).toBeLessThan(200);
   }, 60000);
 });
+
+import { freeFallTime, sfRate, sfProbability, depletionTime, SF_RHO_TH, SF_GRID_CELL, SF_EFFICIENCY } from '../src/worlds/nbody/starformation';
+import { PRESETS, customPreset, scaleGalaxy, DEFAULT_CUSTOM } from '../src/experiences/collision/presets';
+import { diskRotation } from '../src/worlds/nbody/orbit';
+import { whiteBalance } from '../src/worlds/nbody/GalaxyRenderer';
+import { blackbodyRGB } from '../src/physics/blackbody';
+
+describe('collision · star formation (Schmidt law per free-fall time)', () => {
+  it('free-fall time of 1 M☉ pc⁻³ gas ≈ 8.3 Myr', () => {
+    // 1 M☉ pc⁻³ = 1e9 M☉ kpc⁻³ = 0.1 sim units; t_ff = sqrt(3π/(32 G ρ)).
+    expect(freeFallTime(0.1)).toBeGreaterThan(8.0);
+    expect(freeFallTime(0.1)).toBeLessThan(8.6);
+  });
+  it('a normal Sc disk (Σ_gas ≈ 12 M☉ pc⁻² in a 0.75 kpc cell) depletes its gas in ~1–3 Gyr', () => {
+    const sigma = 12e6 / 1e10; // 10¹⁰ M☉ kpc⁻²
+    const rho = sigma / SF_GRID_CELL;
+    const t = depletionTime(rho);
+    expect(t).toBeGreaterThan(1000);
+    expect(t).toBeLessThan(3000);
+  });
+  it('no star formation below the threshold; ρ^1.5 volumetric law well above it (Kennicutt slope)', () => {
+    expect(sfRate(0.5 * SF_RHO_TH)).toBe(0);
+    const r1 = 10 * SF_RHO_TH, r2 = 100 * SF_RHO_TH;
+    const slope = Math.log((r2 * sfRate(r2)) / (r1 * sfRate(r1))) / Math.log(r2 / r1);
+    expect(slope).toBeCloseTo(1.5, 6);
+  });
+  it('burst probability per step converts gas at exactly the Schmidt rate on average', () => {
+    const rho = 20 * SF_RHO_TH, dt = 1;
+    const massRate = (sfProbability(rho, dt) * SF_EFFICIENCY) / dt;
+    expect(massRate / sfRate(rho)).toBeGreaterThan(0.97);
+    expect(massRate / sfRate(rho)).toBeLessThanOrEqual(1);
+  });
+});
+
+describe('collision · presets and encounter geometry', () => {
+  it('scaling a galaxy at fixed density: M × f, lengths × f^⅓', () => {
+    const g = scaleGalaxy(LATE_SPIRAL, 0.125);
+    expect(g.halo.mass).toBeCloseTo(LATE_SPIRAL.halo.mass / 8, 10);
+    expect(g.disk.scale).toBeCloseTo(LATE_SPIRAL.disk.scale / 2, 10);
+    const mean = (x: { mass: number; scale: number }) => x.mass / x.scale ** 3;
+    expect(mean(g.halo)).toBeCloseTo(mean(LATE_SPIRAL.halo), 8);
+  });
+  it('the Cartwheel intruder arrives along the target disk’s spin axis (ring-making geometry)', () => {
+    const p = PRESETS.find((q) => q.id === 'cartwheel')!;
+    const g = p.scenario.galaxies[0];
+    const R = diskRotation(g.i, g.w);
+    const n = [R[2], R[5], R[8]]; // spin axis in the orbit frame
+    const s = keplerStart(100, 20, p.scenario.orbit);
+    const r = Math.hypot(...s.r);
+    const cos = Math.abs((n[0] * s.r[0] + n[1] * s.r[1] + n[2] * s.r[2]) / r);
+    expect(cos).toBeGreaterThan(0.9);
+  });
+  it('preset moments are ordered and the warm-up opens the story after the approach', () => {
+    for (const p of PRESETS) {
+      for (let k = 1; k < p.moments.length; k++) expect(p.moments[k].t).toBeGreaterThan(p.moments[k - 1].t);
+      expect(p.warmup).toBeGreaterThan(p.moments[0].t);
+    }
+  });
+  it('custom encounters: prograde/retrograde labelling and a smaller companion', () => {
+    const c = customPreset({ ...DEFAULT_CUSTOM, massRatio: 4 });
+    expect(c.designation).toContain('prograde × retrograde');
+    expect(c.scenario.galaxies[1].spec.disk.mass).toBeCloseTo(c.scenario.galaxies[0].spec.disk.mass / 4, 10);
+  });
+});
+
+describe('collision · stellar populations and colour', () => {
+  it('inside-out disks: young disk stars sit at larger radii than old ones', () => {
+    const R = realizeGalaxy(LATE_SPIRAL, { halo: 128, bulge: 64, disk: 128 }, { bulge: 256, disk: 12000, gas: 256 }, { halo: 0.8, bulge: 0.12, disk: 0.3 }, 11);
+    let ry = 0, ny = 0, ro = 0, no = 0;
+    const { pos, age, kind } = R.tracers;
+    for (let i = 0; i < kind.length; i++) {
+      if (kind[i] !== 1) continue;
+      const r = Math.hypot(pos[i * 3], pos[i * 3 + 1]);
+      if (age[i] < 1000) (ry += r), ny++;
+      else if (age[i] > 6000) (ro += r), no++;
+    }
+    expect(ny).toBeGreaterThan(100);
+    expect(ry / ny / (ro / no)).toBeGreaterThan(1.15);
+  });
+  it('white balance maps an average-spiral (5300 K) population to neutral and keeps hot stars blue', () => {
+    const wb = whiteBalance(5300);
+    const c = blackbodyRGB(5300);
+    const n = [c[0] * wb.x, c[1] * wb.y, c[2] * wb.z];
+    expect(n[0]).toBeCloseTo(n[1], 6);
+    expect(n[2]).toBeCloseTo(n[1], 6);
+    const hot = blackbodyRGB(15000);
+    expect(hot[2] * wb.z).toBeGreaterThan(hot[0] * wb.x);
+  });
+});
+
+describe('collision · Milkomeda timing (CPU reference)', () => {
+  it('first pericentre ≈ 3.9 Gyr from now (van der Marel et al. 2012: 3.87 Gyr)', () => {
+    const p = PRESETS.find((q) => q.id === 'milkomeda')!;
+    const data = buildScenario(p.scenario, { skeleton: 1024, tracers: 1024 });
+    const sim = new CpuNBody(data, { dt: 2, substeps: 1 });
+    let best = Infinity, tBest = 0;
+    for (let s = 0; s < 300; s++) {
+      sim.step();
+      const [a, b] = sim.centers;
+      const d = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+      if (d < best) (best = d), (tBest = sim.time);
+    }
+    const tNow = (tBest + p.clock!.offsetMyr) / 1000;
+    expect(tNow).toBeGreaterThan(3.6);
+    expect(tNow).toBeLessThan(4.2);
+    expect(best).toBeLessThan(60);
+  }, 120000);
+});
