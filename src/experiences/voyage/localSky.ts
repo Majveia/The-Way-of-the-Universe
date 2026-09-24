@@ -75,6 +75,8 @@ export class LocalSky {
   nearestStar = 1;
   /** 0..1 overall visibility of the regime. */
   fade = 1;
+  /** 0..1 weight of the Sun's resolved image (a star system layer draws it when we are inside Sol). */
+  sunWeight = 1;
   /** Baseline sky brightness/star size (view-dependent: planetarium vs camera). */
   baseBrightness = 1;
   baseStarSize = 1;
@@ -223,7 +225,8 @@ export class LocalSky {
     };
     for (const e of list) {
       hide.push(e.index);
-      add(e.pos, e.absMag, e.temperature, e.radiusRsun, e.index * 0.137, 1);
+      const w = e.index === 0 ? this.sunWeight : 1;
+      if (w > 0.001) add(e.pos, e.absMag, e.temperature, e.radiusRsun, e.index * 0.137, w);
     }
     for (const x of this.extras) if (x.weight > 0.001 && k < 8) add(x.pos, x.absMag, x.temperature, x.radiusRsun, x.seed, x.weight);
     views.length = k;
@@ -234,6 +237,13 @@ export class LocalSky {
   collectLights(push: (dir: THREE.Vector3, illum: number, T: number) => void): void {
     if (this.fade <= 0.001) return;
     const f = this.fade;
+    if (this.sunWeight < 1) {
+      // The Sun lights the ship at full strength even while a system layer draws its image.
+      const d = Math.max(this.observer.length(), 1e-12);
+      const m = 4.83 + 5 * (Math.log10(d) - 1);
+      _v1.copy(this.observer).negate().divideScalar(d);
+      push(_v1, 3.17 * Math.pow(10, -0.4 * (m - 1)) * P_REF * P_REF * (1 - this.sunWeight), 5772);
+    }
     for (const v of this.nearViews) push(v.dir, 3.17 * Math.pow(10, -0.4 * (v.mag - 1)) * P_REF * P_REF * f, v.temperature);
     for (let i = 0; i < 7; i++) {
       if (this.nearList.some((e) => e.index === i)) continue;

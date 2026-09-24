@@ -28,17 +28,22 @@ const css = `
 .vy-home svg { display:block; overflow:visible; }
 .vy-home .vy-hm { position:absolute; left: 34px; top: -8px; white-space:nowrap; font: 400 10.5px/1.35 var(--font-ui); letter-spacing:.12em; color: var(--cool); text-shadow: 0 0 4px #000, 0 0 12px #000; }
 .vy-home .vy-hm span { display:block; font-family: var(--font-mono); font-size:9.5px; letter-spacing:.02em; color: var(--ink-3); }
+.vy-caption { position:absolute; left:50%; bottom: 19%; transform: translate(-50%, 8px); width: min(540px, 62vw); text-align:center; pointer-events:none; opacity:0; transition: opacity 1.2s var(--ease), transform 1.2s var(--ease); text-shadow: 0 0 6px #000, 0 0 18px #000; }
+.vy-caption.on { opacity:1; transform: translate(-50%, 0); }
+.vy-caption .vy-cap-t { font: 300 22px/1.2 var(--font-ui); letter-spacing: .06em; color: var(--ink); margin-bottom: 8px; }
+.vy-caption .vy-cap-x { font: 400 13px/1.55 var(--font-ui); letter-spacing: .02em; color: var(--ink-2); }
+@media (max-width: 720px) { .vy-caption { bottom: 40%; width: 86vw; } .vy-caption .vy-cap-t { font-size: 18px; } }
 .vy-flight { min-width: 210px; max-width: 300px; text-align: right; font: 400 11px/1.5 var(--font-ui); color: var(--ink-2); letter-spacing: .04em; }
 .vy-flight .vy-fl-name { font-size: 11px; letter-spacing: .14em; color: var(--ink-3); }
 .vy-flight .vy-fl-phase { color: var(--ink); font-size: 12.5px; letter-spacing: .03em; }
 .vy-flight .vy-fl-bar { height:1px; background: var(--line-strong); margin: 7px 0 5px; position: relative; overflow: hidden; }
 .vy-flight .vy-fl-bar i { position:absolute; left:0; top:0; bottom:0; background: var(--accent); transform-origin: left center; }
 .vy-flight .vy-fl-eta { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3); white-space: pre-line; }
-.vy-flight .vy-fl-crumb { font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: right; }
+.vy-flight .vy-fl-crumb { font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; }
 .vy-flight .vy-fl-scale { margin-top: 8px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); }
 .vy-flight .vy-fl-scale i { display: block; height: 5px; border: 1px solid var(--ink-3); border-top: 0; min-width: 4px; }
 .vy-flight .vy-fl-tag { display:inline-block; margin-top:6px; font-size:9.5px; letter-spacing:.2em; text-transform:uppercase; color: var(--cool); }
-@media (max-width: 720px) { .vy-flight { text-align: left; } .vy-flight .vy-fl-crumb { text-align: left; direction: ltr; } .vy-flight .vy-fl-scale { justify-content: flex-start; } }
+@media (max-width: 720px) { .vy-flight { text-align: left; } .vy-flight .vy-fl-crumb { text-align: left; } .vy-flight .vy-fl-scale { justify-content: flex-start; } }
 `;
 
 export class Hud {
@@ -109,7 +114,7 @@ export class Hud {
     const ui = this.uiBoxes;
     const narrow = w < 720;
     ui[0][2] = narrow ? w : 290; ui[0][3] = 124;
-    ui[1][1] = h - (narrow ? 250 : 150); ui[1][2] = narrow ? w : 300; ui[1][3] = h;
+    ui[1][1] = h - (narrow ? 300 : 150); ui[1][2] = narrow ? w : 300; ui[1][3] = h;
     ui[2][0] = w - 330; ui[2][1] = h - 175; ui[2][2] = w; ui[2][3] = h;
     ui[3][0] = w - 240; ui[3][2] = w; ui[3][3] = 60;
     for (const b of ui) this.boxes.push(b);

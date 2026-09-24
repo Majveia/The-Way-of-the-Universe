@@ -27,6 +27,9 @@ export interface GalaxyEntry {
   radius: number;
   /** Current render weight 0..1 (set by the explorer each frame). */
   weight: number;
+  /** Eye adaptation for this galaxy (multiplies its radiance), and the radiance scale last used. */
+  adapt: number;
+  scaleUsed: number;
   halo: UniverseHalo | null;
   /** Build when closer than this (Mpc); dispose beyond `dropMpc`. */
   buildMpc: number;
@@ -105,13 +108,14 @@ export class Cosmos {
     const m31Frame = new Frame({ id: 'm31', kind: 'galaxy', label: 'Andromeda', parent: this.root, unit: 1e-6, origin: m31Pos, rotation: o.rotation, entry: 250_000, exit: 320_000 });
     const m31Params = scaleGalaxy(preset('Sb', 31), 1.45);
     m31Params.label = 'Andromeda (M31)';
+    m31Params.look = { ...m31Params.look, exposure: 0.55 };
     this.m31Entry = this.addGalaxy({ id: 'm31', name: 'Andromeda', kicker: 'M31 · spiral Sb · 2.5 million ly', frame: m31Frame, params: m31Params, morph: 'Sb', buildMpc: 2.2, dropMpc: 3.2 });
     this.universe = new UniverseLayer(renderer, { detail });
     this.kids.set(this.mw, [this.local]);
   }
 
-  private addGalaxy(o: Omit<GalaxyEntry, 'layer' | 'ready' | 'age' | 'radius' | 'weight' | 'halo'> & { halo?: UniverseHalo }): GalaxyEntry {
-    const e: GalaxyEntry = { ...o, layer: null, ready: false, age: 0, radius: o.params.rMax, weight: 0, halo: o.halo ?? null };
+  private addGalaxy(o: Omit<GalaxyEntry, 'layer' | 'ready' | 'age' | 'radius' | 'weight' | 'halo' | 'adapt' | 'scaleUsed'> & { halo?: UniverseHalo }): GalaxyEntry {
+    const e: GalaxyEntry = { ...o, layer: null, ready: false, age: 0, radius: o.params.rMax, weight: 0, adapt: 1, scaleUsed: 1, halo: o.halo ?? null };
     this.galaxies.push(e);
     const list = this.kids.get(this.root) ?? [];
     list.push(e.frame);
@@ -160,10 +164,10 @@ export class Cosmos {
   }
 
   /** Build/dispose galaxy layers by distance (camera in root Mpc). */
-  manage(camRoot: THREE.Vector3, dt: number, allowM31: boolean): void {
+  manage(camRoot: THREE.Vector3, dt: number, allow: { mw: boolean; m31: boolean }): void {
     for (const g of this.galaxies) {
       const d = camRoot.distanceTo(g.frame.origin);
-      const want = g === this.m31Entry ? allowM31 && d < g.buildMpc : d < g.buildMpc;
+      const want = g === this.m31Entry ? allow.m31 && d < g.buildMpc : g === this.mwEntry ? (allow.mw || d > 0.05) && d < g.buildMpc : d < g.buildMpc;
       if (want && !g.layer) {
         g.ready = false;
         g.age = 0;
