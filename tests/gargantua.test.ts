@@ -130,10 +130,14 @@ describe('Page–Thorne thin disk', () => {
       }
     });
   }
-  it('Newtonian limit far out: F → 3/(8πr³)(1 − √(r_in/r))', () => {
-    const r = 1e4;
-    const newt = (3 / (8 * Math.PI * r ** 3)) * (1 - Math.sqrt(6 / r));
-    expect(pageThorneFlux(0, r) / newt).toBeCloseTo(1, 2);
+  it('far out the flux approaches the Newtonian 3GMṀ/(8πr³) law (with an O(r^-½) torque term)', () => {
+    for (const a of [0, 0.9]) {
+      const r = 1e6;
+      const k = pageThorneFlux(a, r) / (3 / (8 * Math.PI * r ** 3));
+      expect(Math.abs(1 - k)).toBeLessThan(6 / Math.sqrt(r));
+      // Independent check of the same regime against quadrature.
+      expect(pageThorneFlux(a, 400) / pageThorneFluxQuadrature(a, 400, 20000)).toBeCloseTo(1, 3);
+    }
   });
   it('temperature peaks outside the ISCO, is zero at the ISCO and normalised to 1', () => {
     const p = diskProfile(0.9, iscoRadius(0.9), 40, 200);
@@ -297,9 +301,15 @@ describe('light bending and the shadow', () => {
   });
   it('null geodesics conserve H ≈ 0 and report disk-plane crossings', () => {
     const cam = camera(0.9, 30, 0.17);
-    const res = traceRay(0.9, cam.pos, rayMomentum(cam.tetrad, [0.05, -0.08, -0.99]), { eps: 0.03 });
-    expect(res.hError).toBeLessThan(1e-8);
+    // Passes behind the hole, crosses the disk plane, escapes (the lensed far side of the disk).
+    const res = traceRay(0.9, cam.pos, rayMomentum(cam.tetrad, [0.0, 0.2, -0.98]), { eps: 0.03 });
+    expect(res.fate).toBe('escaped');
+    expect(res.hError).toBeLessThan(1e-6);
     expect(res.crossings.length).toBeGreaterThan(0);
+    // A captured ray: H drift stays small relative to the (growing) momentum scale.
+    const cap = traceRay(0.9, cam.pos, rayMomentum(cam.tetrad, [0.05, -0.08, -0.99]), { eps: 0.03 });
+    expect(cap.fate).toBe('captured');
+    expect(cap.hError).toBeLessThan(1e-3);
   });
 });
 

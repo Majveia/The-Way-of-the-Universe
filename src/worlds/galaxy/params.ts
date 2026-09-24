@@ -140,11 +140,12 @@ export function milkyWay(seed = 1): GalaxyParams {
   // 8.5 kpc, Perseus ≈ 10 kpc, Outer ≈ 13 kpc. Model azimuth φ = π + β.
   const pitch = 12;
   const armList: ArmSpec[] = [
-    { name: 'Scutum–Centaurus', pitchDeg: pitch, phase: Math.PI, r0: 5430, rStart: 3300, rEnd: 17500, strength: 1, width: 0.045 },
-    { name: 'Perseus', pitchDeg: pitch, phase: 2 * Math.PI, r0: 5430, rStart: 3300, rEnd: 18500, strength: 1, width: 0.05 },
-    { name: 'Sagittarius–Carina', pitchDeg: pitch, phase: Math.PI, r0: 6870, rStart: 3600, rEnd: 15500, strength: 0.72, width: 0.04 },
-    { name: 'Norma–Outer', pitchDeg: pitch, phase: 2 * Math.PI, r0: 6870, rStart: 3400, rEnd: 17500, strength: 0.72, width: 0.042 },
-    { name: 'Orion Spur', pitchDeg: 11.4, phase: Math.PI, r0: 8530, rStart: 7300, rEnd: 9900, strength: 0.42, width: 0.03 },
+    // Widths: Gaussian σ ≈ 0.03 R, i.e. FWHM ≈ 0.4–0.7 kpc near the Sun (Reid et al. 2014, Table 2).
+    { name: 'Scutum–Centaurus', pitchDeg: pitch, phase: Math.PI, r0: 5430, rStart: 3300, rEnd: 17500, strength: 1, width: 0.032 },
+    { name: 'Perseus', pitchDeg: pitch, phase: 2 * Math.PI, r0: 5430, rStart: 3300, rEnd: 18500, strength: 1, width: 0.034 },
+    { name: 'Sagittarius–Carina', pitchDeg: pitch, phase: Math.PI, r0: 6870, rStart: 3600, rEnd: 15500, strength: 0.72, width: 0.028 },
+    { name: 'Norma–Outer', pitchDeg: pitch, phase: 2 * Math.PI, r0: 6870, rStart: 3400, rEnd: 17500, strength: 0.72, width: 0.03 },
+    { name: 'Orion Spur', pitchDeg: 11.4, phase: Math.PI, r0: 8530, rStart: 7300, rEnd: 9900, strength: 0.42, width: 0.022 },
   ];
   return {
     id: 'milkyway',
@@ -156,7 +157,7 @@ export function milkyWay(seed = 1): GalaxyParams {
     rMax: 26000,
     zMax: 4200,
     disk: {
-      lum: 2.0e10,
+      lum: 1.6e10,
       scaleLength: 2600,
       scaleHeight: 300,
       truncation: 20000,
@@ -169,9 +170,10 @@ export function milkyWay(seed = 1): GalaxyParams {
       thickColorT: 4750,
       flare: 11000,
     },
-    bulge: { lum: 3e9, a: 450, flatten: 0.8, colorT: 4250, rotation: 0.7, rMaxFactor: 8 },
+    // Little or no classical bulge: most of the "bulge" is the bar's boxy/peanut core (Shen et al. 2010).
+    bulge: { lum: 1.3e9, a: 450, flatten: 0.8, colorT: 4250, rotation: 0.7, rMaxFactor: 8 },
     bar: {
-      lum: 6.5e9,
+      lum: 8e9,
       halfLength: 5000,
       axisRatio: 0.32,
       peanut: 0.55,
@@ -192,9 +194,9 @@ export function milkyWay(seed = 1): GalaxyParams {
       flocculence: 0.35,
       armList,
     },
-    young: { lum: 4e9, scaleLength: 3500, rInner: 3000, rOuter: 17000, scaleHeight: 70, sfr: 1, armFraction: 0.8, colorT: 11000 },
-    gas: { dust: 1.25, dustScaleLength: 5000, dustScaleHeight: 95, dustLane: 1.7, dustHole: 2600, hii: 1, nuclearRing: 230 },
-    halo: { lum: 1.2e8, rMin: 1500, rMax: 70000, flatten: 0.65 },
+    young: { lum: 9e9, scaleLength: 3500, rInner: 3000, rOuter: 17000, scaleHeight: 70, sfr: 1, armFraction: 0.82, colorT: 13000 },
+    gas: { dust: 1.25, dustScaleLength: 5000, dustScaleHeight: 95, dustLane: 3.2, dustHole: 2600, hii: 1, nuclearRing: 230 },
+    halo: { lum: 6e7, rMin: 1500, rMax: 70000, flatten: 0.65 },
     globulars: { count: 150, rCore: 1200, rMax: 40000 },
     warp: { amplitude: 1400, rStart: 11000, nodeAngle: Math.PI + 17.5 * deg },
     clumpiness: 0.15,
@@ -412,7 +414,7 @@ export function buildArms(p: GalaxyParams, armsOverride?: number, pitchOverride?
         rStart: p.spiral.rInner,
         rEnd: p.spiral.rOuter,
         strength: 1,
-        width: m > 2 ? 0.04 : 0.05,
+        width: m > 2 ? 0.028 : 0.034,
       });
     }
   }
@@ -434,7 +436,7 @@ export function buildArms(p: GalaxyParams, armsOverride?: number, pitchOverride?
       rStart: r0 * (1 - len * 0.5),
       rEnd: r0 * (1 + len * 0.6),
       strength: 0.35 + 0.35 * u01(next(h)),
-      width: 0.035,
+      width: 0.026,
     });
   }
   return arms.slice(0, MAX_ARMS);

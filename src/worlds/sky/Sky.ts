@@ -240,8 +240,8 @@ void main() {
 
 /**
  * Stars placed in 3D (parsecs, galactic frame): parallax, distance modulus, proper motion, relativity.
- * Point-spread function: a Gaussian core (≈ 2 px FWHM) holding 90 % of the light plus a Moffat
- * (β = 1.8) glare halo whose visible radius grows with brightness — bright stars look bigger for the
+ * Point-spread function: a Gaussian core (≈ 2 px FWHM) holding 97 % of the light plus a Moffat
+ * (β = 2.4) glare halo whose visible radius grows with brightness — bright stars look bigger for the
  * same reason they do to eyes and cameras, while every sprite conserves its flux.
  */
 const STAR3D_VERT = /* glsl */ `
@@ -296,11 +296,12 @@ void main() {
   clip.z = clip.w * 0.99999;
   gl_Position = clip;
   float sigma = 0.85 * sqrt(uPixelRatio) * uSize;
-  float peak = 0.9 * E / (6.2831853 * sigma * sigma);
-  float a = 2.2 * uPixelRatio * uSize;
-  float h0 = 0.1 * E * 0.8 / (3.14159265 * a * a);
+  float peak = 0.97 * E / (6.2831853 * sigma * sigma);
+  float a = 2.0 * uPixelRatio * uSize;
+  // Moffat β = 2.4 halo holding 3 % of the light: normalisation (β − 1)/(π a²).
+  float h0 = 0.03 * E * 1.4 / (3.14159265 * a * a);
   float R = 3.2 * sigma;
-  if (h0 > uLimit) R = max(R, a * sqrt(pow(h0 / uLimit, 1.0 / 1.8) - 1.0));
+  if (h0 > uLimit) R = max(R, a * sqrt(pow(h0 / uLimit, 1.0 / 2.4) - 1.0));
   if (peak > uLimit) R = max(R, sigma * sqrt(2.0 * log(peak / uLimit)));
   R = min(R, uMaxRadius);
   gl_PointSize = 2.0 * R;
@@ -328,7 +329,7 @@ void main() {
   float R2 = vRadius * vRadius;
   if (r2 >= R2) discard;
   float core = exp(-0.5 * r2 / (vSigma * vSigma));
-  float halo = pow(1.0 + r2 / (vAlpha * vAlpha), -1.8);
+  float halo = pow(1.0 + r2 / (vAlpha * vAlpha), -2.4);
   float taper = 1.0 - r2 / R2;
   vec3 col = vCore * core + vHalo * halo * taper * taper;
   outColor = vec4(min(col, vec3(6.0e4)), 1.0);
@@ -535,7 +536,7 @@ export class Sky {
       g.setAttribute('absMag', new THREE.BufferAttribute(mags, 1));
       g.setAttribute('posLo', new THREE.BufferAttribute(posLo!, 3));
       g.setAttribute('vel', new THREE.BufferAttribute(vel!, 3));
-      mat = this.makeStar3DMaterial(o, 1);
+      mat = this.makeStar3DMaterial(o, 1, this.noHide);
     } else {
       g.setAttribute('mag', new THREE.BufferAttribute(mags, 1));
       mat = new THREE.ShaderMaterial({
@@ -560,7 +561,9 @@ export class Sky {
     return pts;
   }
 
-  private makeStar3DMaterial(o: SkyOptions, fade: number): THREE.ShaderMaterial {
+  private noHide = new Int32Array(8).fill(-1);
+
+  private makeStar3DMaterial(o: SkyOptions, fade: number, hide: Int32Array): THREE.ShaderMaterial {
     return new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
       vertexShader: STAR3D_VERT,
@@ -574,7 +577,7 @@ export class Sky {
         uMinDist: { value: 1e-3 },
         uMaxRadius: { value: 128 },
         uLimit: { value: 2.5e-3 },
-        uHide: { value: this.hide },
+        uHide: { value: hide },
       },
       blending: THREE.AdditiveBlending,
       depthTest: false,
@@ -601,7 +604,7 @@ export class Sky {
     g.setAttribute('absMag', new THREE.BufferAttribute(new Float32Array(c.absMag), 1));
     g.setAttribute('temp', new THREE.BufferAttribute(new Float32Array(c.temperature), 1));
     g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e9);
-    this.star3dMat = this.makeStar3DMaterial(this.opts, fadeIn ? 0 : 1);
+    this.star3dMat = this.makeStar3DMaterial(this.opts, fadeIn ? 0 : 1, this.hide);
     this.catalogPoints = new THREE.Points(g, this.star3dMat);
     this.catalogPoints.frustumCulled = false;
     this.catalogPoints.renderOrder = 0;

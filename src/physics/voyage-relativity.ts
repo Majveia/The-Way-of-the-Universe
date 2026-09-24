@@ -279,24 +279,27 @@ export function planTrip(distance: number, alpha: number, betaMax = 1): TripPlan
 /**
  * Advance a proper velocity u = γβ (c = 1) by a rest-frame (proper) acceleration `aRest` (c per unit
  * proper time) over proper time dτ. Uses the exact boost of the 4-acceleration:
- * du/dτ = γ a∥ + a⊥ (components relative to u), integrated with a midpoint step.
+ * du/dτ = γ a∥ + a⊥ (components relative to u), integrated with classical RK4.
  */
 export function stepProperVelocity(u: THREE.Vector3, aRest: THREE.Vector3, dTau: number): THREE.Vector3 {
   const f = (uu: THREE.Vector3, out: THREE.Vector3) => {
-    const um = uu.length();
-    if (um < 1e-12) return out.copy(aRest);
-    const g = Math.sqrt(1 + um * um);
-    const par = aRest.dot(uu) / um;
-    // a⊥ = a − par n ;  du/dτ = γ par n + a⊥ = a + (γ − 1) par n
-    return out.copy(aRest).addScaledVector(uu, ((g - 1) * par) / um);
+    const um2 = uu.lengthSq();
+    if (um2 < 1e-24) return out.copy(aRest);
+    const g = Math.sqrt(1 + um2);
+    // a⊥ = a − (a·n) n ;  du/dτ = γ (a·n) n + a⊥ = a + (γ − 1)(a·u) u / |u|²
+    return out.copy(aRest).addScaledVector(uu, ((g - 1) * aRest.dot(uu)) / um2);
   };
-  const k1 = f(u, _k1);
-  _mid.copy(u).addScaledVector(k1, dTau * 0.5);
-  const k2 = f(_mid, _k2);
-  return u.addScaledVector(k2, dTau);
+  const h = dTau;
+  f(u, _k1);
+  f(_mid.copy(u).addScaledVector(_k1, h / 2), _k2);
+  f(_mid.copy(u).addScaledVector(_k2, h / 2), _k3);
+  f(_mid.copy(u).addScaledVector(_k3, h), _k4);
+  return u.addScaledVector(_k1, h / 6).addScaledVector(_k2, h / 3).addScaledVector(_k3, h / 3).addScaledVector(_k4, h / 6);
 }
 const _k1 = new THREE.Vector3();
 const _k2 = new THREE.Vector3();
+const _k3 = new THREE.Vector3();
+const _k4 = new THREE.Vector3();
 const _mid = new THREE.Vector3();
 
 /**

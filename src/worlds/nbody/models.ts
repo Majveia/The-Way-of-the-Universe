@@ -46,8 +46,18 @@ export const hernquistInverseMass = (a: number, u: number): number => {
  * in units of R_d and M_disk. Filled from scripts in the collision module's fit (see header).
  */
 export const DISK_3MN_TABLE: ReadonlyArray<readonly number[]> = [
-  // ratio,   a1,       a2,       a3,       b,        M1,       M2,       M3
-  [0.1, 0.30743, 4.85723, 1.55113, 0.09775, 0.04093, -0.74746, 1.64007],
+  // z0/Rd,  a1,      a2,      a3,      b,       M1,      M2,      M3      (units of R_d, M_d)
+  [0.02, 0.32384, 1.57130, 4.33727, 0.01892, 0.03627, 1.68171, -0.71829], // rms 0.021, max 0.111
+  [0.035, 0.32734, 1.58453, 4.24949, 0.03334, 0.03882, 1.70692, -0.74604], // rms 0.020, max 0.100
+  [0.05, 0.32836, 1.59356, 4.18519, 0.04794, 0.04089, 1.72607, -0.76723], // rms 0.020, max 0.091
+  [0.07, 0.32643, 1.59993, 4.12578, 0.06769, 0.04296, 1.74328, -0.78650], // rms 0.019, max 0.083
+  [0.1, 0.31755, 1.59933, 4.07542, 0.09785, 0.04470, 1.75444, -0.79938], // rms 0.019, max 0.075
+  [0.13, 0.30286, 1.58971, 4.05307, 0.12864, 0.04514, 1.75330, -0.79867], // rms 0.019, max 0.069
+  [0.17, 0.27653, 1.56801, 4.04411, 0.17059, 0.04436, 1.74140, -0.78596], // rms 0.019, max 0.062
+  [0.22, 0.23592, 1.53288, 4.04346, 0.22438, 0.04218, 1.71989, -0.76227], // rms 0.020, max 0.056
+  [0.3, 0.15958, 1.46838, 4.03337, 0.31330, 0.03782, 1.68463, -0.72263], // rms 0.021, max 0.057
+  [0.4, 0.05212, 1.38222, 3.97828, 0.42905, 0.03267, 1.64873, -0.68157], // rms 0.022, max 0.060
+  [0.55, 0.00000, 1.48921, 2.99998, 0.61155, 0.05921, 2.10911, -1.16846], // rms 0.025, max 0.066
 ];
 
 export interface MN3 {
@@ -59,34 +69,32 @@ export interface MN3 {
   m: [number, number, number];
 }
 
-/** Interpolate the 3MN fit for an exponential disk (mass M, scale R_d, sech² height z₀). */
+/** Thickest disk (z₀/R_d) the 3MN table covers; thicker mass is blended toward a sphere. */
+export const DISK_3MN_MAX_RATIO = 0.55;
+
+/**
+ * Interpolate the 3MN fit for an exponential disk (mass M, scale R_d, sech² height z₀).
+ * Linear in z₀/R_d between table rows; below the table b scales with z₀, above it is clamped.
+ */
 export function disk3MN(mass: number, rd: number, z0: number, out?: MN3): MN3 {
   const t = DISK_3MN_TABLE;
   const ratio = z0 / rd;
-  let row: number[];
-  if (ratio <= t[0][0] || t.length === 1) row = t[0].slice();
-  else if (ratio >= t[t.length - 1][0]) row = t[t.length - 1].slice();
-  else {
-    let i = 0;
-    while (i < t.length - 2 && t[i + 1][0] < ratio) i++;
-    const r0 = t[i], r1 = t[i + 1];
-    // Interpolate in log(ratio); scale lengths in log space, masses linearly.
-    const f = Math.log(ratio / r0[0]) / Math.log(r1[0] / r0[0]);
-    row = r0.map((v, k) => {
-      if (k >= 1 && k <= 4) return Math.exp(Math.log(v) + f * (Math.log(r1[k]) - Math.log(v)));
-      return v + f * (r1[k] - v);
-    });
-  }
-  // When extrapolating in thickness, b tracks z₀ proportionally.
-  const bScale = ratio > t[t.length - 1][0] ? ratio / t[t.length - 1][0] : ratio < t[0][0] ? ratio / t[0][0] : 1;
+  const lo = t[0][0], hi = t[t.length - 1][0];
+  const rc = Math.min(hi, Math.max(lo, ratio));
+  let i = 0;
+  while (i < t.length - 2 && t[i + 1][0] < rc) i++;
+  const r0 = t[i], r1 = t[i + 1];
+  const f = Math.min(1, Math.max(0, (rc - r0[0]) / (r1[0] - r0[0])));
+  const col = (k: number) => r0[k] + f * (r1[k] - r0[k]);
+  const bScale = ratio < lo ? ratio / lo : 1;
   const o = out ?? { a: [0, 0, 0], b: 0, m: [0, 0, 0] };
-  o.a[0] = row[1] * rd;
-  o.a[1] = row[2] * rd;
-  o.a[2] = row[3] * rd;
-  o.b = row[4] * rd * bScale;
-  o.m[0] = row[5] * mass;
-  o.m[1] = row[6] * mass;
-  o.m[2] = row[7] * mass;
+  o.a[0] = col(1) * rd;
+  o.a[1] = col(2) * rd;
+  o.a[2] = col(3) * rd;
+  o.b = col(4) * rd * bScale;
+  o.m[0] = col(5) * mass;
+  o.m[1] = col(6) * mass;
+  o.m[2] = col(7) * mass;
   return o;
 }
 
