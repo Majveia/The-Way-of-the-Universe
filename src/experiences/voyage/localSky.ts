@@ -294,10 +294,16 @@ export class LocalSky {
     return best;
   }
 
-  render(r: THREE.WebGLRenderer, skyCam: THREE.PerspectiveCamera, pixelRatio: number, targetW: number, targetH: number, exposure: number, cssHeight: number): void {
+  /** Draw the sky (writes the background: call first). */
+  renderSky(r: THREE.WebGLRenderer, skyCam: THREE.PerspectiveCamera, pixelRatio: number, cssHeight: number): void {
     if (this.fade <= 0.001) return;
     this.sky.cssHeight = cssHeight;
     this.sky.render(r, skyCam, pixelRatio);
+  }
+
+  /** Draw the resolved nearby stars (additive). */
+  renderNear(r: THREE.WebGLRenderer, skyCam: THREE.PerspectiveCamera, pixelRatio: number, targetW: number, targetH: number, exposure: number): void {
+    if (this.fade <= 0.001 || this.nearViews.length === 0) return;
     const pxAngle = (2 * Math.tan(THREE.MathUtils.degToRad(skyCam.fov) / 2)) / targetH;
     this.near.set(this.nearViews, pxAngle, pixelRatio, exposure, targetW, targetH, targetH * 0.28);
     this.near.render(r, skyCam);

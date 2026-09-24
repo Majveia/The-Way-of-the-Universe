@@ -24,14 +24,21 @@ const css = `
 .vy-reticle svg { display:block; overflow:visible; }
 .vy-reticle .vy-rt { position:absolute; left: 22px; top: -9px; white-space:nowrap; font: 400 11px/1.35 var(--font-ui); letter-spacing:.1em; color: var(--accent); text-shadow: 0 0 4px #000, 0 0 12px #000, 0 0 20px rgba(0,0,0,.8); }
 .vy-reticle .vy-rt span { display:block; font-family: var(--font-mono); font-size:10px; letter-spacing:.02em; color: var(--ink-2); }
+.vy-home { position:absolute; left:0; top:0; pointer-events:none; will-change:transform; transition: opacity .6s var(--ease); }
+.vy-home svg { display:block; overflow:visible; }
+.vy-home .vy-hm { position:absolute; left: 34px; top: -8px; white-space:nowrap; font: 400 10.5px/1.35 var(--font-ui); letter-spacing:.12em; color: var(--cool); text-shadow: 0 0 4px #000, 0 0 12px #000; }
+.vy-home .vy-hm span { display:block; font-family: var(--font-mono); font-size:9.5px; letter-spacing:.02em; color: var(--ink-3); }
 .vy-flight { min-width: 210px; max-width: 300px; text-align: right; font: 400 11px/1.5 var(--font-ui); color: var(--ink-2); letter-spacing: .04em; }
 .vy-flight .vy-fl-name { font-size: 11px; letter-spacing: .14em; color: var(--ink-3); }
 .vy-flight .vy-fl-phase { color: var(--ink); font-size: 12.5px; letter-spacing: .03em; }
 .vy-flight .vy-fl-bar { height:1px; background: var(--line-strong); margin: 7px 0 5px; position: relative; overflow: hidden; }
 .vy-flight .vy-fl-bar i { position:absolute; left:0; top:0; bottom:0; background: var(--accent); transform-origin: left center; }
 .vy-flight .vy-fl-eta { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3); white-space: pre-line; }
+.vy-flight .vy-fl-crumb { font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: right; }
+.vy-flight .vy-fl-scale { margin-top: 8px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); }
+.vy-flight .vy-fl-scale i { display: block; height: 5px; border: 1px solid var(--ink-3); border-top: 0; min-width: 4px; }
 .vy-flight .vy-fl-tag { display:inline-block; margin-top:6px; font-size:9.5px; letter-spacing:.2em; text-transform:uppercase; color: var(--cool); }
-@media (max-width: 720px) { .vy-flight { text-align: left; } }
+@media (max-width: 720px) { .vy-flight { text-align: left; } .vy-flight .vy-fl-crumb { text-align: left; direction: ltr; } .vy-flight .vy-fl-scale { justify-content: flex-start; } }
 `;
 
 export class Hud {
@@ -40,6 +47,9 @@ export class Hud {
   private reticle: HTMLElement;
   private reticleText: HTMLElement;
   private reticleSub: HTMLElement;
+  private home: HTMLElement;
+  private homeText: HTMLElement;
+  private homeSub: HTMLElement;
   private style: HTMLStyleElement;
   private v = new THREE.Vector3();
   private boxes: Array<[number, number, number, number]> = [];
@@ -68,6 +78,14 @@ export class Hud {
     this.reticleSub = this.reticle.querySelector('.vy-rt span') as HTMLElement;
     this.reticleText.style.fontWeight = '400';
     this.root.appendChild(this.reticle);
+    this.home = document.createElement('div');
+    this.home.className = 'vy-home';
+    this.home.style.opacity = '0';
+    this.home.innerHTML = `<svg width="0" height="0"><circle cx="0" cy="0" r="5" fill="none" stroke="var(--cool)" stroke-width="1"/><path d="M6 0h22" stroke="var(--cool)" stroke-width="1" stroke-opacity="0.6"/></svg><div class="vy-hm"><b></b><span></span></div>`;
+    this.homeText = this.home.querySelector('.vy-hm b') as HTMLElement;
+    this.homeText.style.fontWeight = '400';
+    this.homeSub = this.home.querySelector('.vy-hm span') as HTMLElement;
+    this.root.appendChild(this.home);
   }
 
   /** Project a world direction (camera at the origin) to CSS pixels; null if behind or off-screen. */
@@ -82,7 +100,7 @@ export class Hud {
     return [x, y];
   }
 
-  update(items: readonly LabelItem[], target: LabelItem | null, camera: THREE.Camera, w: number, h: number, reserved?: readonly [number, number, number, number][]): void {
+  update(items: readonly LabelItem[], target: LabelItem | null, camera: THREE.Camera, w: number, h: number, reserved?: readonly [number, number, number, number][], home: LabelItem | null = null): void {
     // Reserved areas (e.g. the ship), then the reticle.
     this.boxes.length = 0;
     if (reserved) for (const b of reserved) this.boxes.push(b);
@@ -92,7 +110,7 @@ export class Hud {
     const narrow = w < 720;
     ui[0][2] = narrow ? w : 290; ui[0][3] = 124;
     ui[1][1] = h - (narrow ? 250 : 150); ui[1][2] = narrow ? w : 300; ui[1][3] = h;
-    ui[2][0] = w - 330; ui[2][1] = h - 130; ui[2][2] = w; ui[2][3] = h;
+    ui[2][0] = w - 330; ui[2][1] = h - 175; ui[2][2] = w; ui[2][3] = h;
     ui[3][0] = w - 240; ui[3][2] = w; ui[3][3] = 60;
     for (const b of ui) this.boxes.push(b);
     let rp: [number, number] | null = null;
@@ -105,6 +123,16 @@ export class Hud {
       if (this.reticleSub.textContent !== sub) this.reticleSub.textContent = sub;
       this.boxes.push([rp[0] - 26, rp[1] - 26, rp[0] + 190, rp[1] + 30]);
     } else this.reticle.style.opacity = '0';
+    // "You are here" marker.
+    const hp = home ? this.project(home.dir, camera, w, h) : null;
+    if (hp && home) {
+      this.home.style.opacity = '1';
+      this.home.style.transform = `translate3d(${hp[0].toFixed(1)}px, ${hp[1].toFixed(1)}px, 0)`;
+      if (this.homeText.textContent !== home.text) this.homeText.textContent = home.text;
+      const sub = home.sub ?? '';
+      if (this.homeSub.textContent !== sub) this.homeSub.textContent = sub;
+      this.boxes.push([hp[0] - 8, hp[1] - 12, hp[0] + 200, hp[1] + 22]);
+    } else this.home.style.opacity = '0';
 
     let k = 0;
     if (this.labelsOn) {
