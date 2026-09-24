@@ -189,6 +189,24 @@ describe('log-distance autopilot', () => {
     expect(fwd.dot(want)).toBeGreaterThan(0.999);
   });
 
+  it('arrives exactly at a destination whose frame moves during the trip', () => {
+    const { local, system, planet } = chain();
+    const kids = (f: Frame) => (f === local ? [system] : f === system ? [planet] : []);
+    const nav = makeNav(local);
+    nav.position.set(0.5, 0, 0); // 0.5 pc from the Sun
+    const view = new THREE.Vector3(0, 0, 20000);
+    const trip = new Trip({ frame: local, position: nav.position, scale: 1e15 }, { frame: planet, position: view, scale: 6.4e6 }, { lookAt: new THREE.Vector3() });
+    for (let i = 0; i < 1000 && !trip.done; i++) {
+      // The planet runs along its orbit (30 km/s × a time warp) while we fly.
+      planet.origin.x += (30 * 3600) / 1.495978707e8;
+      trip.step(trip.duration / 600, nav);
+      settleFrame(nav, kids);
+    }
+    expect(trip.done).toBe(true);
+    expect(nav.frame).toBe(planet);
+    expect(nav.position.distanceTo(view)).toBeLessThan(1e-6);
+  });
+
   it('smoother is 0 → 1 with flat ends', () => {
     expect(smoother(0)).toBe(0);
     expect(smoother(1)).toBe(1);

@@ -34,7 +34,7 @@ export interface UniverseRenderOptions {
 }
 
 export class UniverseLayer {
-  readonly ready: Promise<void>;
+  private readyP: Promise<void> | null = null;
   /** Halos in the root frame (empty until ready), most massive first. */
   halos: UniverseHalo[] = [];
   home: HomeChoice | null = null;
@@ -73,10 +73,20 @@ export class UniverseLayer {
   constructor(
     private renderer: THREE.WebGLRenderer,
     private opts: { detail: number; seed?: number },
-  ) {
-    const d = opts.detail;
+  ) {}
+
+  /** Resolves when the web can be drawn. The simulation (a Web Worker) starts on first access. */
+  get ready(): Promise<void> {
+    return this.start();
+  }
+
+  /** Start (or join) the z = 0 simulation; cached across mounts by the cosmicweb module. */
+  start(): Promise<void> {
+    if (this.readyP) return this.readyP;
+    const d = this.opts.detail;
+    const renderer = this.renderer;
     const np = d >= 1 ? 128 : d >= 0.6 ? 96 : 64;
-    this.ready = loadWebToday({ seed: opts.seed ?? 42, np }).then((w) => {
+    this.readyP = loadWebToday({ seed: this.opts.seed ?? 42, np }).then((w) => {
       if (this.disposed) return;
       this.data = w;
       this.boxMpc = w.boxMpc;
@@ -96,6 +106,7 @@ export class UniverseLayer {
       this.web.setKeyframes(0, w.today.positions, 0, w.today.positions);
       this.web.setGalaxies(w.today.galaxies, w.today.galaxies);
     });
+    return this.readyP;
   }
 
   get isReady(): boolean {

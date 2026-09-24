@@ -106,6 +106,8 @@ export class Trip {
   private dirStart = new THREE.Vector3();
   private dirEnd = new THREE.Vector3();
   private dirRoot = new THREE.Vector3();
+  /** Current direction to the destination (root axes). */
+  private dirNow = new THREE.Vector3();
   private q0 = new THREE.Quaternion();
   private qTravel = new THREE.Quaternion();
   private q1 = new THREE.Quaternion();
@@ -129,6 +131,7 @@ export class Trip {
     if (d.lengthSq() > 0) d.normalize();
     else d.set(0, 0, -1);
     frameDirToRoot(d, lca, this.dirRoot);
+    this.dirNow.copy(this.dirRoot);
     convertDirection(d, lca, start.frame, this.dirStart);
     convertDirection(d, lca, end.frame, this.dirEnd);
     this.logLength = tripLogLength(this.distance, start.scale, end.scale);
@@ -201,6 +204,12 @@ export class Trip {
       nav.frame = lca;
       nav.position.copy(pa).lerp(pb, w);
     }
+    // Follow the destination if its frame moves (a planet on its orbit): aim at where it is now.
+    const lcaEnd = convertPoint(this.end.position, this.end.frame, nav.frame, _pb).sub(nav.position);
+    if (lcaEnd.lengthSq() > 0) {
+      frameDirToRoot(lcaEnd.normalize(), nav.frame, this.dirNow);
+      lookQuat(this.dirNow, _up2.set(0, 1, 0).applyQuaternion(this.q0), this.qTravel);
+    }
     // Attitude: turn to the destination, travel, then turn to the arrival view in the last stretch.
     const tSec = u * this.duration;
     const k0 = smoother(tSec / Math.max(this.turn, 1e-3));
@@ -210,7 +219,7 @@ export class Trip {
       _q.slerp(this.q1, k1);
     }
     nav.quaternion.copy(_q);
-    nav.velocity.copy(this.dirRoot).multiplyScalar(this.speed);
+    nav.velocity.copy(this.dirNow).multiplyScalar(this.speed);
   }
 }
 
@@ -227,6 +236,7 @@ const _q = new THREE.Quaternion();
 const _m = new THREE.Matrix4();
 const _zero = new THREE.Vector3();
 const _up = new THREE.Vector3();
+const _up2 = new THREE.Vector3();
 
 /** Attitude looking along `dir` (root axes) with `up` as near-up. Camera convention: −Z forward. */
 export function lookQuat(dir: THREE.Vector3, up: THREE.Vector3, out: THREE.Quaternion): THREE.Quaternion {
