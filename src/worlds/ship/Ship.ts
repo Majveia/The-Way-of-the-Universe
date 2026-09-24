@@ -493,7 +493,9 @@ export class Ship {
     this.hullMat.uniforms.uThrust.value = t;
     this.plume.thrust = t;
     const c = this.plume.color;
-    (this.hullMat.uniforms.uEngineColor.value as THREE.Color).setRGB(c.r * this.plume.brightness, c.g * this.plume.brightness, c.b * this.plume.brightness);
+    // Light cast on the hull: the plume's integrated colour (continuum + Balmer), paler than the lines alone.
+    const k = this.plume.brightness;
+    (this.hullMat.uniforms.uEngineColor.value as THREE.Color).setRGB((0.25 * c.r + 0.5) * k, (0.25 * c.g + 0.6) * k, (0.25 * c.b + 0.78) * k);
   }
   set pixelRatio(pr: number) {
     this.lightsMat.uniforms.uPixelRatio.value = pr;

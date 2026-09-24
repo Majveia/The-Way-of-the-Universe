@@ -13,6 +13,8 @@ export interface ViewTarget {
   yaw: number;
   pitch: number;
   fov?: number;
+  /** Look-at offset from the focus body (AU, three axes) — e.g. halfway down a comet's tail. */
+  target?: THREE.Vector3;
 }
 
 export interface ViewPreset {
@@ -36,6 +38,72 @@ const _d = new THREE.Vector3();
 const get = (m: SolarSystemModel, id: string): SolarBody => m.get(id)!;
 /** Direction from body to the Sun. */
 const sunward = (b: SolarBody) => _d.copy(b.position).negate();
+
+/**
+ * Broadside view of a comet: look at a point `along` AU down the anti-solar axis (where the tails
+ * are), from `distance` AU, `side` radians around from the Sun line, a little above the orbit.
+ */
+function cometView(m: SolarSystemModel, id: string, along: number, distance: number, side = 1.35, pitch = 0.32): ViewTarget {
+  const c = get(m, id);
+  const out = c.position.clone().normalize();
+  return { focus: id, distance, yaw: yawOf(out) + side, pitch, target: out.multiplyScalar(along) };
+}
+
+/**
+ * Pitch for a ringed planet that puts the camera ~16° from the ring plane on its *sunlit* face
+ * (the rings are lit from one side only; near equinox — Saturn, March 2025 — they go dark).
+ */
+function sunlitRingPitch(b: SolarBody, yaw: number): number {
+  const n = b.pole;
+  const sunSide = Math.sign(n.dot(sunward(b))) || 1;
+  let best = 0.24;
+  let bestScore = Infinity;
+  const v = new THREE.Vector3();
+  for (let p = -1.2; p <= 1.2; p += 0.02) {
+    v.set(Math.cos(p) * Math.sin(yaw), Math.sin(p), Math.cos(p) * Math.cos(yaw));
+    const elev = Math.asin(THREE.MathUtils.clamp(v.dot(n), -1, 1)) * sunSide;
+    const score = Math.abs(elev - 0.42) + 0.1 * Math.abs(p);
+    if (score < bestScore) {
+      bestScore = score;
+      best = p;
+    }
+  }
+  return best;
+}
+
+/**
+ * A telephoto view over the lunar limb toward Earth. The camera sits `rc` lunar radii from the
+ * Moon's centre, displaced toward the Sun so the near limb is lit; Earth sits just clear of the
+ * limb (angle θ = asin(1/rc) + margin from the Moon's centre) and the frame is aimed a little
+ * below it so the curved horizon fills the lower part of the picture.
+ */
+function earthriseView(m: SolarSystemModel): ViewTarget {
+  const moon = get(m, 'moon');
+  const earth = get(m, 'earth');
+  const Rm = moon.radius;
+  const u = new THREE.Vector3().subVectors(earth.position, moon.position).normalize();
+  // Displacement off the Moon–Earth line, partly across the Sun’s direction and partly sunward
+  // so the limb below Earth is lit and its curve reads cleanly against black. (Lighting follows
+  // the real date: the Earth phase is whatever the Moon saw at that moment.)
+  const sp = new THREE.Vector3().copy(moon.position).negate().normalize();
+  sp.addScaledVector(u, -sp.dot(u));
+  if (sp.lengthSq() < 1e-6) sp.set(0, 1, 0).addScaledVector(u, -u.y);
+  sp.normalize();
+  const across = new THREE.Vector3().crossVectors(u, sp).normalize();
+  if (across.y < 0) across.negate();
+  const n = across.multiplyScalar(0.72).addScaledVector(sp, 0.7).normalize();
+  const rc = 2.3;
+  const fov = 22;
+  const theta = Math.asin(1 / rc) + THREE.MathUtils.degToRad(3.2);
+  const C = new THREE.Vector3().copy(u).multiplyScalar(-Math.cos(theta) * rc * Rm).addScaledVector(n, Math.sin(theta) * rc * Rm);
+  // Aim below Earth (toward the Moon's centre) by a fraction of the field.
+  const delta = THREE.MathUtils.degToRad(fov * 0.26);
+  const w = new THREE.Vector3().copy(u).addScaledVector(n, -Math.tan(delta)).normalize();
+  const Lr = 4 * Rm;
+  const target = C.clone().addScaledVector(w, Lr);
+  _d.copy(w).negate();
+  return { focus: 'moon', distance: Lr, yaw: yawOf(_d), pitch: pitchOf(_d), fov, target };
+}
 
 export const VIEWS: ViewPreset[] = [
   {
@@ -62,7 +130,8 @@ export const VIEWS: ViewPreset[] = [
     label: 'Saturn',
     view: (m) => {
       const s = get(m, 'saturn');
-      return { focus: 'saturn', distance: s.radius * 9.5, yaw: yawOf(sunward(s)) + 0.95, pitch: 0.24 };
+      const yaw = yawOf(sunward(s)) + 0.95;
+      return { focus: 'saturn', distance: s.radius * 9.5, yaw, pitch: sunlitRingPitch(s, yaw) };
     },
   },
   {
@@ -70,7 +139,7 @@ export const VIEWS: ViewPreset[] = [
     label: 'Jupiter’s moons',
     view: (m) => {
       const j = get(m, 'jupiter');
-      return { focus: 'jupiter', distance: 0.03, yaw: yawOf(sunward(j)) + 0.6, pitch: 0.22 };
+      return { focus: 'jupiter', distance: 0.02, yaw: yawOf(sunward(j)) + 0.6, pitch: 0.3 };
     },
   },
   {
@@ -98,7 +167,7 @@ export const VIEWS: ViewPreset[] = [
   {
     id: 'sun',
     label: 'The Sun',
-    view: () => ({ focus: 'sun', distance: 0.03, yaw: 0.4, pitch: 0.18 }),
+    view: () => ({ focus: 'sun', distance: 0.021, yaw: 0.4, pitch: 0.18 }),
   },
   {
     id: 'voyager',
@@ -116,15 +185,20 @@ const J = (y: number, mo: number, d: number, h = 0, mi = 0) => calendarToJD(y, m
 
 export const EVENTS: ViewPreset[] = [
   {
+    id: 'earthrise',
+    label: 'Earthrise 1968',
+    caption: 'Apollo 8, 24 December 1968: Earth over the lunar limb, 384 000 km away and four times the Moon’s size in our sky',
+    jdUTC: J(1968, 12, 24, 16, 40),
+    warp: 1,
+    view: (m) => earthriseView(m),
+  },
+  {
     id: 'hale-bopp-1997',
     label: 'Hale–Bopp 1997',
     caption: 'The Great Comet of 1997 near perihelion: a curved white dust tail and a straight blue ion tail',
     jdUTC: J(1997, 3, 29, 12),
     warp: 3,
-    view: (m) => {
-      const c = get(m, 'hale-bopp');
-      return { focus: 'hale-bopp', distance: 0.42, yaw: yawOf(sunward(c)) + 1.75, pitch: 0.28 };
-    },
+    view: (m) => cometView(m, 'hale-bopp', 0.22, 0.95, 1.2, 0.3),
   },
   {
     id: 'halley-1986',
@@ -132,29 +206,32 @@ export const EVENTS: ViewPreset[] = [
     caption: '1P/Halley one week after perihelion, February 1986',
     jdUTC: J(1986, 2, 16),
     warp: 3,
-    view: (m) => {
-      const c = get(m, 'halley');
-      return { focus: 'halley', distance: 0.3, yaw: yawOf(sunward(c)) + 1.9, pitch: 0.35 };
-    },
+    view: (m) => cometView(m, 'halley', 0.12, 0.5, 1.3, 0.35),
   },
   {
     id: 'neowise-2020',
     label: 'NEOWISE 2020',
     jdUTC: J(2020, 7, 6),
     warp: 3,
-    view: (m) => {
-      const c = get(m, 'neowise');
-      return { focus: 'neowise', distance: 0.25, yaw: yawOf(sunward(c)) + 1.6, pitch: 0.3 };
-    },
+    view: (m) => cometView(m, 'neowise', 0.1, 0.42, 1.4, 0.3),
   },
   {
     id: 'mcnaught-2007',
     label: 'McNaught 2007',
     jdUTC: J(2007, 1, 15),
     warp: 3,
+    view: (m) => cometView(m, 'mcnaught', 0.14, 0.55, 1.5, 0.45),
+  },
+  {
+    id: 'cassini-2017',
+    label: 'Saturn 2017',
+    caption: 'Cassini’s Grand Finale, September 2017: northern summer on Saturn, the rings open 26° to the Sun',
+    jdUTC: J(2017, 9, 15, 10, 31),
+    warp: 3,
     view: (m) => {
-      const c = get(m, 'mcnaught');
-      return { focus: 'mcnaught', distance: 0.35, yaw: yawOf(sunward(c)) + 1.7, pitch: 0.35 };
+      const s = get(m, 'saturn');
+      const yaw = yawOf(sunward(s)) + 0.8;
+      return { focus: 'saturn', distance: s.radius * 8.5, yaw, pitch: sunlitRingPitch(s, yaw) };
     },
   },
   {

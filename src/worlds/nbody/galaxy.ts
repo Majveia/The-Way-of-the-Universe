@@ -565,16 +565,40 @@ export function realizeGalaxy(spec: GalaxySpec, sk: SkeletonCounts, tr: TracerCo
   const ageBins = [0.15, 0.5, 1.5, 3.5, 7.5];
   const jeansByBin = ageBins.map((aG) => new VerticalJeans(model, z0 * Math.min(1, Math.max(0.3, Math.sqrt(aG / 7.5))), diskRmax));
   const sigOld = sigmaRFromQ(spec, curve, spec.disk.Q, Rd);
+  // Stellar associations: birth radius from the young (extended) disk, age uniform in 0.1–0.6 Gyr.
+  const nAssoc = 90;
+  const assocR = new Float64Array(nAssoc), assocPhi = new Float64Array(nAssoc), assocAge = new Float64Array(nAssoc);
+  for (let a = 0; a < nAssoc; a++) {
+    assocR[a] = Math.max(0.8, expDiskInverse(0.05 + 0.9 * rng.next()) * Rd * 1.25);
+    assocPhi[a] = rng.next() * 2 * Math.PI;
+    assocAge[a] = 0.1 + 0.5 * rng.next();
+  }
   for (let i = 0; i < tr.disk; i++, q++) {
     // Sample age in [0.1, 11] Gyr from SFR ∝ exp(−(11 − age)/τ) (declining in cosmic time → more old stars).
     const T = 11;
     const uA = rng.next();
     const lo = Math.exp(-(T - 0.1) / tau), hi = 1;
-    const ageG = T + tau * Math.log(lo + uA * (hi - lo));
+    let ageG = T + tau * Math.log(lo + uA * (hi - lo));
+    // Young stars (< 0.6 Gyr) are mostly born together in associations; they are placed at their
+    // birth site and carried round by differential rotation for their age, φ = φ_b + Ω(R) t, so
+    // the youngest stay clumped and older groups shear into trailing, flocculent arm segments.
+    let assoc = -1;
+    if (ageG < 0.6 && rng.next() < 0.75) {
+      assoc = Math.floor(rng.next() * nAssoc);
+      ageG = assocAge[assoc] * (1 + 0.08 * rng.normal());
+    }
     const bin = ageG < 0.3 ? 0 : ageG < 1 ? 1 : ageG < 2.5 ? 2 : ageG < 5 ? 3 : 4;
     const hz = z0 * Math.min(1, Math.max(0.3, Math.sqrt(ageBins[bin] / 7.5)));
-    const Rs = expDiskInverse(Math.min(0.9985, rng.next())) * Rd;
-    const ph = rng.next() * 2 * Math.PI;
+    let Rs: number, ph: number;
+    if (assoc >= 0) {
+      Rs = Math.max(0.2, assocR[assoc] + 0.3 * rng.normal());
+      ph = assocPhi[assoc] + (0.3 / assocR[assoc]) * rng.normal() + (curve.vcAt(Rs) / Rs) * ageG * 1000;
+    } else {
+      // Inside-out growth: young populations have longer scale lengths than old ones
+      // (R_d ∝ 1.3 − 0.5 age/11 Gyr; e.g. Bovy et al. 2012, Frankel et al. 2019).
+      Rs = expDiskInverse(Math.min(0.9985, rng.next())) * Rd * (1.3 - (0.5 * ageG) / T);
+      ph = rng.next() * 2 * Math.PI;
+    }
     const x = Rs * Math.cos(ph), y = Rs * Math.sin(ph), z = sech2Height(rng, hz);
     tPos[q * 3] = x;
     tPos[q * 3 + 1] = y;

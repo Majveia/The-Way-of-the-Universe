@@ -26,6 +26,8 @@ uniform float uAlpha;
 uniform float uClip;
 uniform float uHasHist;
 uniform float uSharp;
+uniform float uStill;
+uniform float uDenoise;
 out vec4 outColor;
 
 vec3 ctm(vec3 c) { return c / (1.0 + luma(c)); }
@@ -78,25 +80,38 @@ void main() {
       closest = min(closest, texelFetch(uCurAux, ik, 0).x);
     }
   }
-  vec4 cur = sum / max(wsum, 1e-6);
+  // Reconstruct the current frame by bicubic interpolation of the jittered low-resolution
+  // samples at this pixel (continuous: no splat pattern); the Gaussian weights above only
+  // measure how well this pixel is covered this frame.
+  vec4 cur = catmullRom(uCur, uv - uJitter / uLowSize, uLowSize);
+  cur.rgb = ctm(cur.rgb);
+  // The ray-march jitter is interleaved gradient noise, which is built to cancel under a 3×3
+  // neighbourhood filter (Jimenez 2014). Blend toward the Gaussian reconstruction of the nine
+  // jittered samples: it removes the per-frame step noise at the low-res pixel frequency that
+  // the exponential history alone cannot average below ~√α of its amplitude.
+  cur = mix(cur, sum / max(wsum, 1e-6), uDenoise);
   vec4 res = cur;
   if (uHasHist > 0.5) {
     float depth = texture(uCurAux, uv).x;
     depth = min(depth, closest * 1.5 + 1e-3);
     vec2 ndc = uv * 2.0 - 1.0;
-    vec4 v = uProjInv * vec4(ndc, 1.0, 1.0);
+    vec4 v = uProjInv * vec4(ndc, -1.0, 1.0);
     vec3 rd = normalize(uViewToLocal * normalize(v.xyz / v.w));
     vec3 P = uCamLocal + rd * depth;
     vec4 pc = uPrevVP * vec4(P, 1.0);
     vec2 puv = pc.xy / pc.w * 0.5 + 0.5;
     if (pc.w > 0.0 && all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0)))) {
-      vec4 hist = catmullRom(uHist, puv, uFullSize);
+      // A still camera must not resample its history: repeated bicubic resampling at a tiny,
+      // constant sub-pixel offset (float round-off in the reprojection) acts as a sharpening
+      // filter and grows a checkerboard. Snap to the pixel when the motion is negligible.
+      vec2 dpx = (puv - uv) * uFullSize;
+      vec4 hist = (uStill > 0.5 || dot(dpx, dpx) < 1e-3) ? texelFetch(uHist, ivec2(gl_FragCoord.xy), 0) : catmullRom(uHist, puv, uFullSize);
       vec4 mean = m1 / 9.0;
       vec4 sd = sqrt(max(m2 / 9.0 - mean * mean, vec4(0.0)));
       vec4 lo = mean - 1.25 * sd - vec4(vec3(0.002), 0.01);
       vec4 hi = mean + 1.25 * sd + vec4(vec3(0.002), 0.01);
       hist = mix(hist, clamp(hist, lo, hi), uClip);
-      float a = clamp(uAlpha * mix(0.35, 1.0, wmax), 0.0, 1.0);
+      float a = clamp(uAlpha * mix(0.7, 1.0, wmax), 0.0, 1.0);
       res = mix(hist, cur, a);
     }
   }

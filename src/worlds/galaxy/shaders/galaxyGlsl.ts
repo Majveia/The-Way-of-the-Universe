@@ -78,6 +78,12 @@ float warpH(float R, float phi) {
   return uWarp.x * s * s * sin(phi - uWarp.z);
 }
 
+// Visible light per bolometric watt relative to the Sun, η(T)/η(T☉) (physics/galaxyStars.visualEfficacy).
+float visEff(float T) {
+  float x = log(clamp(T, 2000.0, 60000.0)) * 0.4342944819 - 3.76;
+  return pow(10.0, 0.00272759 + x * (0.564788 + x * (-4.95986 + x * (3.97801 + x * -1.38651))));
+}
+
 vec3 toRender(vec3 m) { return vec3(m.x, m.z, -uSpin * m.y); }
 vec3 fromRender(vec3 r) { return vec3(r.x, -uSpin * r.z, r.y); }
 
@@ -146,7 +152,7 @@ void youngState(float Rg, float cidF, float midF, float mass, float tau, float T
   hm = hnext(hm); float az = TAU_G * u01(hm);
   hm = hnext(hm); float rr = pow(u01(hm), 1.0 / 3.0);
   hm = hnext(hm); float vexp = 1.2 + 3.5 * u01(hm);
-  hm = hnext(hm); float hb = (u01(hm) - 0.5) * 2.0 * uYoungScaleH;
+  float hb = (u01(hnext(h)) - 0.5) * 2.0 * uYoungScaleH; // shared by the association
   float sz = sqrt(max(0.0, 1.0 - cz * cz));
   float rad = scale * (0.2 + 0.8 * rr) + vexp * age;
   float dR = rad * sz * cos(az);

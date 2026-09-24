@@ -20,7 +20,7 @@ void main() {
   vec3 p = mod(position - uOffset + 0.5 * uBox, uBox) - 0.5 * uBox;
   vec3 w = p - uDir * uLen * aEnd;
   float r = length(p) / (0.5 * uBox);
-  vFade = smoothstep(1.0, 0.55, r) * smoothstep(0.02, 0.12, r) * (1.0 - 0.6 * aEnd) * uIntensity;
+  vFade = smoothstep(1.0, 0.55, r) * smoothstep(0.04, 0.2, r) * (1.0 - aEnd) * (1.0 - aEnd) * uIntensity;
   vAhead = dot(normalize(p), uDir);
   gl_Position = projectionMatrix * mat4(mat3(viewMatrix)) * vec4(w, 1.0);
 }`;
@@ -31,8 +31,8 @@ in float vFade;
 in float vAhead;
 out vec4 outColor;
 void main() {
-  vec3 ahead = vec3(0.55, 0.75, 1.0);
-  vec3 behind = vec3(1.0, 0.45, 0.25);
+  vec3 ahead = vec3(0.45, 0.66, 1.0);
+  vec3 behind = vec3(1.0, 0.42, 0.2);
   vec3 c = mix(behind, ahead, smoothstep(-0.6, 0.6, vAhead)) * vFade;
   outColor = vec4(c, 1.0);
 }`;
@@ -71,7 +71,7 @@ export class WarpField {
       },
       blending: THREE.AdditiveBlending,
       depthWrite: false,
-      depthTest: false,
+      depthTest: true, // the hull occludes the streaks
       transparent: true,
     });
     this.object = new THREE.LineSegments(g, this.mat);
@@ -93,7 +93,7 @@ export class WarpField {
     // Keep the offset bounded (periodic box).
     this.offset.set(this.offset.x % this.box, this.offset.y % this.box, this.offset.z % this.box);
     u.uLen.value = Math.min(this.box * 0.45, v * 0.09);
-    u.uIntensity.value = s * 2.2 * Math.max(0.2, Math.min(1, exposure * 2));
+    u.uIntensity.value = s * 0.55 * Math.max(0.2, Math.min(1, exposure * 2));
     this.object.visible = s > 0.01;
   }
 

@@ -93,6 +93,8 @@ void main() {
   // Radiance of a pixel holding all the flux, then a soft knee for the camera's dynamic range.
   float I = fluxEM * uGain / uPixelSolidAngle;
   float Ik = I < uKnee ? I : uKnee * pow(I / uKnee, 0.5);
+  // Keep inside half-float range whatever the distance (the camera may sit next to a star).
+  Ik = min(Ik, 400.0 * uKnee);
   vColor = col * Ik;
   float sigma = 0.72 * uPixelRatio;
   vSigma = sigma;
@@ -305,7 +307,7 @@ export class NebulaStars {
       u.uExpand.value = v.expansion;
       u.uKappa.value = v.kappa;
       u.uIonDust.value = v.ionDust;
-      u.uGain.value = v.preset.gain * v.exposure * this.brightness;
+      u.uGain.value = v.gain * this.brightness;
       this.object.position.copy(v.object.position);
       this.object.quaternion.copy(v.object.quaternion);
     } else {

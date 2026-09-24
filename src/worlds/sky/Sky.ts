@@ -141,12 +141,15 @@ vec3 band(vec3 d) {
   float disk = exp(-abs(sb) / 0.07) * (0.5 + 0.5 * max(cl, 0.0) * max(cl, 0.0) + 0.12);
   float thick = exp(-abs(sb) / 0.2) * 0.12;
   float bulge = exp(-(l * l) / (2.0 * 0.26 * 0.26)) * exp(-abs(sb) / 0.14);
-  float clouds = 0.5 + 0.5 * fbm3(p * 1.6, 5);
+  // Star clouds and dust are sheared along the plane (differential rotation stretches them in
+  // longitude), so sample the noise anisotropically: finer in latitude than in longitude.
+  const vec3 ANISO = vec3(1.0, 2.2, 1.0);
+  float clouds = 0.5 + 0.5 * fbm3(p * 1.6 * ANISO, 5);
   float granular = 0.55 + 0.45 * fbm3(d * 16.0 + uSeed * 1.7, 5);
   float emission = disk * clouds * granular * 1.3 + thick + 1.5 * bulge * (0.75 + 0.25 * granular);
   // Dust: the Great Rift — filamentary absorbing lanes hugging the plane.
-  float dn = fbm3(d * 6.0 + 11.0, 6);
-  float fil = 1.0 - abs(fbm3(d * 13.0 + 3.0, 5));
+  float dn = fbm3(d * 6.0 * ANISO + 11.0, 6);
+  float fil = 1.0 - abs(fbm3(d * 13.0 * ANISO + 3.0, 5));
   float dust = (smoothstep(-0.05, 0.45, dn) * 0.8 + 0.6 * smoothstep(0.6, 0.95, fil))
              * exp(-abs(sb + 0.01 * sin(l * 3.0)) / 0.035);
   float trans = exp(-dust * 2.4);
@@ -160,7 +163,7 @@ void main() {
   if (uBetaMag < 1e-7) {
     vec3 b = band(normalize(vDir));
     vec3 c = mix(blackbody(8200.0), blackbody(4200.0), b.y);
-    c *= mix(vec3(1.0, 0.7, 0.5), vec3(1.0), b.z);
+    c *= mix(vec3(1.0, 0.78, 0.6), vec3(1.0), b.z);
     col = c * b.x * uIntensity * 0.075;
   } else {
     // Moving observer: find the rest-frame direction this pixel sees, then Doppler-shift the light.
@@ -172,7 +175,7 @@ void main() {
     float kCool = uRelFlags.z > 0.5 ? pow(10.0, clamp(logLum(8200.0 * delta) - logLum(8200.0), -30.0, 12.0)) : 1.0;
     float kWarm = uRelFlags.z > 0.5 ? pow(10.0, clamp(logLum(4200.0 * delta) - logLum(4200.0), -30.0, 12.0)) : 1.0;
     vec3 c = mix(blackbody(8200.0 * dc) * kCool, blackbody(4200.0 * dc) * kWarm, b.y);
-    c *= mix(vec3(1.0, 0.7, 0.5), vec3(1.0), b.z);
+    c *= mix(vec3(1.0, 0.78, 0.6), vec3(1.0), b.z);
     col = c * b.x * uIntensity * 0.075;
   }
   if (uCmbOn > 0.5) {

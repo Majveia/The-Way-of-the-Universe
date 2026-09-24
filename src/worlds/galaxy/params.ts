@@ -125,6 +125,12 @@ export interface GalaxyParams {
   look: { exposure: number; viewDistance: number };
   /** The Sun (Milky Way only). */
   sun?: { R: number; z: number; phi: number; U: number; V: number; W: number };
+  /**
+   * The local interstellar medium around the Sun (Milky Way only): the dust-poor Local Bubble and
+   * the nearby dark-cloud complexes that make the Great Rift. Galactic (l, b) in degrees, distance
+   * and radius in pc, τ_V through the centre. They move with the Sun.
+   */
+  localISM?: { bubble: number; clouds: Array<{ name: string; l: number; b: number; d: number; r: number; tau: number }> };
 }
 
 const deg = Math.PI / 180;
@@ -140,11 +146,13 @@ export function milkyWay(seed = 1): GalaxyParams {
   // 8.5 kpc, Perseus ≈ 10 kpc, Outer ≈ 13 kpc. Model azimuth φ = π + β.
   const pitch = 12;
   const armList: ArmSpec[] = [
+    // The two major arms (Scutum–Centaurus, Perseus) leave the ends of the bar (R ≈ 4.5 kpc, where
+    // their loci meet the bar's major axis at 27°); inside, the bar's own lanes take over.
     // Widths: Gaussian σ ≈ 0.03 R, i.e. FWHM ≈ 0.4–0.7 kpc near the Sun (Reid et al. 2014, Table 2).
-    { name: 'Scutum–Centaurus', pitchDeg: pitch, phase: Math.PI, r0: 5430, rStart: 3300, rEnd: 17500, strength: 1, width: 0.032 },
-    { name: 'Perseus', pitchDeg: pitch, phase: 2 * Math.PI, r0: 5430, rStart: 3300, rEnd: 18500, strength: 1, width: 0.034 },
-    { name: 'Sagittarius–Carina', pitchDeg: pitch, phase: Math.PI, r0: 6870, rStart: 3600, rEnd: 15500, strength: 0.72, width: 0.028 },
-    { name: 'Norma–Outer', pitchDeg: pitch, phase: 2 * Math.PI, r0: 6870, rStart: 3400, rEnd: 17500, strength: 0.72, width: 0.03 },
+    { name: 'Scutum–Centaurus', pitchDeg: pitch, phase: Math.PI, r0: 5430, rStart: 4500, rEnd: 17500, strength: 1, width: 0.032 },
+    { name: 'Perseus', pitchDeg: pitch, phase: 2 * Math.PI, r0: 5430, rStart: 4500, rEnd: 18500, strength: 1, width: 0.034 },
+    { name: 'Sagittarius–Carina', pitchDeg: pitch, phase: Math.PI, r0: 6870, rStart: 4700, rEnd: 15500, strength: 0.72, width: 0.028 },
+    { name: 'Norma–Outer', pitchDeg: pitch, phase: 2 * Math.PI, r0: 6870, rStart: 4300, rEnd: 17500, strength: 0.72, width: 0.03 },
     { name: 'Orion Spur', pitchDeg: 11.4, phase: Math.PI, r0: 8530, rStart: 7300, rEnd: 9900, strength: 0.42, width: 0.022 },
   ];
   return {
@@ -188,20 +196,41 @@ export function milkyWay(seed = 1): GalaxyParams {
       patternSpeed: 25,
       phase: Math.PI,
       r0: 5430,
-      amplitude: 0.032,
-      rInner: 3300,
+      // Organised epicycle amplitude. Linear theory gives δΣ/Σ = A·m·cot(i) ≈ 0.42 for cold orbits;
+      // random epicycles (σ_R/κ ≈ 1 kpc) smear it by the Lin–Shu reduction factor to ≈ 0.15, i.e.
+      // an arm/inter-arm ratio ≈ 1.35 in the old stars, as measured in K band (Rix & Zaritsky 1995;
+      // Drimmel & Spergel 2001).
+      amplitude: 0.045,
+      rInner: 4200,
       rOuter: 18000,
       flocculence: 0.35,
       armList,
     },
-    young: { lum: 9e9, scaleLength: 3500, rInner: 3000, rOuter: 17000, scaleHeight: 70, sfr: 1, armFraction: 0.82, colorT: 13000 },
-    gas: { dust: 1.25, dustScaleLength: 5000, dustScaleHeight: 95, dustLane: 3.2, dustHole: 2600, hii: 1, nuclearRing: 230 },
+    // OB population: continuous SFR ≈ 1.7–2 M☉/yr gives L_bol(< 100 Myr) ≈ 1.7 × 10¹⁰ L☉ (Starburst99;
+    // Licquia & Newman 2015 for the SFR).
+    young: { lum: 1.7e10, scaleLength: 3500, rInner: 3800, rOuter: 17000, scaleHeight: 70, sfr: 1, armFraction: 0.82, colorT: 13000 },
+    gas: { dust: 1.25, dustScaleLength: 5000, dustScaleHeight: 95, dustLane: 4, dustHole: 2600, hii: 1, nuclearRing: 230 },
     halo: { lum: 6e7, rMin: 1500, rMax: 70000, flatten: 0.65 },
     globulars: { count: 150, rCore: 1200, rMax: 40000 },
     warp: { amplitude: 1400, rStart: 11000, nodeAngle: Math.PI + 17.5 * deg },
     clumpiness: 0.15,
     look: { exposure: 1, viewDistance: 32000 },
     sun: { R: SUN_GALACTIC.R, z: SUN_GALACTIC.z, phi: Math.PI, U: SUN_GALACTIC.U, V: SUN_GALACTIC.V, W: SUN_GALACTIC.W },
+    // Distances from Gaia-based 3D dust maps (Lallement et al. 2019; Zucker et al. 2020); sizes and
+    // central extinctions are representative of each complex.
+    localISM: {
+      bubble: 160,
+      clouds: [
+        { name: 'Ophiuchus', l: 354, b: 16, d: 135, r: 9, tau: 5 },
+        { name: 'Aquila Rift', l: 28, b: 4, d: 240, r: 42, tau: 2.6 },
+        { name: 'Serpens', l: 12, b: 6, d: 420, r: 45, tau: 2 },
+        { name: 'Cygnus Rift', l: 78, b: 1, d: 850, r: 110, tau: 3 },
+        { name: 'Taurus', l: 172, b: -15, d: 140, r: 14, tau: 2.4 },
+        { name: 'Coalsack', l: 301, b: -1, d: 185, r: 7, tau: 2 },
+        { name: 'Lupus', l: 339, b: 15, d: 155, r: 10, tau: 1.6 },
+        { name: 'Orion', l: 210, b: -19, d: 420, r: 28, tau: 3 },
+      ],
+    },
   };
 }
 
@@ -215,6 +244,7 @@ function base(id: MorphologyId, label: string, hubble: string, seed: number): Ga
     hubble,
     spin: 1,
     sun: undefined,
+    localISM: undefined,
     warp: { amplitude: 0, rStart: 12000, nodeAngle: 0 },
     spiral: { ...mw.spiral, armList: undefined, phase: 0, r0: 4000 },
     bar: { ...mw.bar, lum: 0, strength: 0, angle: 0.4 },
@@ -244,7 +274,7 @@ export function preset(id: MorphologyId, seed = 1): GalaxyParams {
       p.gas = { ...p.gas, dust: 0, dustLane: 0, hii: 0, nuclearRing: 0 };
       p.halo = { lum: 2e9, rMin: 4000, rMax: 90000, flatten: flat * 0.9 + 0.1 };
       p.globulars = { count: 700, rCore: 4000, rMax: 70000 };
-      p.look = { exposure: 0.9, viewDistance: 70000 };
+      p.look = { exposure: 0.6, viewDistance: 60000 };
       return p;
     }
     case 'S0': {
@@ -306,7 +336,7 @@ export function preset(id: MorphologyId, seed = 1): GalaxyParams {
         arms: 2,
         pitchDeg: early ? 7 : late ? 21 : 13,
         patternSpeed: barred ? 30 : early ? 32 : late ? 20 : 25,
-        amplitude: early ? 0.025 : late ? 0.042 : 0.036,
+        amplitude: early ? 0.033 : late ? 0.055 : 0.047,
         rInner: barred ? 3800 : early ? 3000 : 1800,
         rOuter: late ? 22000 : 19000,
         flocculence: early ? 0.12 : late ? 0.55 : 0.3,
@@ -342,9 +372,16 @@ export function preset(id: MorphologyId, seed = 1): GalaxyParams {
           strength: 1,
           colorT: 4350,
         };
-        // Align the bar with the start of the arms: arm 0 passes through (rInner, phase).
+        // Much of a barred galaxy's "bulge" is the bar's own boxy/peanut inner part.
+        p.bulge.lum *= 0.45;
+        // The arms leave the ends of the bar: gas arms start there and the bar's major axis points
+        // at arm 0's locus at R = bar half-length.
+        const L = p.bar.halfLength;
         const ti = 1 / Math.tan(p.spiral.pitchDeg * deg);
-        p.bar.angle = p.spiral.phase - ti * Math.log(p.spiral.rInner / p.spiral.r0);
+        p.spiral.rInner = 1.02 * L;
+        p.young.rInner = 0.95 * L;
+        p.gas.dustHole = 0.9 * L;
+        p.bar.angle = p.spiral.phase - ti * Math.log(L / p.spiral.r0);
       }
       p.look = { exposure: 1, viewDistance: late ? 38000 : 34000 };
       return p;

@@ -118,6 +118,18 @@ export class NebulaVolume {
   emission = 1;
   /** Age in years: drives turbulence drift and homologous expansion of shells. */
   age: number;
+  /** True while simulated time runs (history is refreshed faster). */
+  animating = false;
+  /**
+   * Photometric normalisation (1 / reference radiance). Starts at the preset's value and is
+   * replaced by `calibrate()`, which meters the default view once like a camera's auto-exposure
+   * — after that it stays fixed so physical changes (flux, density) visibly brighten or dim.
+   */
+  baseGain: number;
+  private calibrated = false;
+  /** True once calibrate() has finished (or was skipped). */
+  metered = false;
+  private calibRT: THREE.WebGLRenderTarget | null = null;
 
   private readonly N: number;
   private dens: THREE.WebGL3DRenderTarget;
@@ -166,6 +178,7 @@ export class NebulaVolume {
     this.teff = this.preset.source.teff;
     this.age = this.preset.ageYears;
     this.layout = buildLayout(this.preset, this.seed);
+    this.baseGain = this.preset.gain;
     const s = (o.radius ?? this.preset.half) / this.preset.half;
     this.object.scale.setScalar(s);
 
@@ -247,7 +260,11 @@ export class NebulaVolume {
         uAlpha: { value: 1 },
         uClip: { value: 1 },
         uHasHist: { value: 0 },
-        uSharp: { value: 2.0 },
+        // The low tier marches few steps: reconstruct fully with the Gaussian so its step noise
+        // never shows as a lattice (or as shimmer while the camera drifts).
+        uSharp: { value: this.quality.steps < 50 ? 0.8 : 1.1 },
+        uDenoise: { value: this.quality.steps < 50 ? 1 : 0.85 },
+        uStill: { value: 0 },
       },
     });
     const kExt = this.kExt();
@@ -327,12 +344,14 @@ export class NebulaVolume {
       (u.uColA.value[i] as THREE.Vector3).set(...cols[ids[i]]);
       (u.uColB.value[i] as THREE.Vector3).set(...cols[ids[i + 4]]);
     }
-    u.uGain.value = p.gain * this.exposure;
+    u.uGain.value = this.baseGain * this.exposure;
     u.uEmission.value = this.emission;
     const T = this.teff;
     (u.uLnZone.value as THREE.Vector3).set(
       Math.log(zoneThreshold(T, 'He+')),
-      Math.log(zoneThreshold(T, 'O++')),
+      // Near the front the ionization parameter collapses and low ions (O⁺, N⁺, S⁺) take over even
+      // around hot stars (O&F §5.4): the O²⁺ zone never reaches the last ~40 % of the photon budget.
+      Math.min(Math.log(zoneThreshold(T, 'O++')), -0.5),
       Math.log(zoneThreshold(T, 'He++')),
     );
     const L = p.lines;
@@ -348,8 +367,90 @@ export class NebulaVolume {
     this.bakedKey = key;
   }
 
+  /** Cheap per-frame update of the emission fade (no history reset). */
+  applyEmission(): void {
+    this.matMarch.uniforms.uEmission.value = this.emission;
+  }
+
+  /** Current gain applied to radiance (baseGain × exposure) — stars use the same scale. */
+  get gain(): number {
+    return this.baseGain * this.exposure;
+  }
+
+  /**
+   * Meter the preset's default view once (like a camera's auto-exposure) so every nebula and
+   * every seed lands at a good exposure: the 99.5th-percentile pixel maps to `target`.
+   * Resolves after a tiny GPU readback; later calls are no-ops.
+   */
+  async calibrate(renderer: THREE.WebGLRenderer, target = this.preset.meter ?? 1.6): Promise<void> {
+    if (this.calibrated || !this.hasField) return;
+    this.calibrated = true;
+    try {
+      await this.meter(renderer, target);
+    } finally {
+      this.metered = true;
+    }
+  }
+
+  private async meter(renderer: THREE.WebGLRenderer, target: number): Promise<void> {
+    const W = 96;
+    const H = 54;
+    const rt = (this.calibRT = new THREE.WebGLRenderTarget(W, H, { count: 2, type: THREE.FloatType, depthBuffer: false }));
+    const v = this.preset.views.default;
+    const cam = new THREE.PerspectiveCamera(42, W / H, 1e-4, 1e4);
+    const t = new THREE.Vector3(...(v.target ?? [0, 0, 0]));
+    const cp = Math.cos(v.pitch);
+    cam.position.set(t.x + v.distance * cp * Math.sin(v.yaw), t.y + v.distance * Math.sin(v.pitch), t.z + v.distance * cp * Math.cos(v.yaw));
+    cam.lookAt(t);
+    cam.updateMatrixWorld();
+    cam.updateProjectionMatrix();
+    const mu = this.matMarch.uniforms;
+    const inv = new THREE.Matrix4().copy(this.object.matrixWorld).invert();
+    const v2l = new THREE.Matrix4().multiplyMatrices(inv, cam.matrixWorld);
+    const saved = { g: mu.uGain.value as number, e: mu.uEmission.value as number, jx: this.jitter.x, jy: this.jitter.y };
+    this.viewToLocal3.setFromMatrix4(v2l);
+    this.camLocal.setFromMatrixPosition(v2l);
+    (mu.uProjInv.value as THREE.Matrix4).copy(cam.projectionMatrixInverse);
+    mu.uRes.value.set(W, H);
+    mu.uGain.value = 1;
+    mu.uEmission.value = 1;
+    mu.uExpand.value = this.expansion;
+    this.jitter.set(0, 0);
+    const prev = renderer.getRenderTarget();
+    this.quad.material = this.matMarch;
+    renderer.setRenderTarget(rt);
+    renderer.render(this.quad.scene, this.quad.camera);
+    renderer.setRenderTarget(prev);
+    mu.uGain.value = saved.g;
+    mu.uEmission.value = saved.e;
+    this.jitter.set(saved.jx, saved.jy);
+    const px = new Float32Array(W * H * 4);
+    try {
+      await renderer.readRenderTargetPixelsAsync(rt, 0, 0, W, H, px, undefined, 0);
+    } catch {
+      return;
+    } finally {
+      rt.dispose();
+      this.calibRT = null;
+    }
+    const lum: number[] = [];
+    for (let i = 0; i < W * H; i++) {
+      const l = 0.2126 * px[i * 4] + 0.7152 * px[i * 4 + 1] + 0.0722 * px[i * 4 + 2];
+      if (Number.isFinite(l) && l > 0) lum.push(l);
+    }
+    if (lum.length < 20) return;
+    lum.sort((a, b) => a - b);
+    const idx = Math.max(Math.floor(0.995 * W * H) - (W * H - lum.length), Math.floor(0.9 * lum.length));
+    const p = lum[Math.min(lum.length - 1, idx)];
+    if (p > 0) {
+      this.baseGain = target / p;
+      this.applyParams();
+    }
+  }
+
   /** Re-run only the ionization/lighting bake (after density/flux/dust changes). */
   invalidateLight(): void {
+    if (this.preset.layout === 'shock') return;
     if (this.stage === 'done' || this.stage === 'light') {
       this.stage = 'light';
       this.layer = 0;
@@ -385,7 +486,15 @@ export class NebulaVolume {
         renderer.setRenderTarget(this.dens, this.layer);
         renderer.render(scene, cam);
         budget -= 1;
-        if (++this.layer >= this.N) this.nextStage('light');
+        if (++this.layer >= this.N) {
+          if (this.preset.layout === 'shock') {
+            // Shock layouts carry their own field (distance to the sheets); nothing to ionize.
+            this.hasField = true;
+            this.matMarch.uniforms.uField.value = this.dens.texture;
+            this.nextStage('done');
+            this.paramsVersion++;
+          } else this.nextStage('light');
+        }
       } else {
         if (this.layer === 0) this.prepareLight();
         this.matLight.uniforms.uLayer.value = this.layer;
@@ -415,7 +524,7 @@ export class NebulaVolume {
     if (this.stage !== 'done') this.bakeStep(renderer, this.hasField ? 12 : 48);
     // Homologous expansion: re-bake the ionization as the shell grows.
     const s = this.expansion;
-    if (this.hasField && this.stage === 'done' && Math.abs(s / this.bakedExpand - 1) > 0.004) this.invalidateLight();
+    if (this.preset.layout === 'photo' && this.hasField && this.stage === 'done' && Math.abs(s / this.bakedExpand - 1) > 0.004) this.invalidateLight();
     if (!this.hasField) {
       renderer.setRenderTarget(target);
       return;
@@ -451,7 +560,7 @@ export class NebulaVolume {
       alpha = 0.5;
     } else {
       this.staticFrames++;
-      alpha = Math.max(1 / (this.staticFrames + 2), o.animating ? 1 / 10 : 1 / 48);
+      alpha = Math.max(1 / (this.staticFrames + 2), o.animating || this.animating ? 1 / 10 : 1 / 48);
       clip = this.staticFrames < 3 ? 1 : 0;
     }
     const k = (this.frameIndex % 16) + 1;
@@ -461,6 +570,8 @@ export class NebulaVolume {
     // 1. Ray march (low resolution, MRT: radiance+T, depth).
     const mu = this.matMarch.uniforms;
     mu.uRes.value.set(lowRT.width, lowRT.height);
+    const fov = (camera as THREE.PerspectiveCamera).fov ?? 50;
+    mu.uPixAngle.value = (2 * Math.tan(THREE.MathUtils.degToRad(fov) / 2)) / lowRT.height;
     mu.uFrame.value = this.frameIndex % 4096;
     (mu.uProjInv.value as THREE.Matrix4).copy((camera as THREE.PerspectiveCamera).projectionMatrixInverse);
     mu.uExpand.value = s;
@@ -484,6 +595,7 @@ export class NebulaVolume {
     ru.uAlpha.value = alpha;
     ru.uClip.value = clip;
     ru.uHasHist.value = cut ? 0 : 1;
+    ru.uStill.value = moved ? 0 : 1;
     this.quad.material = this.matResolve;
     renderer.setRenderTarget(dst);
     renderer.render(this.quad.scene, this.quad.camera);
@@ -506,7 +618,8 @@ export class NebulaVolume {
    * is done on the GPU by NebulaStars; this is the shader-side contract): exposes the field.
    */
   get fieldTexture(): THREE.Data3DTexture | null {
-    return this.hasField ? this.fields[this.front].texture : null;
+    if (!this.hasField) return null;
+    return this.preset.layout === 'shock' ? this.dens.texture : this.fields[this.front].texture;
   }
   /** τ_V per pc per unit of the field's x channel (dust-bearing density). */
   get kappa(): number {
@@ -576,6 +689,7 @@ export class NebulaVolume {
     this.lowRT?.dispose();
     for (const h of this.hist) h.dispose();
     this.probeRT?.dispose();
+    this.calibRT?.dispose();
     this.matProbe?.dispose();
     this.matDetail.dispose();
     this.matDensity.dispose();
@@ -641,6 +755,8 @@ export class NebulaVolume {
       uNearScale: { value: 0.1 },
       uMaxT: { value: 1e9 },
       uDetailFreq: { value: new THREE.Vector2(1 / p.detailScale[0], 1 / p.detailScale[1]) },
+      uTexel: { value: new THREE.Vector3(p.detailScale[0] / this.quality.detailN, p.detailScale[1] / this.quality.detailN, 1 / this.quality.detailN) },
+      uPixAngle: { value: 0 },
       uDrift1: { value: new THREE.Vector3() },
       uDrift2: { value: new THREE.Vector3() },
       uTurb: { value: p.turbulence },
@@ -661,6 +777,8 @@ export class NebulaVolume {
       uScatCount: { value: Math.min(8, this.layout.scatter.length) },
       uScatPos: { value: scatterPos },
       uScatRGB: { value: scatterRGB },
+      uScatShadow: { value: p.layout === 'photo' && p.source.Q > 0 ? 4 : 0 },
+      uScatShadowLen: { value: p.half * 0.6 },
       uEmission: { value: 1 },
       uSheetR: { value: new THREE.Vector4() },
       uSheetO: { value: new THREE.Vector4() },

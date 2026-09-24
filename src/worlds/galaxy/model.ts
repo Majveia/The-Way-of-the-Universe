@@ -17,7 +17,10 @@ import { armPhi, buildArms, wrapPi, type ArmSpec, type GalaxyParams } from './pa
  *    epicycle whose phase is locked to the pattern, θ = m(φ_g − Ω_p t − α(R_g)), with the
  *    orientation α(R) winding logarithmically (pitch i). Neighbouring orbits crowd where
  *    ∂R/∂R_g is smallest, which is along the arms: δΣ/Σ ≈ A m cot(i) — a rigidly rotating
- *    spiral made of stars that are *not* rotating with it.
+ *    spiral made of stars that are *not* rotating with it. Kalnajs' ellipses stay aligned on their
+ *    own only where Ω − κ/2 ≈ Ω_p; elsewhere we assume, as Lin–Shu theory does, that the disk's
+ *    self-gravity keeps them locked to the pattern (an ansatz, not an N-body solution). Random
+ *    epicycles (Rayleigh amplitudes σ_R/κ) smear the wave by the reduction factor e^{−k²s²/2}.
  *  - BAR: x1-like orbits closed in the frame rotating with the bar (Ω_b): ellipses with
  *    axis ratio q traversed at Ω(a) − Ω_b; peanut ("banana") orbits have z ∝ cos 2θ, which
  *    together build the boxy/X-shaped bulge (Combes et al. 1990; Wegg & Gerhard 2013).
@@ -51,13 +54,20 @@ export interface GalaxyParticles {
   populations: PopulationRange[];
   /** Number of young clusters (ids 0..n−1) and globular clusters. */
   youngClusters: number;
+  /**
+   * Stars represented by each young particle (≥ 1): a particle stands for k co-located stars of its
+   * mass inside its association, so that the sampled associations carry the population's light.
+   * From more than a few parsecs away an association is a point; closer, it is a cloud of the
+   * association's size (see the smoothing length in shaders/stars.ts).
+   */
+  youngMultiplicity: number;
   globularClusters: number;
   /** Positions of globular cluster centres are orbit params: [r0, θ0, cosI, node] per cluster. */
   globulars: Float32Array;
 }
 
 /** Fraction of each population's light carried by particles (the rest is the diffuse volume). */
-export const PARTICLE_LIGHT = { disk: 0.15, thick: 0.15, bar: 0.12, bulge: 0.12, young: 0.4, halo: 1, globular: 1 } as const;
+export const PARTICLE_LIGHT = { disk: 0.15, thick: 0.15, bar: 0.12, bulge: 0.12, young: 0.5, halo: 1, globular: 1 } as const;
 
 /** Live, user-controlled parameters shared by the GPU and the CPU mirror. */
 export interface GalaxyLive {
@@ -313,6 +323,7 @@ export function generateParticles(params: GalaxyParams, n: number): GalaxyPartic
 
   // ——— Young OB associations ———
   let youngClusters = 0;
+  let youngK = 1;
   {
     const cnt = count('young');
     if (cnt) {
@@ -361,10 +372,11 @@ export function generateParticles(params: GalaxyParams, n: number): GalaxyPartic
         }
         made += nm;
       }
-      // Particles keep (nearly) real stellar luminosities: the boost is capped at ×1.5, and any light
-      // the sampled stars cannot carry stays in the diffuse young component of the volume.
+      // Each particle stands for k stars of its mass (k ≥ 1, see youngMultiplicity); the rest of the
+      // young light stays in the diffuse young component of the volume.
       const want = P.young.lum * PARTICLE_LIGHT.young;
-      const k = lumAvg > 0 ? Math.min(want / lumAvg, 1.5) : 0;
+      const k = lumAvg > 0 ? Math.max(1, Math.min(want / lumAvg, 200)) : 0;
+      youngK = k;
       for (let i = start; i < start + made; i++) data[i * STRIDE + 10] *= k;
       populations.push({ name: 'young', kind: KIND_YOUNG, start, count: made, lum: lumAvg * k });
     }
@@ -429,6 +441,7 @@ export function generateParticles(params: GalaxyParams, n: number): GalaxyPartic
     count: used,
     populations,
     youngClusters,
+    youngMultiplicity: youngK,
     globularClusters,
     globulars,
   };
@@ -705,8 +718,8 @@ export function youngState(
   const rr = Math.cbrt(u01(hm));
   hm = next(hm);
   const vexp = 1.2 + 3.5 * u01(hm);
-  hm = next(hm);
-  const hb = (u01(hm) - 0.5) * 2 * P.young.scaleHeight;
+  // The association's birth height is shared by all its members (it oscillates as one).
+  const hb = (u01(next(h)) - 0.5) * 2 * P.young.scaleHeight;
   const sz = Math.sqrt(Math.max(0, 1 - cz * cz));
   const rad = scale * (0.2 + 0.8 * rr) + vexp * age;
   const dR = rad * sz * Math.cos(az);
@@ -739,3 +752,47 @@ export function youngState(
 
 /** Wrap helper re-export for consumers. */
 export { wrapPi };
+
+// ——— Convenience facade ————————————————————————————————————————————————————
+
+/**
+ * GalaxyModel: parameters + seed → a deterministic galaxy you can query without a GPU.
+ *   const g = new GalaxyModel(milkyWay(1), 250_000);
+ *   g.stateAt(i, tMyr)             // render-frame position (pc) and current light of particle i
+ *   g.potential.vcKms(8200)        // rotation curve, κ, ν, resonances… (physics/galaxyPotential)
+ *   g.toRender(x, y, h, out)       // model (disk) frame → three.js frame
+ * The GalaxyLayer renders the same particles (and mirrors this code on the GPU).
+ */
+export class GalaxyModel {
+  readonly params: GalaxyParams;
+  readonly particles: GalaxyParticles;
+  readonly kin: Kinematics;
+  private readonly st: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+
+  constructor(params: GalaxyParams, count = 250_000, particles?: GalaxyParticles) {
+    this.params = params;
+    this.particles = particles ?? generateParticles(params, count);
+    this.kin = new Kinematics(params);
+  }
+
+  get potential() {
+    return this.kin.potential;
+  }
+  get count(): number {
+    return this.particles.count;
+  }
+  /** Population kind of particle i (KIND_*). */
+  kind(i: number): number {
+    return this.particles.data[i * STRIDE];
+  }
+  /** Position (render frame, pc) and current luminosity/temperature of particle i at t (Myr). */
+  stateAt(i: number, t: number, out: ParticleState = this.st): ParticleState {
+    return particleState(this.kin, this.particles.data, i, t, out);
+  }
+  toRender(x: number, y: number, h: number, out: Vec3Like): Vec3Like {
+    return this.kin.toRender(x, y, h, out);
+  }
+  fromRender(x: number, y: number, z: number, out: Vec3Like): Vec3Like {
+    return this.kin.fromRender(x, y, z, out);
+  }
+}

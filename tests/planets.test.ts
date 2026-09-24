@@ -257,3 +257,50 @@ describe('photometry', () => {
     expect(b[2]).toBeGreaterThan(b[1]);
   });
 });
+
+describe('Earth experience — view geometry', async () => {
+  const { fovForDistance, pbdProgress, voyagerGeocentricAU, voyagerSunEarthAngle, apparentPixels, AU_RE } = await import('../src/experiences/earth/math');
+  const { meanMotion } = await import('../src/experiences/earth/camera');
+  const { SunGlare } = await import('../src/experiences/earth/glare');
+  const THREE = await import('three');
+
+  it('ISS orbit at 420 km has a period of ≈ 92.8 minutes', () => {
+    const T = (2 * Math.PI) / meanMotion(1 + 420 / 6371) / 60;
+    expect(T).toBeGreaterThan(92.4);
+    expect(T).toBeLessThan(93.2);
+  });
+  it('geostationary radius gives one sidereal day', () => {
+    const T = (2 * Math.PI) / meanMotion(42164 / 6371);
+    expect(T / 86164.1).toBeCloseTo(1, 3);
+  });
+  it('field of view: 34° near Earth → Voyager NAC pixel scale at 40 AU', () => {
+    expect(fovForDistance(4)).toBeCloseTo(34, 5);
+    expect(fovForDistance(40.5 * AU_RE)).toBeCloseTo(0.38, 2);
+    expect(pbdProgress(2)).toBe(0);
+    expect(pbdProgress(40 * AU_RE)).toBe(1);
+  });
+  it('Pale Blue Dot: Voyager ≈ 40.4 AU from Earth, Earth within ~2° of the Sun, ~0.1 NAC pixel', () => {
+    const v = voyagerGeocentricAU();
+    const d = Math.hypot(v.x, v.y, v.z);
+    expect(d).toBeGreaterThan(39.5);
+    expect(d).toBeLessThan(41.5);
+    const ang = voyagerSunEarthAngle() / DEG;
+    expect(ang).toBeGreaterThan(0.3);
+    expect(ang).toBeLessThan(2);
+    const px = apparentPixels(6371, d * 1.495978707e8, (0.424 * DEG) / 800);
+    expect(px).toBeGreaterThan(0.08);
+    expect(px).toBeLessThan(0.3);
+  });
+  it('Sun glare visibility: 1 unobstructed, 0 behind the Earth, partial at the limb', () => {
+    const sun = new THREE.Vector3(23500, 0, 0);
+    const earth = [{ c: new THREE.Vector3(0, 0, 0), r: 1 }];
+    expect(SunGlare.visibility(new THREE.Vector3(0, 5, 0), sun, 109, earth)).toBeCloseTo(1, 6);
+    expect(SunGlare.visibility(new THREE.Vector3(-3, 0, 0), sun, 109, earth)).toBe(0);
+    // Camera placed so the Earth's limb crosses the solar disk centre.
+    // The line of sight to the Sun grazes the Earth's limb (impact parameter = 1 radius).
+    const eye = new THREE.Vector3(-3, 1, 0);
+    const v = SunGlare.visibility(eye, sun, 109, earth);
+    expect(v).toBeGreaterThan(0.05);
+    expect(v).toBeLessThan(0.95);
+  });
+});

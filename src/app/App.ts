@@ -53,6 +53,8 @@ export class App {
       navigate: (id) => this.navigate(id),
       toggleSound: () => this.audio.toggle(),
       soundOn: () => this.audio.enabled,
+      sound: this.audio,
+      stats: () => ({ fps: this.engine.fps, tier: this.engine.quality.tier, scale: this.engine.renderScale, width: this.engine.width, height: this.engine.height }),
     });
     if (this.params.has('noui')) uiRoot.style.display = 'none';
     if (shot) this.ui.neverIdle = true;
@@ -80,8 +82,10 @@ export class App {
   start(): void {
     this.engine.start((f) => this.frame(f));
     const first = this.hashId();
-    void this.go(first).then(() => {
-      if (first === DEFAULT_EXPERIENCE && !this.engine.shotMode) setTimeout(() => this.ui.openMenu(), 1600);
+    // First load with no hash: the title sequence plays over the prelude sky, then the menu.
+    const intro = !location.hash.replace(/^#/, '') && !this.engine.shotMode ? this.ui.playIntro() : Promise.resolve(false);
+    void Promise.all([this.go(first), intro]).then(([, played]) => {
+      if (first === DEFAULT_EXPERIENCE && !this.engine.shotMode && this.debug.experienceId === DEFAULT_EXPERIENCE) setTimeout(() => this.ui.openMenu(), played ? 200 : 1600);
     });
   }
 

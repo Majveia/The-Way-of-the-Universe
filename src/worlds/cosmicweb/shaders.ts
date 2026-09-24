@@ -163,6 +163,7 @@ uniform float uNear;
 uniform int uStride;       // draw every uStride-th particle (replicas)
 uniform int uStrideOffset;
 uniform float uGain;
+uniform float uEmit;       // emissivity per unit mass ∝ (ρ/ρ̄)^uEmit (collisional emission ∝ ρ², clumping)
 out float vW;
 out float vLog;
 void main() {
@@ -185,7 +186,13 @@ void main() {
   float fade = smoothstep(uNear, uNear + 2.0 * h, dist);
   if (uFadeFar > 0.0) fade *= 1.0 - smoothstep(0.78 * uFadeFar, uFadeFar, length(mv.xyz));
   fade *= keep;
-  vW = w8 * fade * uGain;
+  if (dot(uOffset, uOffset) > 0.0) {
+    // Periodic replicas: a faint suggestion of the infinite universe — dimming with distance from
+    // the simulated box and never close to the camera (no giant sprites across the view).
+    vec3 outside = max(abs(w / uBoxWorld) - 0.5, 0.0);
+    fade *= exp(-3.0 * length(outside)) * smoothstep(0.35 * uBoxWorld, 0.9 * uBoxWorld, dist);
+  }
+  vW = w8 * fade * uGain * pow(rho, uEmit);
   vLog = log2(rho) * 0.30103;   // log10
   if (fade <= 0.0) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
 }`;
@@ -228,7 +235,7 @@ vec3 palette(float x) {
   const vec3 c4 = vec3(1.000, 0.480, 0.160);   // orange
   const vec3 c5 = vec3(1.000, 0.760, 0.420);   // gold
   const vec3 c6 = vec3(1.000, 0.930, 0.820);   // white-gold
-  float t = clamp((x + 0.8) / 3.4, 0.0, 1.0) * 6.0;
+  float t = clamp((x + 0.6) / 2.6, 0.0, 1.0) * 6.0;
   if (t < 1.0) return mix(c0, c1, t);
   if (t < 2.0) return mix(c1, c2, t - 1.0);
   if (t < 3.0) return mix(c2, c3, t - 2.0);
@@ -418,7 +425,9 @@ void main() {
   n += 0.35 * vnoise(d * 42.0 + uSeed * 1.7);
   n += 0.18 * vnoise(d * 95.0 + uSeed * 2.1);
   float T = uT * (1.0 + uAniso * n);
+  // Deepen the chroma a little: the tone mapper washes a bright 3000 K field toward cream.
   vec3 c = blackbody(T);
+  c = pow(c / max(c.r, 1e-6), vec3(1.35)) * c.r;
   // Radiance of a blackbody in the visible rises steeply with T (Wien tail): δI/I ≈ (hν/kT) δT/T.
   float gain = pow(T / uT, 8.0);
   outColor = vec4(c * uRadiance * gain, 1.0);

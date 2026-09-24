@@ -25,6 +25,7 @@ uniform float uFloc;         // flocculence 0..1
 uniform float uClump;        // clumpiness 0..1 (irregulars)
 uniform float uArmFrac;      // fraction of star formation in arms
 uniform float uTrunc;        // outer truncation radius of the gas disk
+uniform vec2 uDiskSigma;     // thin-disk σ_R at 3.15 R_d (pc/Myr), R_d (pc)
 
 float sq(float x) { return x * x; }
 
@@ -43,10 +44,17 @@ void main() {
   float nFine = fbm3(vec3(q / 240.0, 9.1), 4);
   float nKnot = fbm3(vec3(q / 420.0, 13.3), 4);
 
-  // Old stars: the kinematic density wave in linear theory, δΣ/Σ = −A m cot(i) sin m(φ − α).
+  // Old stars: the kinematic density wave in linear theory, δΣ/Σ = −A m cot(i) sin m(φ − α),
+  // reduced by the random epicycles exactly as the particles are: for Rayleigh-distributed
+  // amplitudes of scale s = σ_R/κ the average of J₀(kX) is e^{−k²s²/2}, k = m cot(i)/R
+  // (the Lin–Shu reduction factor of a hot disk).
   float oldMod = 1.0;
   if (uWaveM > 0.0) {
-    float c = clamp(uWaveAmp * uWaveM * uWaveCot, 0.0, 0.85);
+    float sig = uDiskSigma.x * exp(-(R - 3.15 * uDiskSigma.y) / (2.0 * uDiskSigma.y));
+    float s = min(0.28 * R, sig / max(lutAt(R, 0).y, 1e-6));
+    float kk = uWaveM * uWaveCot / R;
+    float red = exp(-0.5 * kk * kk * s * s);
+    float c = clamp(uWaveAmp * uWaveM * uWaveCot * red, 0.0, 0.85);
     oldMod = 1.0 - c * sin(uWaveM * (phi - waveAlpha(R))) * waveTaper(R);
   }
 
@@ -61,10 +69,12 @@ void main() {
     float wig = uFloc * (0.22 * nLarge + 0.1 * nMid);
     float d = wrapPi(phi - armPhiK(k, R) + wig) * R * sinI;
     float brk = mix(1.0, smoothstep(-0.35, 0.25, nLarge + 0.3 * nMid), uFloc * 0.8);
-    young += w * brk * exp(-0.5 * sq((d - sd * 0.35 * sig) / (0.85 * sig)));
-    hii += w * brk * exp(-0.5 * sq((d - sd * 0.3 * sig) / (0.6 * sig)));
-    lane += w * mix(1.0, brk, 0.6) * exp(-0.5 * sq((d + sd * 0.55 * sig) / (0.5 * sig)));
-    armGas += w * exp(-0.5 * sq((d + sd * 0.15 * sig) / (1.4 * sig)));
+    // Across the arm, in the direction of the gas flow: the shock and its dust lane first (upstream,
+    // inner/concave edge inside corotation), then HII regions, then the young stars drifting out.
+    young += w * brk * exp(-0.5 * sq((d - sd * 0.35 * sig) / (0.9 * sig)));
+    hii += w * brk * exp(-0.5 * sq((d - sd * 0.1 * sig) / (0.55 * sig)));
+    lane += w * mix(1.0, brk, 0.6) * exp(-0.5 * sq((d + sd * 0.8 * sig) / (0.45 * sig)));
+    armGas += w * exp(-0.5 * sq((d + sd * 0.3 * sig) / (1.3 * sig)));
   }
 
   // Radial envelopes.

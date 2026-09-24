@@ -603,7 +603,7 @@ export function traceRay(a: number, pos: Vec3, kCov: Vec4, o: TraceOptions = {})
     rMin = Math.min(rMin, r);
     ksRhs(a, s, pt, d);
     const vr = radialVelocity(a, s, d, r);
-    if (vr < 0 && r < (insideStart ? rH * 1.0005 : rCap)) {
+    if (insideStart ? vr < 0 && r < rH * 1.0005 : r < rCap) {
       fate = 'captured';
       break;
     }
@@ -756,4 +756,42 @@ export function accretionForPeakTemperature(a: number, massSun: number, tPeak: n
 export function tidalAcceleration(massSun: number, rInRg: number, lengthM = 2): number {
   const rm = rInRg * gravitationalRadius(massSun);
   return (2 * GM_SUN_SI * massSun * lengthM) / (rm * rm * rm);
+}
+
+// ———————————————————————————————————————————————————————————————— shadow size at the camera
+
+/**
+ * Angular width of the shadow (radians) seen by a static observer (ZAMO inside the ergosphere) at
+ * Kerr–Schild position `pos`, measured across the horizontal (perpendicular to the spin axis
+ * projected on the sky). Found by bisection on the exact CPU geodesics: the edge is where rays stop
+ * being captured. For a = 0 this reproduces Synge's (1966) sin ψ = √27 √(1 − 2/r) / r.
+ */
+export function shadowAngularWidth(a: number, pos: Vec3, iterations = 22): number {
+  const d = Math.hypot(pos[0], pos[1], pos[2]);
+  const back: Vec3 = [pos[0] / d, pos[1] / d, pos[2] / d];
+  let up: Vec3 = [-back[2] * back[0], -back[2] * back[1], 1 - back[2] * back[2]];
+  let un = Math.hypot(up[0], up[1], up[2]);
+  if (un < 1e-6) {
+    up = [0, 1, 0];
+    un = 1;
+  }
+  up = [up[0] / un, up[1] / un, up[2] / un];
+  const right: Vec3 = [up[1] * back[2] - up[2] * back[1], up[2] * back[0] - up[0] * back[2], up[0] * back[1] - up[1] * back[0]];
+  const u = staticObserver(a, pos[0], pos[1], pos[2]) ?? zamoObserver(a, pos[0], pos[1], pos[2]);
+  if (!u) return Math.PI * 2;
+  const tet = buildTetrad(a, pos, u, right, up, back);
+  const rEsc = Math.max(d * 1.05, 60);
+  const cap = (psi: number, side: number) =>
+    traceRay(a, pos, rayMomentum(tet, [side * Math.sin(psi), 0, -Math.cos(psi)]), { eps: 0.05, rEscape: rEsc, maxSteps: 4000 }).fate !== 'escaped';
+  const half = (side: number) => {
+    if (!cap(0, side)) return 0;
+    let lo = 0, hi = Math.PI;
+    for (let i = 0; i < iterations; i++) {
+      const mid = 0.5 * (lo + hi);
+      if (cap(mid, side)) lo = mid;
+      else hi = mid;
+    }
+    return 0.5 * (lo + hi);
+  };
+  return half(1) + half(-1);
 }

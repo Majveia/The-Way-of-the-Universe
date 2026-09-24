@@ -317,7 +317,9 @@ export class FlyRig {
     const h = tr.t * (1 - u) * (1 - u);
     this.position.addScaledVector(tr.v0, h);
     if (tr.orient) {
-      const k = smoother(Math.min(1, u / 0.35));
+      // Turn to face the destination within the first ~2 s (while the eased path is still slow),
+      // so the ship never visibly slides sideways at speed.
+      const k = smoother(Math.min(1, tr.t / Math.min(2.2, 0.35 * tr.dur)));
       this.quaternion.slerpQuaternions(tr.q0, tr.q1, k);
     }
     if (dt > 0) this.velocity.copy(this.position).sub(prev).divideScalar(dt);

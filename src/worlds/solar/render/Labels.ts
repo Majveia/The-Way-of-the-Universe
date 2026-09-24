@@ -30,6 +30,7 @@ interface El {
   lastY: number;
   lastO: number;
   selected: boolean;
+  left: boolean;
 }
 
 const STYLE = `
@@ -37,6 +38,7 @@ const STYLE = `
 .solar-label { position: absolute; left: 0; top: 0; display: flex; align-items: center; gap: 6px; white-space: nowrap;
   font: 400 11px/1 var(--font-ui); letter-spacing: 0.1em; color: var(--ink-2); will-change: transform, opacity;
   pointer-events: auto; cursor: pointer; padding: 3px 4px; margin: -3px -4px; }
+.solar-label.left { flex-direction: row-reverse; }
 .solar-label .tick { width: 10px; height: 1px; background: currentColor; opacity: 0.55; flex: none; }
 .solar-label.p0 { color: var(--ink); font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase; }
 .solar-label.p1 { color: var(--ink); font-size: 11.5px; letter-spacing: 0.14em; text-transform: uppercase; }
@@ -58,6 +60,12 @@ export class Labels {
   private placedPool: Array<{ x: number; y: number; w: number }> = [];
   private seen = new Set<string>();
   visible = true;
+  private snapNext = false;
+
+  /** Skip the fades on the next update (the view jumped). */
+  snap(): void {
+    this.snapNext = true;
+  }
 
   constructor(parent: HTMLElement, private onPick: (id: string) => void) {
     this.style = document.createElement('style');
@@ -86,7 +94,7 @@ export class Labels {
     });
     root.addEventListener('pointerdown', (ev) => ev.stopPropagation());
     this.root.appendChild(root);
-    e = { root, opacity: 0, shown: false, width: 12 + c.text.length * 7.2, lastX: NaN, lastY: NaN, lastO: -1, selected: false };
+    e = { root, opacity: 0, shown: false, width: 12 + c.text.length * 7.2, lastX: NaN, lastY: NaN, lastO: -1, selected: false, left: false };
     this.els.set(c.id, e);
     return e;
   }
@@ -103,14 +111,23 @@ export class Labels {
       return B.strength - A.strength;
     });
     this.placed.length = 0;
-    const k = 1 - Math.exp(-dt / 0.18);
+    const k = this.snapNext ? 1 : 1 - Math.exp(-dt / 0.18);
+    this.snapNext = false;
     const seen = this.seen;
     seen.clear();
     for (const i of order) {
       const c = cands[i];
       const e = this.el(c);
       seen.add(c.id);
-      const lx = c.x + Math.max(4, c.radius + 3);
+      // Labels sit right of their body; near the right edge they flip to the left side.
+      const off = Math.max(4, c.radius + 3);
+      const left = c.x + off + e.width > width - 6 && c.x - off - e.width > 4;
+      if (left !== e.left) {
+        e.left = left;
+        e.root.classList.toggle('left', left);
+        e.lastX = NaN;
+      }
+      const lx = left ? c.x - off - e.width : c.x + off;
       const ly = c.y;
       let ok = this.visible && c.strength > 0.02 && c.x > -40 && c.x < width + 10 && c.y > -10 && c.y < height + 10;
       if (ok) {
@@ -141,7 +158,7 @@ export class Labels {
         e.selected = c.selected;
         e.root.classList.toggle('sel', c.selected);
       }
-      this.write(e, lx, ly, e.opacity);
+      this.write(e, left ? c.x - off : lx, ly, e.opacity);
     }
     // Fade out labels not offered this frame.
     for (const [id, e] of this.els) {
@@ -165,8 +182,9 @@ export class Labels {
       }
       return;
     }
-    if (Math.abs(x - e.lastX) > 0.05 || Math.abs(y - e.lastY) > 0.05) {
-      e.root.style.transform = `translate3d(${x.toFixed(1)}px, ${(y - 5.5).toFixed(1)}px, 0)`;
+    // (lastX starts as NaN: `!(|Δ| <= ε)` is true for NaN, so the first write always lands.)
+    if (!(Math.abs(x - e.lastX) <= 0.05) || !(Math.abs(y - e.lastY) <= 0.05)) {
+      e.root.style.transform = `translate3d(${x.toFixed(1)}px, ${(y - 5.5).toFixed(1)}px, 0)${e.left ? ' translateX(-100%)' : ''}`;
       e.lastX = x;
       e.lastY = y;
     }

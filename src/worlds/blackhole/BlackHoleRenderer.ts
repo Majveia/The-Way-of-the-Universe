@@ -27,7 +27,7 @@ import {
   planckLuminance,
   populationColor,
 } from './spectrum';
-import { ACCUM_FRAG, COMPOSITE_FRAG, DISK_TEXTURE_FRAG, traceFrag } from './shaders';
+import { ACCUM_FRAG, COMPOSITE_FRAG, DISK_TEXTURE_FRAG, METER_FRAG, traceFrag } from './shaders';
 
 export type ObserverKind = 'static' | 'zamo' | 'orbiting' | 'rain';
 export type BlackHoleQuality = 'low' | 'medium' | 'high' | 'ultra';
@@ -80,7 +80,7 @@ export const defaultBlackHoleParams = (): BlackHoleParams => ({
   thickness: 0.018,
   peakTemperature: 9000,
   diskBrightness: 4,
-  opacity: 10,
+  opacity: 4,
   turbulence: 0.8,
   disk: true,
   doppler: true,
@@ -90,7 +90,7 @@ export const defaultBlackHoleParams = (): BlackHoleParams => ({
   showPhotonOrbits: false,
   hotSpot: 0,
   hotSpotRadius: 7,
-  envGain: 0.35,
+  envGain: 0.08,
   starGain: 1,
   stars: true,
   observer: 'static',
@@ -111,13 +111,15 @@ interface QualitySettings {
   eps: number;
   diskSamples: number;
   diskTex: [number, number];
+  /** Turbulence octaves in the disk texture. */
+  diskOct: number;
 }
 
 const QUALITY: Record<BlackHoleQuality, QualitySettings> = {
-  low: { traceScale: 0.5, maxSteps: 150, eps: 0.14, diskSamples: 5, diskTex: [768, 192] },
-  medium: { traceScale: 0.6, maxSteps: 220, eps: 0.11, diskSamples: 7, diskTex: [1024, 256] },
-  high: { traceScale: 0.72, maxSteps: 300, eps: 0.09, diskSamples: 9, diskTex: [1536, 384] },
-  ultra: { traceScale: 1, maxSteps: 420, eps: 0.07, diskSamples: 12, diskTex: [2048, 512] },
+  low: { traceScale: 0.5, maxSteps: 150, eps: 0.14, diskSamples: 8, diskTex: [1024, 256], diskOct: 3 },
+  medium: { traceScale: 0.6, maxSteps: 220, eps: 0.11, diskSamples: 12, diskTex: [1536, 384], diskOct: 4 },
+  high: { traceScale: 0.72, maxSteps: 300, eps: 0.09, diskSamples: 16, diskTex: [2048, 512], diskOct: 5 },
+  ultra: { traceScale: 1, maxSteps: 420, eps: 0.07, diskSamples: 24, diskTex: [3072, 768], diskOct: 6 },
 };
 
 /** Star layers: cells per cube-face edge and magnitude ranges (dN/dm ∝ 10^{0.35 m}). */
@@ -129,6 +131,9 @@ const STAR_LAYERS = [
 
 /** Kerr–Schild (spin +z) → three.js black-hole frame (spin +y): (x, y, z) → (x, z, −y). */
 const KS_TO_BH = new THREE.Matrix3().set(1, 0, 0, 0, 0, 1, 0, -1, 0);
+
+const METER_W = 16;
+const METER_H = 9;
 
 const halton = (i: number, b: number): number => {
   let f = 1, r = 0;
@@ -179,6 +184,16 @@ export class BlackHoleRenderer {
   private traceMat: THREE.ShaderMaterial;
   private accumMat: THREE.ShaderMaterial;
   private compMat: THREE.ShaderMaterial;
+  private meterMat: THREE.ShaderMaterial;
+  private meterRT = new THREE.WebGLRenderTarget(METER_W, METER_H, { type: THREE.UnsignedByteType, depthBuffer: false });
+  private meterBuf = new Uint8Array(METER_W * METER_H * 4);
+  private meterBusy = false;
+  private meterSorted = new Float64Array(METER_W * METER_H);
+  /**
+   * Scene brightness from the last metering: the 95th-percentile linear luminance of the disk
+   * light (a camera exposing for its highlights). 0 until the first measurement arrives.
+   */
+  highlightLuminance = 0;
   private env: THREE.Texture | null = null;
   private customU: Vec4 | null = null;
   private frame = 0;
@@ -190,6 +205,8 @@ export class BlackHoleRenderer {
   private lastFwd = new THREE.Vector3();
   private lastPos = new THREE.Vector3();
   private traceScale: number;
+  /** Increments whenever a parameter other than `time` changes (lets callers detect a new image). */
+  version = 0;
   /** Camera state of the most recent frame (for picking and readouts). */
   camera: CameraState | null = null;
   private tanX = 1;
@@ -199,6 +216,10 @@ export class BlackHoleRenderer {
   private readonly camToSky = new THREE.Matrix3();
   private readonly toSky = new THREE.Matrix3();
   private readonly bhRot = new THREE.Matrix3();
+  private readonly tmpM = new THREE.Matrix4();
+  private readonly tmpQ2 = new THREE.Quaternion();
+  private readonly tmpV2 = new THREE.Vector3();
+  private readonly jitter = new THREE.Vector2();
 
   constructor(renderer: THREE.WebGLRenderer, opts: BlackHoleRendererOptions = {}) {
     this.renderer = renderer;
@@ -224,11 +245,12 @@ export class BlackHoleRenderer {
       depthBuffer: false,
       stencilBuffer: false,
     });
+    this.diskRT.texture.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
 
     const common = { vertexShader: FULLSCREEN_VERT, glslVersion: THREE.GLSL3, depthTest: false, depthWrite: false };
     this.diskMat = new THREE.ShaderMaterial({
       ...common,
-      fragmentShader: DISK_TEXTURE_FRAG,
+      fragmentShader: `#define DISK_OCT ${this.quality.diskOct}\n${DISK_TEXTURE_FRAG}`,
       uniforms: {
         uA: { value: 0.9 },
         uTime: { value: 0 },
@@ -288,6 +310,11 @@ export class BlackHoleRenderer {
       fragmentShader: ACCUM_FRAG,
       uniforms: { uCurrent: { value: null }, uHistory: { value: null }, uAlpha: { value: 1 } },
     });
+    this.meterMat = new THREE.ShaderMaterial({
+      ...common,
+      fragmentShader: METER_FRAG,
+      uniforms: { uAccum: { value: null }, uCells: { value: new THREE.Vector2(METER_W, METER_H) } },
+    });
     // Star-layer statistics for the unresolved limit.
     const k = 0.35 * Math.LN10;
     const means = STAR_LAYERS.map((l) => {
@@ -330,6 +357,7 @@ export class BlackHoleRenderer {
         uCT: { value: this.ctTex },
         uCTMap: { value: new THREE.Vector2(this.ctRange.qMin, 1 / (this.ctRange.qMax - this.ctRange.qMin)) },
         uSkyShift: { value: 1 },
+        uDbg: { value: 0 },
       },
     });
   }
@@ -337,6 +365,7 @@ export class BlackHoleRenderer {
   /** Background seen through the lens: a cube map (e.g. the project's Sky rendered by a CubeCamera). */
   setEnvironment(tex: THREE.Texture | null): void {
     this.env = tex;
+    this.version++;
     this.historyValid = false;
   }
 
@@ -354,7 +383,10 @@ export class BlackHoleRenderer {
         if (key !== 'time') changed = true;
       }
     }
-    if (changed) this.dirty = true;
+    if (changed) {
+      this.dirty = true;
+      this.version++;
+    }
   }
 
   /** Carry the camera with an arbitrary 4-velocity (Kerr–Schild contravariant), e.g. a plunge. */
@@ -370,6 +402,7 @@ export class BlackHoleRenderer {
 
   /** Drop the temporal history (call after a cut). */
   resetHistory(): void {
+    this.version++;
     this.historyValid = false;
   }
 
@@ -396,9 +429,14 @@ export class BlackHoleRenderer {
       stencilBuffer: false,
       generateMipmaps: false,
     } as const;
-    this.traceRT = new THREE.WebGLRenderTarget(tw, th, { ...opts, count: 2 });
-    const sky = this.traceRT.textures[1];
-    sky.minFilter = sky.magFilter = THREE.NearestFilter;
+    // 32-bit floats where renderable: the sky target stores the deflection Δ, whose finite
+    // differences give the lens Jacobian — half-float rounding (~1e-4 at Δ ≈ 0.1) is comparable to a
+    // pixel's angle and would smear the analytically lensed stars into streaks.
+    const full = this.renderer.extensions.has('EXT_color_buffer_float');
+    this.traceRT = new THREE.WebGLRenderTarget(tw, th, { ...opts, type: full ? THREE.FloatType : THREE.HalfFloatType, count: 2 });
+    // Both are read at texel centres (accumulation) or with texelFetch (composite): nearest
+    // filtering keeps float32 targets valid without OES_texture_float_linear.
+    for (const t of this.traceRT.textures) t.minFilter = t.magFilter = THREE.NearestFilter;
     this.accum = [new THREE.WebGLRenderTarget(tw, th, opts), new THREE.WebGLRenderTarget(tw, th, opts)];
     this.historyValid = false;
   }
@@ -454,18 +492,23 @@ export class BlackHoleRenderer {
    * `camPosInRg`: camera position in gravitational radii in the black hole's frame (spin +Y).
    * The camera's world orientation is interpreted in the same frame (after `params.orientation`).
    */
-  render(target: THREE.WebGLRenderTarget, camera: THREE.PerspectiveCamera, camPosInRg: THREE.Vector3): void {
+  render(target: THREE.WebGLRenderTarget, camera: THREE.PerspectiveCamera, camPosInRg: THREE.Vector3, reuse = false): void {
     const r = this.renderer;
     const p = this.params;
     this.ensureTargets(target.width, target.height);
     const tr = this.traceRT!;
+    // `reuse`: composite last frame's trace again (cheap) — used to throttle CPU-emulated WebGL.
+    if (reuse && this.historyValid && this.camera) {
+      this.composite(target);
+      return;
+    }
     this.updateProfile();
     this.frame++;
 
     // ——— camera → Kerr–Schild frame
-    this.bhRot.setFromMatrix4(new THREE.Matrix4().makeRotationFromQuaternion(p.orientation));
+    this.bhRot.setFromMatrix4(this.tmpM.makeRotationFromQuaternion(p.orientation));
     const invOrient = this.tmpQ.copy(p.orientation).invert();
-    const qCam = new THREE.Quaternion().copy(invOrient).multiply(camera.quaternion);
+    const qCam = this.tmpQ2.copy(invOrient).multiply(camera.quaternion);
     const toKS = (v: THREE.Vector3): Vec3 => [v.x, -v.z, v.y];
     const pos = toKS(camPosInRg);
     const right = toKS(this.tmpV.set(1, 0, 0).applyQuaternion(qCam));
@@ -491,7 +534,7 @@ export class BlackHoleRenderer {
     this.camera = { pos, r: rCam, u, tetrad, inside: rCam < rh };
 
     // ——— temporal accumulation weight from camera motion
-    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+    const fwd = this.tmpV2.set(0, 0, -1).applyQuaternion(camera.quaternion);
     this.tanY = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
     this.tanX = this.tanY * camera.aspect;
     const pixAngle = (2 * this.tanY) / tr.height;
@@ -533,8 +576,7 @@ export class BlackHoleRenderer {
     const jx = halton((this.frame % 16) + 1, 2) - 0.5;
     const jy = halton((this.frame % 16) + 1, 3) - 0.5;
     this.toSky.copy(this.bhRot).multiply(KS_TO_BH);
-    const cm = new THREE.Matrix4().makeRotationFromQuaternion(camera.quaternion);
-    this.camToSky.setFromMatrix4(cm);
+    this.camToSky.setFromMatrix4(this.tmpM.makeRotationFromQuaternion(camera.quaternion));
     const t = this.traceMat.uniforms;
     t.uA.value = a;
     t.uLensing.value = lensing ? 1 : 0;
@@ -582,15 +624,46 @@ export class BlackHoleRenderer {
     this.quad.render(r, next);
     this.accumIndex = 1 - this.accumIndex;
     this.historyValid = true;
+    this.jitter.set(jx, jy);
+    this.composite(target);
+  }
 
-    // ——— composite into the HDR target
+  /**
+   * Measure the image brightness for auto exposure (async GPU readback, no stall). Call every few
+   * frames; the result lands in `highlightLuminance`.
+   */
+  meter(): void {
+    if (this.meterBusy || !this.historyValid) return;
+    const r = this.renderer;
+    this.meterMat.uniforms.uAccum.value = this.accum[this.accumIndex].texture;
+    this.quad.material = this.meterMat;
+    this.quad.render(r, this.meterRT);
+    this.meterBusy = true;
+    r.readRenderTargetPixelsAsync(this.meterRT, 0, 0, METER_W, METER_H, this.meterBuf)
+      .then(() => {
+        const n = METER_W * METER_H;
+        for (let i = 0; i < n; i++) this.meterSorted[i] = this.meterBuf[i * 4];
+        this.meterSorted.sort();
+        const code = this.meterSorted[Math.floor(n * 0.95)];
+        this.highlightLuminance = Math.pow(2, (code / 255) * 24 - 16);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        this.meterBusy = false;
+      });
+  }
+
+  /** Final pass: upsampled disk light over the lensed sky, into the HDR target. */
+  private composite(target: THREE.WebGLRenderTarget): void {
+    const p = this.params;
+    const tr = this.traceRT!;
     const c = this.compMat.uniforms;
-    c.uAccum.value = next.texture;
+    c.uAccum.value = this.accum[this.accumIndex].texture;
     c.uSky.value = tr.textures[1];
     c.uEnv.value = this.env;
     c.uEnvOn.value = this.env ? 1 : 0;
     (c.uTraceRes.value as THREE.Vector2).set(tr.width, tr.height);
-    (c.uJitter.value as THREE.Vector2).set(jx, jy);
+    (c.uJitter.value as THREE.Vector2).copy(this.jitter);
     (c.uTan.value as THREE.Vector2).set(this.tanX, this.tanY);
     (c.uCamToSky.value as THREE.Matrix3).copy(this.camToSky);
     c.uScale.value = tr.width / target.width;
@@ -602,7 +675,7 @@ export class BlackHoleRenderer {
     c.uStarsOn.value = p.stars ? 1 : 0;
     c.uSkyShift.value = p.gravitationalRedshift || p.doppler ? 1 : 0;
     this.quad.material = this.compMat;
-    this.quad.render(r, target);
+    this.quad.render(this.renderer, target);
   }
 
   /** Debug: read the latest accumulated trace value (rgb, transmittance) at normalised coords. */
@@ -646,5 +719,7 @@ export class BlackHoleRenderer {
     this.traceMat.dispose();
     this.accumMat.dispose();
     this.compMat.dispose();
+    this.meterMat.dispose();
+    this.meterRT.dispose();
   }
 }

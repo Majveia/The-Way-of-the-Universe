@@ -345,7 +345,7 @@ export function buildShipGeometry(detail = 1): ShipGeometry {
     ],
     nozzle: new THREE.Vector3(0, cy, SHIP_DIMENSIONS.tailZ - 0.2),
     nozzleRadius: 1.18,
-    cockpit: new THREE.Vector3(0, fuselageCenterY(0.25) + fuselageHalfHeight(0.25) + 0.42, stationZ(0.25)),
+    cockpit: new THREE.Vector3(0, fuselageCenterY(0.25) + fuselageHalfHeight(0.25) + 0.62, stationZ(0.25)),
     boundingRadius: 14.5,
   };
 }

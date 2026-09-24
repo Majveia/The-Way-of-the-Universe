@@ -89,6 +89,12 @@ vec3 rotY(vec3 v, float a) {
   return vec3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
 }
 
+// Anti-aliasing gate for procedural detail of spatial frequency f (per radius): fades the detail
+// out before its features shrink below ~3 pixels (footprint = pixel size on the surface, radii).
+float nyquist(float f, float footprint) {
+  return smoothstep(1.0 / f, 0.33 / f, footprint);
+}
+
 // Zonal wind profile (rad per flow cycle): easterly trades, mid-latitude westerlies, polar easterlies.
 float windProfile(float lat) {
   float a = abs(lat);
@@ -111,7 +117,7 @@ float cloudCover(vec3 d, float footprint) {
   float c = pow(mix(c1, c2, abs(2.0 * f1 - 1.0)), 2.2);
   // Sub-texel detail when close: erode/sharpen edges with fbm (real clouds are fractal).
   float texel = PI / 2048.0;
-  float detail = smoothstep(texel, texel * 0.1, footprint);
+  float detail = smoothstep(texel, texel * 0.1, footprint) * nyquist(900.0, footprint);
   if (detail > 0.0) {
     float n = fbm3(d * 900.0 + vec3(uCloudTime * 0.3), 4);
     c = clamp(c + detail * (n * 0.35) * (1.0 - c) * c * 4.0, 0.0, 1.0);
@@ -127,7 +133,7 @@ float cloudCover(vec3 d, float footprint) {
   float c1 = texture(uCubeC, rotY(d, w * (f1 - 0.5))).r;
   float c2 = texture(uCubeC, rotY(d, w * (f2 - 0.5))).r;
   float c = mix(c1, c2, abs(2.0 * f1 - 1.0));
-  float detail = smoothstep(uBakeTexel * 2.0, uBakeTexel * 0.2, footprint);
+  float detail = smoothstep(uBakeTexel * 2.0, uBakeTexel * 0.2, footprint) * nyquist(260.0, footprint);
   if (detail > 0.0) {
     float n = fbm3(d * 260.0 + uSeedOffRT, 4);
     c = clamp(c + detail * n * 0.5 * c * (1.0 - c) * 4.0, 0.0, 1.0);
@@ -163,6 +169,32 @@ vec3 cityGlow(vec3 d, float footprint) {
 #else
   return vec3(0.0);
 #endif
+}
+
+// Crater relief (units of the cell size): a cellular field where each cell may hold one crater of
+// random radius, biased toward small ones (cumulative size distribution N(>D) ∝ D^-2 or so), with a
+// bowl of depth/diameter ≈ 0.2 and a raised rim.
+float craterBowl(vec3 p) {
+  vec3 id = floor(p);
+  vec3 f = fract(p);
+  float h = 0.0;
+  for (int k = 0; k < 27; k++) {
+    vec3 o = vec3(float(k % 3), float((k / 3) % 3), float(k / 9)) - 1.0;
+    vec3 c = id + o;
+    vec3 rnd = hash33(c);
+    if (rnd.z > 0.55) continue;                          // ~55 % of cells cratered
+    float R = 0.12 + 0.55 * pow(rnd.y, 3.0);              // mostly small, a few large
+    vec3 fp = o + 0.2 + 0.6 * rnd;
+    float r = length(fp - f) / R;
+    if (r > 1.4) continue;
+    float bowl = -0.4 * R * sqr(max(0.0, 1.0 - r * r));
+    float rim = 0.06 * R * exp(-sqr((r - 1.0) / 0.25));
+    h += bowl + rim;
+  }
+  return h;
+}
+float moonCraters(vec3 q, float g1, float g2) {
+  return (craterBowl(q * 260.0) / 260.0) * g1 + (craterBowl(q * 900.0 + 7.3) / 900.0) * g2 * 0.4;
 }
 
 Surf surfaceAt(vec3 d, vec3 n, float footprint) {
@@ -225,15 +257,19 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
   float sx = (hE - hW) * k / (2.0 * du * TAU * cl);
   float sy = (hN - hS) * k / (2.0 * dv * PI);
   vec3 N = normalize(n - uRelief * (sx * east + sy * north));
-  // Sub-texel craters and regolith when very close.
-  float detail = smoothstep(PI / 512.0, PI / 4096.0, footprint);
-  if (detail > 0.0) {
-    vec3 q = d * 420.0;
-    float n1 = fbm3(q, 5);
-    vec2 w = worley3(q * 0.5);
-    float cr = smoothstep(0.35, 0.0, w.x) * 0.5;
-    N = normalize(N + detail * 0.15 * (east * (n1 - fbm3(q + vec3(0.03, 0.0, 0.0), 5)) / 0.03 * 0.01 + north * cr * 0.2));
-    s.albedo *= 1.0 + detail * 0.15 * n1;
+  // Sub-texel craters when close: bowls with raised rims from cellular noise at two scales (a 3D
+  // Voronoi field sliced by the sphere gives circles of many sizes — a natural size distribution),
+  // shaded through their slopes; each scale fades in only once it spans a few pixels.
+  float g1 = nyquist(260.0, footprint) * smoothstep(PI / 512.0, PI / 2048.0, footprint);
+  if (g1 > 0.0) {
+    float g2 = nyquist(1800.0, footprint);
+    float e = 0.15 / 260.0;
+    vec3 q = d + uSeedOffRT * 0.01;
+    float h0 = moonCraters(q, g1, g2);
+    float hx = moonCraters(normalize(q + east * e), g1, g2);
+    float hy = moonCraters(normalize(q + north * e), g1, g2);
+    N = normalize(N - (east * (hx - h0) + north * (hy - h0)) / e * 0.16);
+    s.albedo *= 1.0 + 0.12 * g1 * (fbm3(q * 700.0, 3) * nyquist(1400.0, footprint));
   }
   s.N = N;
   s.photometry = 1;
@@ -253,7 +289,7 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
   vec4 a2 = texture(uCubeA, rotY(d, jets * amp * (f2 - 0.5)));
   vec4 A = mix(a1, a2, abs(2.0 * f1 - 1.0));
   s.albedo = A.rgb * A.rgb;
-  float detail = smoothstep(uBakeTexel * 1.5, uBakeTexel * 0.2, footprint);
+  float detail = smoothstep(uBakeTexel * 1.5, uBakeTexel * 0.2, footprint) * nyquist(700.0, footprint);
   if (detail > 0.0) {
     vec3 q = d + uSeedOffRT * 0.01;
     float fil = fbm3(vec3(q.x * 90.0, q.y * 700.0, q.z * 90.0), 4);
@@ -269,7 +305,7 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
   // Keep the baked normal in this frame (the bake normal is in the same object space).
   s.N = normalize(mix(n, N, clamp(uRelief, 0.0, 3.0)));
   s.emission = B.a;
-  float detail = smoothstep(uBakeTexel * 1.5, uBakeTexel * 0.15, footprint);
+  float detail = smoothstep(uBakeTexel * 1.5, uBakeTexel * 0.15, footprint) * nyquist(180.0, footprint);
   if (detail > 0.0 && s.spec < 0.5) {
     vec3 q = d * 180.0 + uSeedOffRT;
     float e0 = fbm3(q, 5);
@@ -393,6 +429,18 @@ void main() {
     brdf = pow(max(NoL, 0.0), 0.92) * pow(NoV, -0.08);
   }
   vec3 Lg = s.albedo * (Esun * brdf + Esky * (0.5 + 0.5 * dot(s.N, n)));
+#ifdef HAS_RINGS
+  // Ringshine: the sunlit face of the rings lights the hemisphere that sees it (the only light on
+  // the night side of a ringed planet). Irradiance ≈ ring radiance × projected solid angle of the
+  // annulus seen from this latitude (≈ 0.25 sr mid-latitudes, zero at the equator where it is edge-on).
+  {
+    float litSide = step(0.0, n.y * uSunDir.y);
+    float mu0r = abs(uSunDir.y);
+    float Lring = 0.55 * 0.25 * mu0r / (0.5 + mu0r) * 0.8;   // albedo·P/4 · μ₀/(μ+μ₀) · (1 − e^{−τ/μ}) for τ ≈ 1
+    float omega = 0.3 * smoothstep(0.0, 0.5, abs(n.y)) * (1.0 - smoothstep(0.75, 1.0, abs(n.y)));
+    Lg += s.albedo * uSunColor * Lring * omega * litSide;
+  }
+#endif
   // Umbra lit by light refracted through the occluder's atmosphere (lunar eclipse).
   Lg += s.albedo * uUmbraLight * uSunColor * umbra * max(dot(n, uSunDir), 0.0);
   if (s.spec > 0.0) {
@@ -410,7 +458,8 @@ void main() {
   float daylight = luma(Esun * max(muS, 0.0) + Esky);
   if (s.emission > 0.0) {
 #if defined(KIND_LAVA)
-    float T = mix(650.0, uLavaT, s.emission) * (0.94 + 0.06 * snoise(vec3(d * 40.0) + uTime * 0.02));
+    // Crust edges cooler (dull red), centres of cracks and lakes near the melt temperature.
+    float T = mix(0.7 * uLavaT, uLavaT, s.emission) * (0.95 + 0.05 * snoise(vec3(d * 40.0) + uTime * 0.02));
     float c2 = 25925.0;   // hc/(λk) at 555 nm
     float rad = 46200.0 * (exp(c2 / 5772.0) - 1.0) / (exp(c2 / T) - 1.0);
     Lg += blackbody(T) * rad * uEmission * smoothstep(0.02, 0.2, s.emission);
@@ -471,8 +520,13 @@ void main() {
   float t0 = max(top.x, tCam);
   float t1 = top.y;
   if (t1 <= t0) discard;
-  vec2 g = raySphere(ro, rd, vec3(0.0), 1.0);
-  if (g.x <= g.y && g.y > tCam) discard;   // the surface pass owns rays that hit the ground
+  // The surface pass owns rays that hit the ground. Test with the closest approach, biased by a few
+  // tens of metres toward "sky", so grazing rays are never dropped by both passes (float rounding of
+  // the two proxies differs); a hair-thin overlap is invisible, a hole is a black pixel.
+  float tca = -dot(ro, rd);
+  vec3 pca = ro + rd * tca;
+  float b2 = dot(pca, pca);
+  if (b2 < 1.0 - 1e-5 && tca + sqrt(max(0.0, 1.0 - b2)) > tCam) discard;
   float jitter = ign(gl_FragCoord.xy);
   float footprint = (t0 - tCam) * uPixelAngle;
   // Cloud segments along the limb ray (up to two: near and far side of the cloud shell).

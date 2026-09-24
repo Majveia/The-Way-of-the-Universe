@@ -52,6 +52,7 @@ uniform float uScatter;
 uniform sampler3D uNoise;
 uniform float uNoiseTile;
 uniform float uGain;
+uniform float uNearCut;    // emission closer than this (pc) is drawn as individual stars instead
 uniform int uDebug;
 uniform int uMask;         // component bits: 1 disk, 2 thick, 4 bulge, 8 bar, 16 young, 32 HII, 64 scattering, 128 dust
 
@@ -106,9 +107,12 @@ void main() {
     if (steps >= uMaxSteps || t >= iv.y) break;
     vec3 m0 = ro + rd * t;
     float h0 = m0.z;
+    // Step: resolve the vertical structure (∝ |h| + 20 pc along the ray), the neighbourhood of the
+    // camera (∝ distance) and the bulge (∝ r); far above the plane only smooth, faint light remains.
     float ds = uStepK * (abs(h0) + 20.0) / max(absRdz, 0.012);
-    ds = min(ds, 0.03 * t + 3.0);
-    ds = clamp(ds, uStepRange.x, uStepRange.y);
+    float r0 = length(m0);
+    ds = min(ds, min(0.03 * t + 3.0, 0.22 * r0 + 30.0));
+    ds = clamp(ds, uStepRange.x, max(uStepRange.y, 0.35 * abs(h0)));
     ds = max(ds, (iv.y - t) / max(1.0, uMaxSteps - steps));
     float tm = t + ds * (first ? jitter : 0.5);
     if (first) { ds *= jitter + 0.5; first = false; }
@@ -197,6 +201,8 @@ void main() {
     // Dust-scattered disk light (albedo ≈ 0.6; bluer than the stars that light it).
     if ((uMask & 64) != 0) j += uColScatter * (uScatter * rho * (uDiskP.x * exp(-R / uDiskP.y) + 4.0 * uYoungP.x * mp.g));
 
+    // Nearby light belongs to the resolved local star field, not to a glow around the viewer.
+    if (uNearCut > 0.0) j *= smoothstep(0.45 * uNearCut, uNearCut, tm);
     vec3 sig = rho * uExtRGB;
     vec3 att = exp(-sig * ds);
     vec3 w = mix(vec3(ds), (1.0 - att) / max(sig, vec3(1e-8)), step(vec3(1e-5), sig * ds));

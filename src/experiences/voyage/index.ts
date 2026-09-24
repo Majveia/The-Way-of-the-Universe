@@ -11,7 +11,7 @@ import { Ship, SkyProbe } from '../../worlds/ship/Ship';
 import { ShipCamera, type ShipView } from '../../worlds/ship/ShipCamera';
 import { StarshipFlight, describeWarp, TIME } from '../../worlds/ship/flight';
 import { C_PC_PER_YEAR, aberrateDirection, gammaOf, logBlackbodyLuminance } from '../../physics/voyage-relativity';
-import { formatNumber, formatDuration } from '../../physics/units';
+import { formatNumber, formatDuration, formatScientific } from '../../physics/units';
 import { YEAR } from '../../physics/constants';
 import { DESTINATIONS, STAR_OVERRIDES, type Destination } from './targets';
 import { Hud, type LabelItem } from './hud';
@@ -33,6 +33,8 @@ const J2000 = 2000.0;
 /** Reference pixel angle (rad) for converting star flux to illuminance on the hull (≈ 60° / 1047 px). */
 const P_REF = 1e-3;
 const NEAR_PC = 0.05;
+/** Starting distance from the Sun (AU): well past the heliopause, where the Sun is a −13.7 mag star. */
+const DEPART_AU = 420;
 
 interface NearEntry {
   index: number;
@@ -118,6 +120,10 @@ class Voyage implements Experience {
   }> = {};
   private viewButtons!: { setActive(i: number): void };
   private warpManual = TIME.DAY_YR * 7;
+  /** Default framing: Sun azimuth/elevation from the nose (deg, +az = starboard), chase camera offsets (rad). */
+  departureSun = { az: 100, el: 20, camYaw: 0.4, camPitch: 0 };
+  /** Seconds until the default departure lights the drive (0 = off). */
+  private autoEngage = 0;
 
   async mount(ctx: ExperienceContext): Promise<void> {
     this.ctx = ctx;
@@ -133,7 +139,7 @@ class Voyage implements Experience {
     }
     this.near = new NearStars();
     this.ship = new Ship({ detail: Math.max(0.55, Math.min(1.3, q.detail)), shadowSize: q.detail >= 1 ? 2048 : 1024 });
-    this.ship.plume.steps = q.detail >= 1 ? 30 : q.detail >= 0.7 ? 22 : 14;
+    this.ship.plume.steps = q.detail >= 1 ? 32 : q.detail >= 0.7 ? 24 : 20;
     this.probe = new SkyProbe(q.detail >= 1 ? 128 : 64, ctx.engine.halfFloat);
     this.ship.setEnvironment(this.probe, 1);
     this.shipScene.add(this.ship.group);
@@ -302,6 +308,7 @@ class Voyage implements Experience {
   preset(name: string): void {
     const f = this.flight;
     f.halt();
+    this.autoEngage = 0;
     f.tau = 0;
     f.t = 0;
     this.rig.cancelTravel();
@@ -310,16 +317,24 @@ class Voyage implements Experience {
     const acen = this.cat.find('Rigil Kentaurus');
     const toAcen = this.starPos(acen, _v1).normalize();
     if (name === 'departure' || name === 'default') {
-      // 150 AU out (beyond the heliopause), nose toward α Centauri, the Sun ahead-left.
+      // 420 AU out (far beyond the heliopause), nose toward α Centauri. The Sun — now a −16 mag star —
+      // stands behind the camera's shoulder, raking light across the hull; the camera sits off the
+      // starboard quarter so the ship reads in three-quarter view against the southern Milky Way.
       this.setTarget('alpha-cen', true);
       this.drive = 'sublight';
       const upG = _v3.set(0, 1, 0);
-      const left = _v4.crossVectors(upG, toAcen).normalize(); // points "left" when facing α Cen
-      const sunDir = _v5.copy(toAcen).multiplyScalar(Math.cos(0.72)).addScaledVector(left, Math.sin(0.72)).addScaledVector(upG, 0.16).normalize();
-      f.position.copy(sunDir).multiplyScalar(-150 * AU_PC);
+      const right = _v4.crossVectors(toAcen, upG).normalize();
+      const up = _v6.crossVectors(right, toAcen).normalize();
+      const az = THREE.MathUtils.degToRad(this.departureSun.az), el = THREE.MathUtils.degToRad(this.departureSun.el);
+      const sunDir = _v5.copy(toAcen).multiplyScalar(Math.cos(el) * Math.cos(az)).addScaledVector(right, Math.cos(el) * Math.sin(az)).addScaledVector(up, Math.sin(el)).normalize();
+      f.position.copy(sunDir).multiplyScalar(-DEPART_AU * AU_PC);
       this.faceDirection(toAcen);
       this.setView('chase');
-      this.shipCam.distance = 36;
+      this.shipCam.distance = 34;
+      this.shipCam.yawBias = this.departureSun.camYaw;
+      this.shipCam.pitchBias = this.departureSun.camPitch;
+      // A moment of stillness, then the drive lights and the ship sets out for α Centauri at 1 g.
+      this.autoEngage = 2.2;
     } else if (name === 'relativistic' || name === '0.9c') {
       // Coasting at 0.9 c toward α Centauri, a light-year out.
       this.setTarget('alpha-cen', true);
@@ -366,6 +381,7 @@ class Voyage implements Experience {
       this.faceDirection(from);
       this.setView('chase');
     }
+    if (name !== 'departure' && name !== 'default') this.shipCam.yawBias = this.shipCam.pitchBias = 0;
     this.shipCam.snap();
     this.syncRigToFlight();
     this.ctl.drive?.set(this.drive);
@@ -388,6 +404,10 @@ class Voyage implements Experience {
     if (v !== 'sky') this.shipCam.mode = v;
     this.ship.group.visible = v !== 'sky';
     this.ship.cockpit = v === 'cockpit';
+    // Planetarium view: a dark-adapted naked eye resolves ~1.45× broader, brighter star images than a
+    // camera at the same field of view (the eye's PSF + scattering halo).
+    this.sky.starSize = v === 'sky' ? 1.45 : 1;
+    this.sky.brightness = v === 'sky' ? 2 : 1;
     this.viewButtons?.setActive(['chase', 'cockpit', 'orbit', 'sky'].indexOf(v));
     this.shipCam.snap();
   }
@@ -572,6 +592,7 @@ class Voyage implements Experience {
     const inp = this.ctx.input;
     inp.onKeyDown((e) => {
       if (e.repeat) return;
+      this.autoEngage = 0; // the pilot has taken the controls
       switch (e.code) {
         case 'Enter':
         case 'NumpadEnter':
@@ -662,6 +683,13 @@ class Voyage implements Experience {
   private step(dt: number): void {
     const fl = this.flight;
     const inp = this.ctx.input;
+    if (this.autoEngage > 0) {
+      this.autoEngage -= dt;
+      if (this.autoEngage <= 0) {
+        this.autoEngage = 0;
+        if (!fl.autopilot && !this.rig.traveling && fl.beta < 1e-6) this.engage();
+      }
+    }
     // Manual throttle (W/S) in sub-light mode.
     if (!fl.autopilot && !this.rig.traveling && this.drive === 'sublight' && this.view !== 'sky') {
       const k = (c: string) => (inp.isDown(c) ? 1 : 0);
@@ -831,7 +859,7 @@ class Voyage implements Experience {
       total += 1e-6 * Math.pow(g / 300, 4);
     }
     // Eye adaptation: dark-adapted below E_ref, then compensate ~90 % of the extra light (in log).
-    const E_REF = 2.5;
+    const E_REF = 1.5;
     const target = total > E_REF ? Math.pow(E_REF / total, 0.9) : 1;
     this.exposureTarget = target;
     const tau = target < this.exposure ? 0.35 : 1.4;
@@ -922,7 +950,7 @@ class Voyage implements Experience {
     // Readouts.
     if (this.rig.traveling) {
       const cPerS = (this.imaginationSpeed / C_PC_PER_YEAR) * (365.25 * 86400);
-      this.ro.speed.set(formatNumber(cPerS, 3), 'c · imagination');
+      this.ro.speed.set(cPerS >= 1e4 ? formatScientific(cPerS, 2) : formatNumber(cPerS, 3), 'c · imagination');
       this.ro.gamma.set('—');
     } else {
       const b = fl.beta;
@@ -965,7 +993,7 @@ class Voyage implements Experience {
       progress = fl.progress;
       const tauLeft = fl.estimateRemainingTau();
       const tl = formatDuration(tauLeft * YEAR, 2);
-      eta = `${tl.value} ${tl.unit} ship time to go · ${describeWarp(fl.warp)}`;
+      eta = `${tl.value} ${tl.unit} ship time to go\ntime warp ${describeWarp(fl.warp)}`;
       p.tag.textContent = '';
     } else if (this.view === 'sky' && fl.position.lengthSq() < 1e-16) {
       phase = 'The sky from Earth';
@@ -977,7 +1005,7 @@ class Voyage implements Experience {
       progress = 1;
     } else {
       phase = fl.beta > 0.0005 ? 'Manual flight' : 'Holding position';
-      eta = `Enter to set course · ${describeWarp(fl.warp)}`;
+      eta = `Enter to set course\ntime warp ${describeWarp(fl.warp)}`;
     }
     p.tag.textContent = this.drive === 'imagination' ? 'Imagination drive armed' : this.relOn ? '' : 'Relativity off';
     if (p.phase.textContent !== phase) p.phase.textContent = phase;
@@ -1029,7 +1057,10 @@ class Voyage implements Experience {
     // Keep labels off the ship.
     const reserved = this.reservedBoxes;
     reserved.length = 0;
-    if (this.view !== 'sky' && this.view !== 'cockpit') {
+    if (this.view === 'cockpit') {
+      // The nose fills the lower part of the cockpit view.
+      reserved.push([eng.cssWidth * 0.18, eng.cssHeight * 0.76, eng.cssWidth * 0.82, eng.cssHeight]);
+    } else if (this.view !== 'sky') {
       const pc = cam as THREE.PerspectiveCamera;
       const c = _v3.set(0, 0, 0).applyMatrix4(pc.matrixWorldInverse);
       if (c.z < 0) {

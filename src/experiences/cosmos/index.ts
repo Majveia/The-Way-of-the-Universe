@@ -69,7 +69,7 @@ class CosmicWebExperience implements Experience {
   private tl: CosmicTimeline | null = null;
   private cosmo: CosmoParams = { ...PLANCK_COSMO };
   private pending: CosmoParams = { ...PLANCK_COSMO };
-  private box = 200;
+  private box = 128;
   private seed = 42;
   private presetId: PresetId | null = 'planck';
 
@@ -382,7 +382,7 @@ class CosmicWebExperience implements Experience {
     this.sliders.As = u.slider({ label: 'Aₛ × 10⁹', min: 0.5, max: 6, value: this.pending.As * 1e9, format: (v) => v.toFixed(2), onChange: (v) => this.edit({ As: v * 1e-9 }) });
     this.sliders.ns = u.slider({ label: 'Spectral index nₛ', min: 0.8, max: 1.1, value: this.pending.ns, format: (v) => v.toFixed(3), onChange: (v) => this.edit({ ns: v }) });
     this.wiggleToggle = u.toggle({ label: 'Baryon acoustic wiggles', value: this.pending.wiggles, onChange: (v) => this.edit({ wiggles: v }) });
-    this.sliders.box = u.slider({ label: 'Box size', min: 100, max: 500, step: 10, value: this.box / this.cosmo.h, unit: 'Mpc', format: (v) => v.toFixed(0), onChange: () => this.markDirty() });
+    this.sliders.box = u.slider({ label: 'Box size', min: 60, max: 500, step: 5, value: this.box / this.cosmo.h, unit: 'Mpc', format: (v) => v.toFixed(0), onChange: () => this.markDirty() });
     this.sliders.seed = u.slider({ label: 'Seed', min: 1, max: 999, step: 1, value: this.seed, format: (v) => v.toFixed(0), onChange: () => this.markDirty() });
     this.fateLine = u.readout('Fate');
     this.rerunBtn = u.button({ label: 'Re-run simulation', primary: true, onClick: () => this.rerun() });
@@ -563,10 +563,21 @@ class CosmicWebExperience implements Experience {
     if (this.u >= this.tl.uToday - 1e-4) this.reachedToday = true;
     else this.reachedToday = false;
     this.introDone = this.u > this.tl.uIC;
+    this.readoutClock = 0;
+  }
+
+  /**
+   * Orbit distance of the overview. In physical coordinates the camera holds a fixed physical
+   * distance (sized for the box at a ≈ 1.6), so the growth of the box itself is the expansion.
+   */
+  private volumeDistance(): number {
+    const Lc = (this.info?.box ?? this.box) / this.cosmo.h;
+    return this.coords === 'physical' ? 3.4 * Lc : 2.05 * Lc;
   }
 
   private setCoords(c: 'comoving' | 'physical'): void {
     this.coords = c;
+    if (this.view === 'volume') this.orbit.flyTo({ distance: this.volumeDistance() }, 2.2);
     this.ctx.ui.toast(c === 'physical' ? 'Physical coordinates — watch space itself expand' : 'Comoving coordinates — the expansion factored out', 2600);
   }
 
@@ -612,13 +623,13 @@ class CosmicWebExperience implements Experience {
         case 'volume':
           this.state.wrap = false;
           this.state.slab = null;
-          o.flyTo({ target: new THREE.Vector3(), distance: 2.05 * L, pitch: 0.36 }, 2.6);
+          o.flyTo({ target: new THREE.Vector3(), distance: this.volumeDistance(), pitch: 0.36 }, 2.6);
           o.autoRotate = 0.028;
           break;
         case 'slice':
           this.state.wrap = false;
-          this.state.slab = { axis: this.slabAxis, center: 0.5, half: 0.035 };
-          o.flyTo({ target: new THREE.Vector3(), distance: 1.28 * L, pitch: Math.PI / 2 - 0.02, yaw: 0 }, 2.6);
+          this.state.slab = { axis: this.slabAxis, center: 0.5, half: 0.06 };
+          o.flyTo({ target: new THREE.Vector3(), distance: 1.12 * L, pitch: Math.PI / 2 - 0.02, yaw: 0 }, 2.6);
           o.autoRotate = 0.012;
           break;
         case 'inside':
@@ -630,7 +641,7 @@ class CosmicWebExperience implements Experience {
           if (halos && halos.count > 0) {
             const k = id === 'cluster' ? 0 : Math.min(halos.count - 1, 2);
             this.haloWorld(halos, k, target);
-            if (id === 'cluster') dist = Math.max(4, (halos.r200[0] / 1000) * 14);
+            if (id === 'cluster') dist = Math.max(0.1 * L, (halos.r200[0] / 1000) * 25);
           }
           o.flyTo({ target, distance: dist, pitch: 0.25 }, 3);
           o.autoRotate = id === 'cluster' ? 0.06 : 0.035;
@@ -783,7 +794,9 @@ class CosmicWebExperience implements Experience {
       rows: [
         ['Mass', fmtMass(m)],
         ['Virial radius R₂₀₀', rTxt],
-        ['Velocity dispersion', `${formatNumber(h.sigma[i], 3)}${THIN}km/s`],
+        // The particle-mesh force is softened on the mesh scale (≳ R₂₀₀), which puffs halos up and
+        // under-reports their internal motions; quote the virial (isothermal-sphere) value σ = V₂₀₀/√2.
+        ['Velocity dispersion', `${formatNumber(vc / Math.SQRT2, 3)}${THIN}km/s`],
         ['Circular velocity V₂₀₀', `${formatNumber(vc, 3)}${THIN}km/s`],
         ['Galaxies (resolved)', String(h.ngal[i])],
         ['Simulation particles', h.npart[i].toLocaleString('en-US')],
@@ -859,11 +872,18 @@ class CosmicWebExperience implements Experience {
     const T = 2.7255 / a;
     const glow = fireballRadiance(T);
     // Soft-capped so the 4000 K fireball stays a deep, saturated orange on screen.
-    const glowShown = 0.5 * (1 - Math.exp(-glow / 0.5));
+    const glowShown = 0.2 * (1 - Math.exp(-glow / 0.2));
     st.cmb = glow > 1e-5 && !e.recollapses ? { T, radiance: glowShown, aniso: z < 1090 ? 0.02 : 0 } : glow > 1e-5 ? { T, radiance: glowShown, aniso: z < 1090 && t < e.tTurn ? 0.02 : 0 } : null;
     const lz = Math.log(1 + Math.max(z, 0));
-    const dmIn = 1 - smooth(Math.log(40), Math.log(260), lz);
+    const dmIn = 1 - smooth(Math.log(40), Math.log(420), lz);
+    // Up close (immersive views) the smoothed dark matter becomes a soft glow and the galaxies —
+    // the only things a telescope would actually see — carry the scene.
+    const immersive = st.wrap;
     st.darkMatter = dmIn * this.viewFade;
+    if (this.web) {
+      this.web.look.bright = immersive ? 0.16 : 0.3;
+      this.web.look.galaxy = immersive ? 2e-3 : 3.5e-4;
+    }
     // Galaxies: the first sparks after z ≈ 25, brightest near cosmic noon.
     const sfr = cosmicSFRD(Math.max(0, z)) / cosmicSFRD(0);
     st.sfrBoost = Math.min(4, 0.6 * (sfr - 1));
@@ -871,9 +891,11 @@ class CosmicWebExperience implements Experience {
     const gOn = this.galaxiesOn ? 1 : 0;
     st.galaxies = gOn * this.viewFade;
     st.fieldGalaxies = gOn * this.viewFade * (1 - smooth(Math.log(26), Math.log(40), lz));
-    st.replicas = this.replicasOn || (this.coords === 'physical' && this.view === 'volume') ? 0.55 : 0;
-    st.outline = this.outlineOn ? this.viewFade : 0;
-    st.exposure = this.brightness;
+    st.replicas = this.replicasOn || (this.coords === 'physical' && this.view === 'volume') ? 0.09 : 0;
+    st.outline = this.outlineOn && !st.slab ? this.viewFade * (1 - Math.min(1, glow * 20)) : 0;
+    // Gentle eye adaptation: the young, smooth web is dimmer (emission ∝ ρ², so it brightens as it
+    // clumps); open the aperture a little at high redshift so early filaments stay readable.
+    st.exposure = this.brightness * THREE.MathUtils.clamp(Math.pow(Math.max(D, 1e-3), -0.45), 1, 2.1);
 
     // Camera.
     const L = this.boxWorld();
@@ -977,7 +999,7 @@ class CosmicWebExperience implements Experience {
     const tToday = e.tToday;
     const frac = t / tToday;
     if (frac <= 1) {
-      const c = cosmicCalendar(frac);
+      const c = cosmicCalendar(Math.min(frac, 1 - 1e-9));
       this.rdCal.set(`${c.month.slice(0, 3)} ${c.day} · ${c.time.slice(0, 5)}`);
     } else {
       const yr = Math.floor(frac);
@@ -995,6 +1017,7 @@ class CosmicWebExperience implements Experience {
     const f = this.frameNear();
     R['Halos found'](f && f.halos.count ? `${f.halos.count.toLocaleString('en-US')} · largest ${fmtMass(f.halos.mass[0])}` : '—');
     this.aPlot.draw(t);
+    this.rdEpoch.set(this.tl!.epochAt(t).kicker.replace(/ ·.*$/, ''));
   }
 
   private updateRings(): void {
@@ -1055,7 +1078,10 @@ class CosmicWebExperience implements Experience {
 
   render(target: THREE.WebGLRenderTarget): void {
     const r = this.ctx.renderer;
-    this.camera.aspect = target.width / target.height;
+    const aspect = target.width / target.height;
+    this.camera.aspect = aspect;
+    // Portrait screens: widen the vertical field so the box still fits across.
+    this.camera.fov = aspect < 1 ? Math.min(82, (2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(25)) / Math.pow(aspect, 0.8)) * 180) / Math.PI) : 50;
     this.camera.updateProjectionMatrix();
     r.setRenderTarget(target);
     const store = this.client.store;
@@ -1139,6 +1165,7 @@ class CosmicWebExperience implements Experience {
 
   coordinates(c: 'comoving' | 'physical'): void {
     this.coords = c;
+    if (this.view === 'volume') this.orbit.set({ distance: this.volumeDistance() });
     this.coordsToggle?.set(c === 'physical');
   }
 
@@ -1153,6 +1180,10 @@ class CosmicWebExperience implements Experience {
       };
       check();
     });
+  }
+
+  tune(p: Record<string, number>): void {
+    this.web?.tune(p);
   }
 
   debugGPU(): Record<string, number> | null {

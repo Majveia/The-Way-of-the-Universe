@@ -5,6 +5,7 @@ import { NOISE_GLSL } from '../../shaders/lib/noise';
 import { BLACKBODY_GLSL } from '../../shaders/lib/blackbody';
 import { Rng } from '../../physics/random';
 import { lineColor, planckRatio555 } from '../../physics/planets-photometry';
+import { blackbodyRGB } from '../../physics/blackbody';
 
 /**
  * A star (planets module): photosphere ray-traced on an exact sphere with
@@ -49,6 +50,7 @@ uniform float uActivity;
 uniform vec4 uSpots[12];    // lat, lon, radius (rad), strength
 uniform int uSpotCount;
 uniform float uPixelAngle;
+uniform float uPixelRadius;
 uniform float uSeed;
 uniform int uDepthMode;
 
@@ -67,7 +69,7 @@ void main() {
   float camDist = length(rv);
   vec3 rd = rv / camDist;
   vec2 hit = raySphere(ro, rd, vec3(0.0), 1.0);
-  if (hit.x > hit.y) discard;
+  if (hit.x > hit.y || uPixelRadius < 1.0) discard;   // sub-pixel: the point sprite takes over
   float t = hit.x >= -camDist ? hit.x : hit.y;
   vec3 p = ro + rd * t;
   vec3 n = normalize(p);
@@ -77,7 +79,8 @@ void main() {
   // Differential rotation (solar: 14.713 − 2.396 sin²φ − 1.787 sin⁴φ °/day), relative to the frame.
   float s2 = sqr(sin(lat));
   float omega = radians(-2.396 * s2 - 1.787 * s2 * s2);
-  float lonR = lon - omega * uTime;
+  // Shear accumulates without bound; spot groups live weeks, so wrap the shear over 60 days.
+  float lonR = lon - omega * mod(uTime, 60.0);
   vec3 q = vec3(cos(lat) * cos(lonR), sin(lat), -cos(lat) * sin(lonR));
   float footprint = (t + camDist) * uPixelAngle;
 
@@ -87,8 +90,9 @@ void main() {
   float gDetail = smoothstep(4.0 / gScale, 0.5 / gScale, footprint);
   if (gDetail > 0.0) {
     float tt = uTime * 144.0;   // ~10-minute granule lifetimes
-    vec2 w1 = worley3(q * gScale + vec3(0.0, 0.0, tt * 0.05));
-    vec2 w2 = worley3(q * gScale * 1.9 + vec3(tt * 0.04, 3.1, 0.0));
+    // Granules live ~10 minutes: sample them unsheared (n), evolving in time.
+    vec2 w1 = worley3(n * gScale + vec3(0.0, 0.0, tt * 0.05));
+    vec2 w2 = worley3(n * gScale * 1.9 + vec3(tt * 0.04, 3.1, 0.0));
     float cell = smoothstep(0.0, 0.35, w1.y - w1.x);
     float fine = smoothstep(0.0, 0.3, w2.y - w2.x);
     dT += gDetail * (0.045 * (cell - 0.55) + 0.02 * (fine - 0.5));
@@ -173,6 +177,30 @@ void main() {
   outColor = vec4(col * uIntensity, 1.0);
 }`;
 
+const STAR_POINT_VERT = /* glsl */ `
+uniform float uWorldRadius;
+uniform float uViewportH;
+uniform vec3 uColor;
+uniform float uIntensity;
+out vec3 vColor;
+void main() {
+  vec4 mv = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+  gl_Position = projectionMatrix * mv;
+  float rpx = uWorldRadius / max(-mv.z, 1e-12) * projectionMatrix[1][1] * 0.5 * uViewportH;
+  float on = (rpx < 1.0 && mv.z < 0.0) ? 1.0 : 0.0;
+  gl_PointSize = on * 5.0;
+  vColor = uColor * uIntensity * (3.14159265 * rpx * rpx) / 3.53 * on;
+}`;
+
+const STAR_POINT_FRAG = /* glsl */ `
+precision highp float;
+in vec3 vColor;
+out vec4 outColor;
+void main() {
+  vec2 q = (gl_PointCoord - 0.5) * 5.0;
+  outColor = vec4(vColor * exp(-dot(q, q) / (2.0 * 0.75 * 0.75)), 1.0);
+}`;
+
 export function createStar(spec: StarSpec): StarRenderer {
   const rng = new Rng(spec.seed * 31 + 5);
   const T = spec.temperatureK;
@@ -207,6 +235,7 @@ export function createStar(spec: StarSpec): StarRenderer {
     uSpots: { value: spots },
     uSpotCount: { value: spots.length },
     uPixelAngle: { value: 1e-3 },
+    uPixelRadius: { value: 1000 },
     uSeed: { value: rng.range(0, 100) },
     uDepthMode: { value: 0 },
   };
@@ -243,6 +272,7 @@ export function createStar(spec: StarSpec): StarRenderer {
   body.add(corona);
 
   const tmpM = new THREE.Matrix4();
+  const tmpP = new THREE.Vector3();
   mesh.onBeforeRender = (renderer, _s, camera) => {
     tmpM.copy(mesh.matrixWorld).invert();
     uniforms.uCamPos.value.setFromMatrixPosition(camera.matrixWorld).applyMatrix4(tmpM);
@@ -250,24 +280,47 @@ export function createStar(spec: StarSpec): StarRenderer {
     const h = rt ? rt.height : renderer.domElement.height;
     const p11 = camera.projectionMatrix.elements[5];
     uniforms.uPixelAngle.value = 2 / (p11 * h);
+    mesh.getWorldPosition(tmpP);
+    const worldR = spec.radius * (object.matrixWorld.getMaxScaleOnAxis() || 1);
+    uniforms.uPixelRadius.value = (worldR / Math.max(tmpP.distanceTo(camera.position), 1e-12)) * p11 * 0.5 * h;
     const caps = renderer.capabilities as unknown as { reverseDepthBuffer?: boolean };
     uniforms.uDepthMode.value = caps.reverseDepthBuffer ? 1 : 0;
   };
 
-  const c = new THREE.Color();
-  {
-    // Starlight colour (luminance 1) from the blackbody at T_eff.
-    const bbTex = new THREE.Color();
-    const r = (x: number) => x;
-    const [cr, cg, cb] = [1, 1, 1].map(r);
-    bbTex.setRGB(cr, cg, cb);
-  }
-  const lightColor = c;
-  import('../../physics/blackbody').then(({ blackbodyRGB }) => {
-    const [r, g, b] = blackbodyRGB(T);
-    const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    lightColor.setRGB(r / y, g / y, b / y, THREE.LinearSRGBColorSpace);
-  }).catch(() => undefined);
+  // Starlight colour (luminance 1) from the blackbody at T_eff.
+  const [br, bg, bb] = blackbodyRGB(T);
+  const by = 0.2126 * br + 0.7152 * bg + 0.0722 * bb;
+  const lightColor = new THREE.Color().setRGB(br / by, bg / by, bb / by, THREE.LinearSRGBColorSpace);
+
+  // Sub-pixel star: a flux-conserving point (disk-averaged radiance × π r², spread over a σ ≈ 0.75 px
+  // Gaussian), so a distant star fades smoothly instead of flickering. Eddington limb darkening makes
+  // the disk average ≈ 0.83 × the centre.
+  const pg = new THREE.BufferGeometry();
+  pg.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3));
+  pg.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1.5);
+  const pointMat = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    vertexShader: STAR_POINT_VERT,
+    fragmentShader: STAR_POINT_FRAG,
+    uniforms: {
+      uWorldRadius: { value: spec.radius },
+      uViewportH: { value: 1080 },
+      uColor: { value: new THREE.Vector3(lightColor.r, lightColor.g, lightColor.b).multiplyScalar(0.83) },
+      uIntensity: uniforms.uIntensity,
+    },
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const point = new THREE.Points(pg, pointMat);
+  point.name = 'star-point';
+  point.frustumCulled = false;
+  point.onBeforeRender = (renderer) => {
+    const rt = renderer.getRenderTarget();
+    pointMat.uniforms.uViewportH.value = rt ? rt.height : renderer.domElement.height;
+    pointMat.uniforms.uWorldRadius.value = spec.radius * (object.matrixWorld.getMaxScaleOnAxis() || 1);
+  };
+  object.add(point);
 
   return {
     object,
@@ -288,6 +341,8 @@ export function createStar(spec: StarSpec): StarRenderer {
       mat.dispose();
       quad.dispose();
       coronaMat.dispose();
+      pg.dispose();
+      pointMat.dispose();
     },
   };
 }

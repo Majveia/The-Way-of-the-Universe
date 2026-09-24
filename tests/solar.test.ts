@@ -379,3 +379,113 @@ describe('resonances and small-body populations', () => {
     expect(quad / close).toBeGreaterThan(0.75);
   });
 });
+
+// ————————————————————————————————————————————————————————————————— comets
+import { COMETS } from '../src/worlds/solar/data/small';
+import {
+  cometActivity,
+  dustGrainPosition,
+  ionTailAxis,
+  ionPosition,
+  computeTailGrid,
+  makeTailGrid,
+  tailAges,
+  dustBetas,
+  betaForGrain,
+  KMS_TO_AUD,
+} from '../src/worlds/solar/comets';
+
+describe('comets (Finson–Probstein dust, solar-wind ions)', () => {
+  const halley = COMETS.find((c) => c.id === 'halley')!;
+  const el = (halley.orbit as { type: 'conic'; el: import('../src/worlds/solar/ephem/conic').ConicElements }).el;
+  const jd = el.tp + 10; // ten days after perihelion, 1986
+
+  it('β = 0 grains stay with the nucleus; β > 0 grains trail anti-sunward and behind the motion', () => {
+    const n = conicState(el, jd, new THREE.Vector3(), new THREE.Vector3());
+    const v = new THREE.Vector3();
+    conicState(el, jd, new THREE.Vector3(), v);
+    const g0 = dustGrainPosition(el, jd, 0, 12, new THREE.Vector3());
+    expect(g0.distanceTo(n)).toBeLessThan(1e-9);
+    const g = dustGrainPosition(el, jd, 0.5, 12, new THREE.Vector3()).sub(n);
+    const rhat = n.clone().normalize();
+    expect(g.dot(rhat)).toBeGreaterThan(0); // away from the Sun
+    expect(g.dot(v.clone().normalize())).toBeLessThan(0); // lagging the nucleus: the tail curves
+    // Larger β → pushed further out (monotonic syndynes at fixed age).
+    const g2 = dustGrainPosition(el, jd, 0.9, 12, new THREE.Vector3()).sub(n);
+    expect(g2.length()).toBeGreaterThan(g.length());
+  });
+
+  it('small-offset limit: radiation pressure displaces a grain by ½ β g τ² (anti-sunward)', () => {
+    const n = conicState(el, jd, new THREE.Vector3());
+    const tau = 0.25; // days — short enough for the constant-acceleration limit
+    const beta = 0.3;
+    const g = dustGrainPosition(el, jd, beta, tau, new THREE.Vector3()).sub(n);
+    const r = n.length();
+    const expected = 0.5 * beta * (el.mu / (r * r)) * tau * tau;
+    expect(Math.abs(g.length() / expected - 1)).toBeLessThan(0.02); // higher-order (tidal) terms ≲ 1 %
+    expect(g.clone().normalize().dot(n.clone().normalize())).toBeGreaterThan(0.99);
+  });
+
+  it('grid equals the direct solutions', () => {
+    const ages = tailAges(6, 30);
+    const betas = dustBetas(4);
+    const ionAges = tailAges(5, 2.6);
+    const grid = makeTailGrid(6, 4, 5);
+    computeTailGrid(el, jd, ages, betas, ionAges, grid);
+    const n = conicState(el, jd, new THREE.Vector3());
+    const p = new THREE.Vector3();
+    for (const [i, j] of [[2, 1], [5, 3]]) {
+      dustGrainPosition(el, jd, betas[j], ages[i], p).sub(n);
+      const k = (i * 4 + j) * 3;
+      expect(Math.hypot(grid.dust[k] - p.x, grid.dust[k + 1] - p.y, grid.dust[k + 2] - p.z)).toBeLessThan(1e-6);
+    }
+    ionPosition(el, jd, ionAges[4], p).sub(n);
+    expect(Math.hypot(grid.ion[12] - p.x, grid.ion[13] - p.y, grid.ion[14] - p.z)).toBeLessThan(1e-6);
+  });
+
+  it('ion tail is aberrated by tan ψ = v⊥ / u_sw', () => {
+    const r = new THREE.Vector3(1, 0, 0);
+    const v = new THREE.Vector3(0, 30 * KMS_TO_AUD, 0); // 30 km/s across the solar wind
+    const axis = new THREE.Vector3();
+    const psi = ionTailAxis(r, v, axis, 400);
+    expect((psi * 180) / Math.PI).toBeCloseTo((Math.atan(30 / 400) * 180) / Math.PI, 4);
+    expect(axis.y).toBeLessThan(0); // tail swept back, opposite the motion
+  });
+
+  it('activity follows the SBDB magnitude law and switches off beyond rCut', () => {
+    const c = halley.comet!;
+    expect(cometActivity(c, 1, 1)).toBeCloseTo(1, 6); // normalised: Halley at 1 AU
+    // One magnitude law: ratio between 0.6 AU and 1 AU = 10^(0.4 K1 log(1/0.6)).
+    expect(cometActivity(c, 0.6, 1) / cometActivity(c, 1, 1)).toBeCloseTo(Math.pow(10, 0.4 * c.K1 * Math.log10(1 / 0.6)), 4);
+    expect(cometActivity(c, c.rCut * 1.01)).toBe(0);
+    expect(betaForGrain(1, 1)).toBeCloseTo(0.57, 6);
+  });
+});
+
+describe('curated views', () => {
+  it('Earthrise 1968: Earth clears the lunar limb, inside the frame, and is gibbous-to-half lit', async () => {
+    const { EVENTS } = await import('../src/experiences/solar/views');
+    const ev = EVENTS.find((e) => e.id === 'earthrise')!;
+    const m = new SolarSystemModel();
+    m.update(utcToTT(ev.jdUTC!));
+    const t = ev.view(m);
+    const moon = m.get('moon')!;
+    const earth = m.get('earth')!;
+    const look = moon.position.clone().add(t.target!);
+    const dir = V(Math.cos(t.pitch) * Math.sin(t.yaw), Math.sin(t.pitch), Math.cos(t.pitch) * Math.cos(t.yaw));
+    const cam = look.clone().addScaledVector(dir, t.distance);
+    const toEarth = earth.position.clone().sub(cam);
+    const toMoon = moon.position.clone().sub(cam);
+    const limb = Math.asin(moon.radius / toMoon.length());
+    // Earth's centre is beyond the Moon's limb (by more than its own angular radius).
+    expect(toEarth.angleTo(toMoon) - limb).toBeGreaterThan(Math.asin(earth.radius / toEarth.length()));
+    // …and within the vertical field of view around the line of sight.
+    const fwd = dir.clone().negate();
+    expect((toEarth.angleTo(fwd) * 180) / Math.PI).toBeLessThan((t.fov ?? 50) / 2);
+    // Phase of Earth seen from the Moon (Sun–Earth–camera angle): lit fraction (1 + cos α) / 2.
+    const alpha = earth.position.clone().negate().angleTo(cam.clone().sub(earth.position));
+    const lit = (1 + Math.cos(alpha)) / 2;
+    expect(lit).toBeGreaterThan(0.3);
+    expect(lit).toBeLessThan(0.9);
+  });
+});

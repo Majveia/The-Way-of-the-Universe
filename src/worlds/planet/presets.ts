@@ -47,7 +47,7 @@ export const PLANET_PRESETS = {
     seed: 8,
   },
   titan: { kind: 'ice', radiusKm: 2574.7, atmosphere: { preset: 'titan' }, color: [0.8, 0.62, 0.4], seed: 9 },
-  io: { kind: 'lava', radiusKm: 1821.6, temperatureK: 130, lavaTemperatureK: 1500, color: [1.4, 1.25, 0.6], seed: 10, atmosphere: null },
+  io: { kind: 'lava', radiusKm: 1821.6, temperatureK: 130, lavaTemperatureK: 1500, seed: 10, atmosphere: null },
   europa: { kind: 'ice', radiusKm: 1560.8, seed: 12, atmosphere: null },
   // Archetypes for Possible Worlds.
   'terran': { kind: 'terrestrial', radiusKm: 6800, clouds: 0.6, cityLights: 0.7, oceanFraction: 0.64, atmosphere: {}, seed: 21 },

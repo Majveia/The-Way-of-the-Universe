@@ -16,20 +16,20 @@ export interface LabelItem {
 
 const css = `
 .vy-label { position:absolute; left:0; top:0; white-space:nowrap; pointer-events:none; will-change:transform;
-  font: 400 10.5px/1.2 var(--font-ui); letter-spacing:.08em; color: var(--ink-2); transition: opacity .4s var(--ease); }
+  font: 400 10.5px/1.2 var(--font-ui); letter-spacing:.08em; color: var(--ink-2); text-shadow: 0 0 4px #000, 0 0 10px rgba(0,0,0,.8); transition: opacity .4s var(--ease); }
 .vy-label b { font-weight:400; color: var(--ink); }
 .vy-label i { font-style:normal; font-family: var(--font-mono); font-size:9.5px; color: var(--ink-3); margin-left:.5em; }
 .vy-label.cool b { color: var(--cool); }
 .vy-reticle { position:absolute; left:0; top:0; pointer-events:none; will-change:transform; transition: opacity .5s var(--ease); }
 .vy-reticle svg { display:block; overflow:visible; }
-.vy-reticle .vy-rt { position:absolute; left: 22px; top: -9px; white-space:nowrap; font: 400 11px/1.35 var(--font-ui); letter-spacing:.1em; color: var(--accent); }
+.vy-reticle .vy-rt { position:absolute; left: 22px; top: -9px; white-space:nowrap; font: 400 11px/1.35 var(--font-ui); letter-spacing:.1em; color: var(--accent); text-shadow: 0 0 4px #000, 0 0 12px #000, 0 0 20px rgba(0,0,0,.8); }
 .vy-reticle .vy-rt span { display:block; font-family: var(--font-mono); font-size:10px; letter-spacing:.02em; color: var(--ink-2); }
-.vy-flight { min-width: 210px; max-width: 280px; text-align: right; font: 400 11px/1.5 var(--font-ui); color: var(--ink-2); letter-spacing: .04em; }
-.vy-flight .vy-fl-name { font-size: 10px; letter-spacing: .26em; text-transform: uppercase; color: var(--ink-3); }
+.vy-flight { min-width: 210px; max-width: 300px; text-align: right; font: 400 11px/1.5 var(--font-ui); color: var(--ink-2); letter-spacing: .04em; }
+.vy-flight .vy-fl-name { font-size: 11px; letter-spacing: .14em; color: var(--ink-3); }
 .vy-flight .vy-fl-phase { color: var(--ink); font-size: 12.5px; letter-spacing: .03em; }
 .vy-flight .vy-fl-bar { height:1px; background: var(--line-strong); margin: 7px 0 5px; position: relative; overflow: hidden; }
 .vy-flight .vy-fl-bar i { position:absolute; left:0; top:0; bottom:0; background: var(--accent); transform-origin: left center; }
-.vy-flight .vy-fl-eta { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3); }
+.vy-flight .vy-fl-eta { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3); white-space: pre-line; }
 .vy-flight .vy-fl-tag { display:inline-block; margin-top:6px; font-size:9.5px; letter-spacing:.2em; text-transform:uppercase; color: var(--cool); }
 @media (max-width: 720px) { .vy-flight { text-align: left; } }
 `;
@@ -43,6 +43,7 @@ export class Hud {
   private style: HTMLStyleElement;
   private v = new THREE.Vector3();
   private boxes: Array<[number, number, number, number]> = [];
+  private uiBoxes: Array<[number, number, number, number]> = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
   labelsOn = true;
 
   constructor(overlay: HTMLElement, maxLabels = 28) {
@@ -85,6 +86,15 @@ export class Hud {
     // Reserved areas (e.g. the ship), then the reticle.
     this.boxes.length = 0;
     if (reserved) for (const b of reserved) this.boxes.push(b);
+    // Keep star names off the interface chrome: title (top-left), readouts (bottom-left), flight status
+    // (bottom-right) and the top-right toolbar.
+    const ui = this.uiBoxes;
+    const narrow = w < 720;
+    ui[0][2] = narrow ? w : 290; ui[0][3] = 124;
+    ui[1][1] = h - (narrow ? 250 : 150); ui[1][2] = narrow ? w : 300; ui[1][3] = h;
+    ui[2][0] = w - 330; ui[2][1] = h - 130; ui[2][2] = w; ui[2][3] = h;
+    ui[3][0] = w - 240; ui[3][2] = w; ui[3][3] = 60;
+    for (const b of ui) this.boxes.push(b);
     let rp: [number, number] | null = null;
     if (target) rp = this.project(target.dir, camera, w, h);
     if (rp) {
@@ -98,7 +108,7 @@ export class Hud {
 
     let k = 0;
     if (this.labelsOn) {
-      const sorted = [...items].sort((a, b) => b.priority - a.priority);
+      const sorted = (items as LabelItem[]).sort(byPriority);
       for (const it of sorted) {
         if (k >= this.labels.length) break;
         const p = this.project(it.dir, camera, w, h);
@@ -128,3 +138,4 @@ export class Hud {
 }
 
 const _rot = new THREE.Matrix3();
+const byPriority = (a: LabelItem, b: LabelItem): number => b.priority - a.priority;

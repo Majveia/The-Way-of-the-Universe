@@ -269,8 +269,43 @@ export class Panel {
     head.appendChild(close);
     this.content = document.createElement('div');
     this.content.className = 'panel-content';
-    this.el.append(head, this.content);
+    // Bottom-sheet grip (visible on narrow screens): drag down to dismiss.
+    const grip = document.createElement('div');
+    grip.className = 'panel-grip';
+    grip.setAttribute('aria-hidden', 'true');
+    this.el.append(grip, head, this.content);
     parent.appendChild(this.el);
+    this.bindSheetDrag(grip);
+    this.bindSheetDrag(head);
+  }
+
+  private bindSheetDrag(handle: HTMLElement): void {
+    let y0 = 0;
+    let dy = 0;
+    let id = -1;
+    const sheet = () => window.matchMedia?.('(max-width: 720px)').matches ?? false;
+    handle.addEventListener('pointerdown', (e) => {
+      if (!sheet() || (e.target as HTMLElement).closest('button')) return;
+      id = e.pointerId;
+      y0 = e.clientY;
+      dy = 0;
+      handle.setPointerCapture(id);
+      this.el.classList.add('is-dragging');
+    });
+    handle.addEventListener('pointermove', (e) => {
+      if (e.pointerId !== id) return;
+      dy = Math.max(0, e.clientY - y0);
+      this.el.style.transform = `translateY(${dy}px)`;
+    });
+    const end = (e: PointerEvent) => {
+      if (e.pointerId !== id) return;
+      id = -1;
+      this.el.classList.remove('is-dragging');
+      this.el.style.transform = '';
+      if (dy > Math.min(120, this.el.offsetHeight * 0.25)) this.setOpen(false);
+    };
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
   }
 
   get isEmpty(): boolean {

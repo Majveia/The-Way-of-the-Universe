@@ -182,3 +182,157 @@ describe('expansion and pulsar', () => {
     expect(pulsarExposure(0.2 * P, 1e-4)).toBeLessThan(0.05);
   });
 });
+
+// ——— Catalogue, layouts and stellar populations ————————————————————————————————————
+
+import { PRESETS, VARIANTS, blackbodyQ, DEFAULT_VARIANT } from '../src/worlds/nebula/presets';
+import { buildLayout } from '../src/worlds/nebula/layouts';
+import { absoluteMagnitude, msLuminosity, msTemperature, plummerPoint, sampleKroupa } from '../src/worlds/nebula/stars';
+import { Rng } from '../src/physics/random';
+
+describe('nebula catalogue', () => {
+  it('has every spec type, a default view and an info card for each object', () => {
+    expect(new Set(VARIANTS)).toEqual(new Set(Object.keys(PRESETS)));
+    for (const t of ['emission', 'planetary', 'remnant', 'dark', 'reflection'] as const) expect(PRESETS[DEFAULT_VARIANT[t]].type).toBe(t);
+    for (const v of VARIANTS) {
+      const p = PRESETS[v];
+      expect(p.views.default).toBeDefined();
+      expect(p.info.rows.length).toBeGreaterThanOrEqual(4);
+      expect(p.gain).toBeGreaterThan(0);
+      expect(p.half).toBeGreaterThan(0);
+    }
+  });
+
+  it('planetary-nebula nuclei: blackbody Q from (T, L) — M57 ≈ 10^46 photons/s, hotter → more per watt', () => {
+    const q = blackbodyQ(125000, 200);
+    expect(Math.log10(q)).toBeGreaterThan(45.9);
+    expect(Math.log10(q)).toBeLessThan(46.6);
+    // Photons per unit luminosity fall as the mean photon energy (∝ T) rises.
+    const r = blackbodyQ(220000, 1) / blackbodyQ(110000, 1);
+    expect(r).toBeGreaterThan(0.5);
+    expect(r).toBeLessThan(0.7);
+  });
+
+  it('kinematic ages of the expanding presets agree with their quoted ages to within a factor ~2', () => {
+    for (const v of ['ring', 'helix', 'butterfly', 'crab'] as const) {
+      const p = PRESETS[v];
+      const age = kinematicAgeYears(p.shellRadius, p.expansionKmS);
+      expect(age / p.ageYears).toBeGreaterThan(0.5);
+      expect(age / p.ageYears).toBeLessThan(2);
+    }
+    // Veil: Sedov–Taylor, v = (2/5) R / t.
+    const veil = PRESETS.veil;
+    const vST = (0.4 * veil.shellRadius * 3.0857e13) / (veil.ageYears * 3.15576e7);
+    expect(vST / veil.expansionKmS).toBeGreaterThan(0.8);
+    expect(vST / veil.expansionKmS).toBeLessThan(1.25);
+  });
+
+  it('M57: the main ring sits near the Strömgren radius of its nucleus', () => {
+    const rs = stromgrenRadiusPc(PRESETS.ring.source.Q, 600);
+    expect(rs).toBeGreaterThan(0.06);
+    expect(rs).toBeLessThan(0.2);
+  });
+});
+
+describe('layouts', () => {
+  it('are deterministic per seed and differ between seeds', () => {
+    for (const v of VARIANTS) {
+      const a = buildLayout(PRESETS[v], 3);
+      const b = buildLayout(PRESETS[v], 3);
+      expect(a.stars.map((s) => s.pos)).toEqual(b.stars.map((s) => s.pos));
+      expect(a.seedOffset).toEqual(b.seedOffset);
+      const c = buildLayout(PRESETS[v], 4);
+      expect(c.seedOffset).not.toEqual(a.seedOffset);
+    }
+  });
+
+  it('pillars point at the ionizing cluster (photoevaporation shapes them radially)', () => {
+    const L = buildLayout(PRESETS.pillars, 0);
+    const A = L.densityUniforms.uPillarA.value as Array<{ x: number; y: number; z: number }>;
+    const B = L.densityUniforms.uPillarB.value as Array<{ x: number; y: number; z: number }>;
+    const n = L.densityUniforms.uPillarCount.value as number;
+    for (let i = 0; i < n; i++) {
+      const d = [L.source[0] - A[i].x, L.source[1] - A[i].y, L.source[2] - A[i].z];
+      const len = Math.hypot(d[0], d[1], d[2]);
+      const cos = (d[0] * B[i].x + d[1] * B[i].y + d[2] * B[i].z) / len;
+      expect(cos).toBeGreaterThan(0.97);
+    }
+  });
+
+  it('the Pleiades keep their real on-sky pattern: Alcyone brightest, Electra ≈ 1.4 pc west', () => {
+    const L = buildLayout(PRESETS.pleiades, 0);
+    const alc = L.stars[0];
+    const ele = L.stars[2];
+    expect(Math.min(...L.stars.map((s) => s.mv))).toBe(alc.mv);
+    expect(ele.pos[0] - alc.pos[0]).toBeCloseTo(1.41, 1);
+    expect(L.scatter.length).toBe(7);
+  });
+
+  it('the Crab carries a pulsar; planetary nebulae a hot nucleus at the centre', () => {
+    expect(buildLayout(PRESETS.crab, 0).stars.some((s) => s.kind === 'pulsar')).toBe(true);
+    for (const v of ['ring', 'helix', 'butterfly'] as const) {
+      const s = buildLayout(PRESETS[v], 0).stars[0];
+      expect(s.pos).toEqual([0, 0, 0]);
+      expect(s.teff).toBeGreaterThan(9e4);
+    }
+  });
+});
+
+describe('stellar populations', () => {
+  it('Kroupa IMF: median mass of 0.1–60 M☉ draws is ≈ 0.3 M☉ and O stars are rare', () => {
+    const rng = new Rng(5);
+    const m = Array.from({ length: 20000 }, () => sampleKroupa(rng, 0.1, 60)).sort((a, b) => a - b);
+    const median = m[m.length >> 1];
+    expect(median).toBeGreaterThan(0.2);
+    expect(median).toBeLessThan(0.4);
+    const massive = m.filter((x) => x > 15).length / m.length;
+    expect(massive).toBeGreaterThan(0.0005);
+    expect(massive).toBeLessThan(0.01);
+  });
+
+  it('Plummer sphere truncated at 5a: half the stars inside 1.24 a (1.305 a untruncated)', () => {
+    const rng = new Rng(9);
+    const r = Array.from({ length: 20000 }, () => Math.hypot(...plummerPoint(rng, 1))).sort((a, b) => a - b);
+    // M(<r) = r³/(r²+a²)^{3/2}; truncation keeps (25/26)^{3/2} of the mass → median at M = 0.4715.
+    const Mh = 0.5 * Math.pow(25 / 26, 1.5);
+    expect(r[r.length >> 1]).toBeCloseTo(1 / Math.sqrt(Math.pow(Mh, -2 / 3) - 1), 1);
+  });
+
+  it('main sequence: the Sun comes out as a G dwarf of M_V ≈ 4.8', () => {
+    expect(msLuminosity(1)).toBeCloseTo(1, 6);
+    expect(msTemperature(1)).toBeCloseTo(5772, -1);
+    expect(absoluteMagnitude(1, 5772)).toBeCloseTo(4.83, 2);
+    expect(msTemperature(20)).toBeGreaterThan(30000);
+  });
+});
+
+describe('optical depths that set the look', () => {
+  // The GLSL generators are not runnable here; these pin the densities they use (density.ts).
+  it('the Horsehead (n ≈ 2 × 10⁴ cm⁻³ over ≈ 0.5 pc) is opaque: A_V > 10 mag — a silhouette', () => {
+    const tau = tauVPerPc(2e4, PRESETS.horsehead.dustToGas) * 0.5;
+    expect(tau / 0.921).toBeGreaterThan(10);
+  });
+
+  it('the Pleiades veil (≈ 20–60 cm⁻³ over ≈ 2 pc) is thin: A_V well below 1 mag toward the stars', () => {
+    const av = (tauVPerPc(45, PRESETS.pleiades.dustToGas) * 2) / 0.921;
+    expect(av).toBeGreaterThan(0.05);
+    expect(av).toBeLessThan(0.6);
+  });
+
+  it('the Butterfly torus is resolved by the lighting bake (≥ 4 voxels at the default tier)', () => {
+    const L = buildLayout(PRESETS.butterfly, 0);
+    const shape = L.densityUniforms.uShape.value as { w: number };
+    const voxel = (2 * PRESETS.butterfly.half) / 128;
+    expect(shape.w / voxel).toBeGreaterThanOrEqual(4);
+  });
+
+  it('reflection nebulae are metered darker than emission nebulae so their stars stay visible', () => {
+    expect(PRESETS.pleiades.meter ?? 1.6).toBeLessThan(PRESETS.pillars.meter ?? 1.6);
+  });
+
+  it('σ Ori sits above B33 (it lights the crest, not the face we see)', () => {
+    const src = PRESETS.horsehead.source.pos;
+    expect(src[1]).toBeGreaterThan(3);
+    expect(src[2]).toBeLessThan(0.35); // no nearer to us than the horse (z = 0.35)
+  });
+});

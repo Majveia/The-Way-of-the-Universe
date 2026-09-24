@@ -4,7 +4,8 @@ import { bulkWindow, CENTER_TAU, type Diagnostics } from './cpu';
 import { sphereScale, SMOOTH_EPS, type SmoothModel } from './galaxy';
 import { applyDiskMoments, DISK_REFIT_TAU, MOMENT_HARD, MOMENT_SIGMA, type DiskMoments } from './moments';
 import { SKELETON_WIDTH, TRACER_WIDTH, type ScenarioData } from './scenario';
-import { COPY2_FRAG, DIAG_FRAG, FORCE_FRAG, K_FRAG, KD_FRAG, MOMENTS_FRAG, TRACER_FRAG, TRACK_FRAG } from './shaders';
+import { COPY2_FRAG, DEPOSIT_FRAG, DEPOSIT_VERT, DIAG_FRAG, FORCE_FRAG, SFR_FRAG, K_FRAG, KD_FRAG, MOMENTS_FRAG, TRACER_FRAG, TRACK_FRAG } from './shaders';
+import { SF_EFFICIENCY, SF_GRID_N } from './starformation';
 import { G_SIM } from './units';
 
 /**
@@ -15,16 +16,31 @@ import { G_SIM } from './units';
  *   FORCE  skeleton  direct N² Plummer-softened gravity + potential  (acc)
  *   K      skeleton  v += ½a dt                                      (MRT: pos, vel)
  *   TRACK  1×2       filtered galaxy centres (bulk motion of each skeleton)
- *   TRACER tracers   K leapfrog sub-steps in the smooth field          (MRT: pos, vel)
+ *   GRID   gas       deposit gas parcels into two 64³ density grids     (additive points)
+ *   TRACER tracers   K leapfrog sub-steps in the smooth field;
+ *                    gas parcels roll for star formation (Schmidt law)  (MRT: pos, vel)
  * Occasional reductions (energy, momentum; disk moments) are read back asynchronously.
  *
  * Reusable: any scene can build a ScenarioData, step it, and read `tracerPosition` etc.
  */
+/** Pure additive accumulation (three's AdditiveBlending multiplies by source alpha). */
+export const ADD_ONE_ONE = {
+  blending: THREE.CustomBlending,
+  blendEquation: THREE.AddEquation,
+  blendSrc: THREE.OneFactor,
+  blendDst: THREE.OneFactor,
+  blendEquationAlpha: THREE.AddEquation,
+  blendSrcAlpha: THREE.OneFactor,
+  blendDstAlpha: THREE.OneFactor,
+} as const;
+
 export interface NBodyOptions {
   /** Skeleton time step in Myr (default 1). */
   dt?: number;
   /** Tracer sub-steps per skeleton step (default 4). */
   substeps?: number;
+  /** Density-triggered star formation in the gas tracers (default true). */
+  starFormation?: boolean;
 }
 
 export interface GalaxyState {
@@ -91,10 +107,24 @@ export class NBodySystem {
   private diagRT: THREE.WebGLRenderTarget;
   private momRT: THREE.WebGLRenderTarget;
   private attr: THREE.DataTexture;
+  /** Gas density grids (two 64³ atlases side by side) for star formation. */
+  private gridRT: THREE.WebGLRenderTarget;
+  private gridScene = new THREE.Scene();
+  private gridCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private gridGeoms: THREE.BufferGeometry[] = [];
+  /** Density-triggered star formation on/off. */
+  starFormation: boolean;
   private mats: Record<string, THREE.ShaderMaterial> = {};
-  private pending = { diag: false, mom: false, model: false };
+  private pending = { diag: false, mom: false, model: false, sfr: false };
   /** Frame-ish counters of how long each async read has been outstanding. */
-  private waited = { diag: 0, mom: 0, model: 0 };
+  private waited = { diag: 0, mom: 0, model: 0, sfr: 0 };
+  private sfrRT: THREE.WebGLRenderTarget;
+  /**
+   * Star-formation rate (M☉/yr) averaged over the last `sfrWindow` Myr, per galaxy's gas
+   * (by origin) and in total; null until the first read-back.
+   */
+  starFormationRate: { total: number; perGalaxy: [number, number]; time: number } | null = null;
+  sfrWindow = 10;
   /**
    * Some drivers (notably software rasterisers) signal fences very late; after one read has waited
    * too long, fall back to synchronous reads of these tiny textures.
@@ -108,6 +138,7 @@ export class NBodySystem {
     diag0: new Float32Array(0),
     diag1: new Float32Array(0),
     mom: [new Float32Array(0), new Float32Array(0), new Float32Array(0)],
+    sfr: new Float32Array(0),
     model: [new Float32Array(8), new Float32Array(8), new Float32Array(8)],
   };
 
@@ -128,10 +159,22 @@ export class NBodySystem {
     this.mB = floatTarget(1, 2, 4);
     this.diagRT = floatTarget(1, this.sH, 2);
     this.momRT = floatTarget(1, this.tH, 3);
+    this.sfrRT = floatTarget(1, this.tH, 1);
     this.attr = dataTexture(T.attr, TRACER_WIDTH, this.tH);
+    this.starFormation = opts.starFormation ?? true;
+    this.gridRT = new THREE.WebGLRenderTarget(SF_GRID_N * 16, SF_GRID_N * 8, {
+      type: THREE.HalfFloatType,
+      format: THREE.RGBAFormat,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+      generateMipmaps: false,
+    });
     this.scratch.diag0 = new Float32Array(this.sH * 4);
     this.scratch.diag1 = new Float32Array(this.sH * 4);
     this.scratch.mom = [0, 1, 2].map(() => new Float32Array(this.tH * 4));
+    this.scratch.sfr = new Float32Array(this.tH * 4);
     this.models = data.galaxies.map((g) => structuredClone(g.model));
     this.spins = data.galaxies.map((g) => [...g.spin]);
     this.galaxies = data.galaxies.map((g) => ({
@@ -193,6 +236,11 @@ export class NBodySystem {
       tVel: { value: null },
       tM0: { value: null },
       tM3: { value: null },
+      tAttr: { value: this.attr },
+      tGrid: { value: this.gridRT.texture },
+      uTime: { value: 0 },
+      uStep: { value: 0 },
+      uSfOn: { value: 1 },
       uDt: dtU,
       uK: { value: this.substeps },
       uHalo: { value: [new THREE.Vector4(), new THREE.Vector4()] },
@@ -201,6 +249,14 @@ export class NBodySystem {
       uMnA: { value: [new THREE.Vector4(), new THREE.Vector4()] },
       uMnM: { value: [new THREE.Vector4(), new THREE.Vector4()] },
       uSpin: { value: [new THREE.Vector4(), new THREE.Vector4()] },
+    });
+    this.material('sfr', SFR_FRAG, {
+      tPos: { value: null },
+      tAttr: { value: this.attr },
+      uTime: { value: 0 },
+      uWindow: { value: 10 },
+      uWidth: { value: TRACER_WIDTH },
+      uSplitRow: { value: this.data.galaxies[1].tracerRows[0] },
     });
     this.material('diag', DIAG_FRAG, { tPos: { value: null }, tVel: { value: null }, tAcc: { value: null } });
     this.material('moments', MOMENTS_FRAG, {
@@ -214,8 +270,49 @@ export class NBodySystem {
       uSig2: { value: this.data.galaxies.map((g) => 2 * (MOMENT_SIGMA * g.spec.disk.scale) ** 2) },
       uWidth: { value: TRACER_WIDTH },
     });
+    // Gas → density grid deposit: one draw per (gas range, grid).
+    for (let g = 0; g < 2; g++) {
+      const dep = new THREE.ShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: DEPOSIT_VERT,
+        fragmentShader: DEPOSIT_FRAG,
+        uniforms: { tPos: { value: null }, tAttr: { value: this.attr }, tM0: { value: null }, uWidth: { value: TRACER_WIDTH }, uGrid: { value: g } },
+        ...ADD_ONE_ONE,
+        depthTest: false,
+        depthWrite: false,
+        transparent: true,
+      });
+      this.mats[`deposit${g}`] = dep;
+      for (const r of this.data.tracers.ranges.gas) {
+        const geo = new THREE.BufferGeometry();
+        geo.setDrawRange(r[0], r[1]);
+        geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e9);
+        this.gridGeoms.push(geo);
+        const pts = new THREE.Points(geo, dep);
+        pts.frustumCulled = false;
+        this.gridScene.add(pts);
+      }
+    }
     this.syncSmoothUniforms();
   }
+
+  /** Deposit the gas parcels into the star-formation grids (centres from the latest track). */
+  private depositGas(): void {
+    const r = this.renderer;
+    for (const g of [0, 1]) {
+      const m = this.mats[`deposit${g}`];
+      m.uniforms.tPos.value = this.tA.textures[0];
+      m.uniforms.tM0.value = this.mA.textures[0];
+    }
+    const prevColor = r.getClearColor(this.tmpColor);
+    const prevAlpha = r.getClearAlpha();
+    r.setClearColor(0x000000, 0);
+    r.setRenderTarget(this.gridRT);
+    r.clear(true, false, false);
+    r.render(this.gridScene, this.gridCam);
+    r.setClearColor(prevColor, prevAlpha);
+  }
+  private tmpColor = new THREE.Color();
 
   /** Push the CPU smooth models (halo, bulge, refit disk, spin) into the tracer shader. */
   syncSmoothUniforms(): void {
@@ -238,7 +335,7 @@ export class NBodySystem {
   }
 
   /** Upload a full state (initial conditions or a snapshot) and re-initialise forces/centres. */
-  upload(sPos: Float32Array, sVel: Float32Array, tPos: Float32Array, tVel: Float32Array, centersKnown?: Float32Array[]): void {
+  upload(sPos: Float32Array, sVel: Float32Array, tPos: Float32Array, tVel: Float32Array): void {
     const r = this.renderer;
     const prev = r.getRenderTarget();
     const tex = [
@@ -255,17 +352,7 @@ export class NBodySystem {
     copy.uniforms.tB.value = tex[3];
     this.pass(copy, this.tA);
     this.computeForces(this.sA);
-    if (centersKnown) {
-      // Restore the filter state exactly (snapshots).
-      const mt = [0, 1, 2, 3].map((k) => dataTexture(centersKnown[k], 1, 2));
-      copy.uniforms.tA.value = mt[0];
-      copy.uniforms.tB.value = mt[1];
-      // MRT copy only handles two attachments: write via track init then overwrite is simpler:
-      this.initTrack();
-      mt.forEach((t) => t.dispose());
-    } else {
-      this.initTrack();
-    }
+    this.initTrack();
     copy.uniforms.tA.value = null;
     copy.uniforms.tB.value = null;
     r.setRenderTarget(prev);
@@ -317,6 +404,11 @@ export class NBodySystem {
       this.bindTrack(track, this.mA);
       this.pass(track, this.mB);
       [this.mA, this.mB] = [this.mB, this.mA];
+      const sf = this.starFormation && this.data.tracers.ranges.gas.some((g) => g[1] > 0);
+      if (sf) this.depositGas();
+      tracer.uniforms.uSfOn.value = sf ? 1 : 0;
+      tracer.uniforms.uTime.value = this.time + this.dt;
+      tracer.uniforms.uStep.value = this.steps;
       tracer.uniforms.tPos.value = this.tA.textures[0];
       tracer.uniforms.tVel.value = this.tA.textures[1];
       tracer.uniforms.tM0.value = this.mA.textures[0];
@@ -359,7 +451,7 @@ export class NBodySystem {
   // ——— Asynchronous reductions ———
 
   /** Read several attachments of a small float target, async when possible. */
-  private read(kind: 'diag' | 'mom' | 'model', rt: THREE.WebGLRenderTarget, w: number, h: number, bufs: Float32Array[]): Promise<Float32Array[]> | null {
+  private read(kind: 'diag' | 'mom' | 'model' | 'sfr', rt: THREE.WebGLRenderTarget, w: number, h: number, bufs: Float32Array[]): Promise<Float32Array[]> | null {
     if (this.pending[kind]) {
       if (++this.waited[kind] > 45) this.syncReads = true;
       return null;
@@ -457,6 +549,32 @@ export class NBodySystem {
       .catch(() => undefined);
   }
 
+  /** Star-formation rate over the last `sfrWindow` Myr (resolves into `starFormationRate`). */
+  requestStarFormationRate(): void {
+    if (this.disposed || this.pending.sfr) {
+      if (this.pending.sfr && ++this.waited.sfr > 45) this.syncReads = true;
+      return;
+    }
+    const m = this.mats.sfr;
+    m.uniforms.tPos.value = this.tA.textures[0];
+    m.uniforms.uTime.value = this.time;
+    m.uniforms.uWindow.value = this.sfrWindow;
+    const prev = this.renderer.getRenderTarget();
+    this.pass(m, this.sfrRT);
+    this.renderer.setRenderTarget(prev);
+    const t = this.time, win = this.sfrWindow;
+    this.read('sfr', this.sfrRT, 1, this.tH, [this.scratch.sfr])
+      ?.then(([b]) => {
+        if (this.disposed) return;
+        const per: [number, number] = [0, 0];
+        for (let row = 0; row < this.tH; row++) per[b[row * 4 + 3] > 0.5 ? 1 : 0] += b[row * 4];
+        // Each burst turns SF_EFFICIENCY of its parcel into stars; 10¹⁰ M☉ per `win` Myr → M☉/yr.
+        const k = (SF_EFFICIENCY * 1e10) / (win * 1e6);
+        this.starFormationRate = { total: (per[0] + per[1]) * k, perGalaxy: [per[0] * k, per[1] * k], time: t };
+      })
+      .catch(() => undefined);
+  }
+
   /** Read the filtered centres/velocities back to the CPU (for cameras, readouts, events). */
   requestGalaxies(): void {
     if (this.disposed) return;
@@ -473,9 +591,50 @@ export class NBodySystem {
       .catch(() => undefined);
   }
 
+  /**
+   * Synchronous read-back of the full tracer state (debugging, snapshots, tests on a real GPU).
+   * Slow (stalls the pipeline): never call per frame.
+   */
+  readTracers(): { pos: Float32Array; vel: Float32Array } {
+    const n = this.data.tracers.n;
+    const pos = new Float32Array(n * 4), vel = new Float32Array(n * 4);
+    this.renderer.readRenderTargetPixels(this.tA, 0, 0, TRACER_WIDTH, this.tH, pos, undefined, 0);
+    this.renderer.readRenderTargetPixels(this.tA, 0, 0, TRACER_WIDTH, this.tH, vel, undefined, 1);
+    return { pos, vel };
+  }
+
+  /** Debug: maximum and total of the gas density grids (10⁶ M☉ per cell). */
+  gridStats(): { max: number; sum: number; cells: number } {
+    const w = this.gridRT.width, h = this.gridRT.height;
+    const buf = new Uint16Array(w * h * 4);
+    this.renderer.readRenderTargetPixels(this.gridRT, 0, 0, w, h, buf);
+    let max = 0, sum = 0, cells = 0;
+    for (let i = 0; i < w * h; i++) {
+      const v = THREE.DataUtils.fromHalfFloat(buf[i * 4]);
+      if (v > 0) cells++;
+      sum += v;
+      max = Math.max(max, v);
+    }
+    return { max, sum, cells };
+  }
+
+  /** Star-formation statistics: gas parcels with a burst in the last `window` Myr. */
+  starFormationStats(window = 10): { recent: number; gas: number; ratePerMyr: number } {
+    const { pos } = this.readTracers();
+    let recent = 0, gas = 0;
+    for (const [s, c] of this.data.tracers.ranges.gas) {
+      for (let i = s; i < s + c; i++) {
+        gas++;
+        if (this.time - pos[i * 4 + 3] < window) recent++;
+      }
+    }
+    return { recent, gas, ratePerMyr: recent / window };
+  }
+
   dispose(): void {
     this.disposed = true;
-    for (const rt of [this.sA, this.sB, this.sAcc, this.tA, this.tB, this.mA, this.mB, this.diagRT, this.momRT]) rt.dispose();
+    for (const rt of [this.sA, this.sB, this.sAcc, this.tA, this.tB, this.mA, this.mB, this.diagRT, this.momRT, this.gridRT, this.sfrRT]) rt.dispose();
+    for (const g of this.gridGeoms) g.dispose();
     this.attr.dispose();
     for (const m of Object.values(this.mats)) m.dispose();
   }

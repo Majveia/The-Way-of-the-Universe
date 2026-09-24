@@ -189,3 +189,80 @@ export function sampleClusterRadius(u: number, concentration: number): number {
   const q = Math.pow(Math.max(m, 1e-12), -2 / 3) - 1;
   return q > 0 ? 1 / Math.sqrt(q) : concentration;
 }
+
+// ——— Visual (photopic) luminosity ——————————————————————————————————————————
+
+/**
+ * Luminous efficacy of a blackbody relative to the Sun: η(T)/η(T☉) with
+ * η = ∫B_λ(T) V(λ) dλ / ∫B_λ(T) dλ (V = CIE 1931 photopic curve). Converts bolometric
+ * luminosity into the light the eye sees: a 35 000 K O star emits only 6% as much visible light
+ * per bolometric watt as the Sun (its bolometric correction), an M dwarf ~25%.
+ * Exact numerical integration (reference for the GLSL fit `visEff`).
+ */
+export function visualEfficacy(T: number): number {
+  const eta = (t: number) => {
+    let s = 0;
+    for (let nm = 360; nm <= 830; nm += 2) s += (Math.pow(nm, -5) / Math.expm1(1.438776877e7 / (nm * t))) * cieXYZ(nm)[1];
+    return s / Math.pow(t, 4); // ∫B_λ dλ ∝ T⁴; the Planck prefactors cancel in the ratio
+  };
+  return eta(T) / eta(5772);
+}
+
+/** Polynomial fit of log10 visualEfficacy in x = log10(T) − 3.76, 2000–60 000 K (|err| < 0.01 dex). */
+export const VIS_EFF_COEFFS = [0.00272759, 0.564788, -4.95986, 3.97801, -1.38651] as const;
+export function visualEfficacyFit(T: number): number {
+  const x = Math.log10(Math.min(Math.max(T, 2000), 60000)) - 3.76;
+  const c = VIS_EFF_COEFFS;
+  return Math.pow(10, c[0] + x * (c[1] + x * (c[2] + x * (c[3] + x * c[4]))));
+}
+
+/**
+ * Visual luminance of an emission-line spectrum per unit radiated energy, relative to the Sun's
+ * light (same normalisation as `visualEfficacy`): Σ e_i V(λ_i) / Σ e_i ÷ η(T☉).
+ */
+export function lineEfficacy(lines: ReadonlyArray<[number, number]>): number {
+  let num = 0;
+  let den = 0;
+  for (const [nm, e] of lines) {
+    num += e * cieXYZ(nm)[1];
+    den += e;
+  }
+  // η(T☉) as the mean of V over the solar blackbody spectrum (energy weighted, 360–830 nm band
+  // extended by the bolometric fraction inside it).
+  let s = 0;
+  let b = 0;
+  for (let nm = 100; nm <= 20000; nm += nm < 1000 ? 2 : 20) {
+    const w = (Math.pow(nm, -5) / Math.expm1(1.438776877e7 / (nm * 5772))) * (nm < 1000 ? 2 : 20);
+    b += w;
+    if (nm >= 360 && nm <= 830) s += w * cieXYZ(nm)[1];
+  }
+  return num / den / (s / b);
+}
+
+/**
+ * Hα-region line spectrum [nm, relative energy] used for HII luminosities: case-B Balmer lines,
+ * [NII], [SII] and [OIII] scaled by excitation (see hiiRGB).
+ */
+export function hiiLines(excitation = 0.3): Array<[number, number]> {
+  const e = Math.max(0, excitation);
+  return [
+    [LINES.H_ALPHA, 2.86],
+    [LINES.H_BETA, 1],
+    [LINES.H_GAMMA, 0.47],
+    [LINES.NII_6584, 0.55],
+    [LINES.SII_6716, 0.18],
+    [LINES.SII_6731, 0.14],
+    [LINES.OIII_5007, 3.6 * e],
+    [LINES.OIII_4959, 1.2 * e],
+  ];
+}
+
+/**
+ * Total optical line luminosity of an HII region (L☉) ionised by Q_H photons/s: case-B gives
+ * 0.45 Hα photons per recombination (hν = 3.03 × 10⁻¹² erg), and Hα carries ≈ 1/3 of the optical
+ * line energy of a typical Galactic HII region; ~40% of ionising photons are absorbed by dust or
+ * escape (Osterbrock & Ferland 2006; Kennicutt 1998).
+ */
+export function hiiLineLuminosity(qH: number): number {
+  return (qH * 0.6 * 0.45 * 3.03e-12 * 3) / 3.828e33;
+}
