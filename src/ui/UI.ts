@@ -1,5 +1,21 @@
 import { ICONS } from './icons';
 import { Panel, PanelSection } from './Panel';
+import { Intro, type IntroOptions } from './Intro';
+import { Palette, type Command } from './Palette';
+import { Help, type Shortcut } from './Help';
+import { SoundMenu, type SoundControls } from './SoundMenu';
+import './overlays.css';
+
+export type { Command, Shortcut, SoundControls, IntroOptions };
+
+/** Diagnostics for the frame-rate/quality indicator (backtick key). */
+export interface StatsInfo {
+  fps: number;
+  tier: string;
+  scale: number;
+  width: number;
+  height: number;
+}
 
 export interface ExperienceMeta {
   id: string;
@@ -12,6 +28,10 @@ export interface UIHandlers {
   navigate(id: string): void;
   toggleSound(): boolean;
   soundOn(): boolean;
+  /** Optional richer sound controls (volume, music layer…). Enables the sound popover. */
+  sound?: SoundControls;
+  /** Optional diagnostics source for the FPS/quality indicator. */
+  stats?: () => StatsInfo;
 }
 
 export interface InfoCard {
@@ -65,6 +85,18 @@ export class UI {
   private lastActivity = performance.now();
   private overUI = false;
   menuOpen = false;
+  private meta: ExperienceMeta | null = null;
+  private hintText = '';
+  private shortcutSets = new Set<Shortcut[]>();
+  private commandSets = new Set<Command[]>();
+  readonly intro: Intro;
+  readonly palette: Palette;
+  readonly help: Help;
+  readonly soundMenu: SoundMenu | null = null;
+  private statsEl: HTMLElement;
+  private statsOn = false;
+  private statsClock = 0;
+  private menuReturn: HTMLElement | null = null;
 
   constructor(root: HTMLElement, private experiences: ExperienceMeta[], private handlers: UIHandlers) {
     this.root = root;
@@ -88,7 +120,10 @@ export class UI {
     const actions = el('nav', 'ui-actions');
     actions.setAttribute('aria-label', 'View controls');
     this.panelBtn = this.iconButton(ICONS.sliders, 'Controls (P)', () => this.panel.toggle());
-    this.soundBtn = this.iconButton(ICONS.soundOff, 'Sound', () => this.syncSound(this.handlers.toggleSound()));
+    this.soundBtn = this.iconButton(ICONS.soundOff, 'Sound', () => {
+      if (this.soundMenu) this.soundMenu.toggle();
+      else this.syncSound(this.handlers.toggleSound());
+    });
     this.fsBtn = this.iconButton(ICONS.expand, 'Full screen', () => this.toggleFullscreen());
     const hideBtn = this.iconButton(ICONS.eye, 'Hide interface (H)', () => this.setHidden(true));
     const menuBtn = this.iconButton(ICONS.menu, 'Menu (M)', () => this.toggleMenu());
@@ -121,8 +156,37 @@ export class UI {
 
     this.menuEl = this.buildMenu();
 
-    root.append(this.overlay, top, bottom, this.infoEl, this.toastEl, this.errorEl, this.loaderEl, this.menuEl);
+    this.statsEl = el('div', 'stats');
+    this.statsEl.hidden = true;
+    this.statsEl.setAttribute('aria-live', 'off');
+
+    root.append(this.overlay, top, bottom, this.infoEl, this.toastEl, this.errorEl, this.loaderEl, this.menuEl, this.statsEl);
     this.panel = new Panel(root);
+    if (handlers.sound) {
+      const snd = handlers.sound;
+      this.soundBtn.setAttribute('aria-haspopup', 'dialog');
+      this.soundMenu = new SoundMenu(root, snd);
+      this.soundMenu.onToggle = (open) => {
+        this.soundBtn.setAttribute('aria-expanded', String(open));
+        this.soundBtn.classList.toggle('is-open', open);
+      };
+      snd.onChange(() => this.syncSound(snd.enabled));
+      window.addEventListener('pointerdown', (e) => {
+        const t = e.target as Node;
+        if (this.soundMenu?.isOpen && !this.soundMenu.el.contains(t) && !this.soundBtn.contains(t)) this.soundMenu.close();
+      });
+      this.soundMenu.el.addEventListener('pointerenter', () => (this.overUI = true));
+      this.soundMenu.el.addEventListener('pointerleave', () => (this.overUI = false));
+    }
+    this.palette = new Palette(root, () => this.commands());
+    this.palette.onToggle = (open) => {
+      this.root.classList.toggle('palette-open', open);
+      this.uiSound(open ? 'ui-open' : 'ui-close');
+    };
+    this.palette.onMove = () => this.uiSound('ui-move');
+    this.help = new Help(root);
+    this.help.onToggle = (open) => this.root.classList.toggle('help-open', open);
+    this.intro = new Intro(root);
     this.panel.onVisibilityChange = (open) => {
       this.panelBtn.classList.toggle('is-active', open);
       this.panelBtn.hidden = this.panel.isEmpty;
@@ -135,7 +199,8 @@ export class UI {
     }
     window.addEventListener('pointermove', () => this.activity(), { passive: true });
     window.addEventListener('pointerdown', () => this.activity(), { passive: true });
-    window.addEventListener('keydown', (e) => this.onKey(e));
+    // Capture phase: runs before experience key handlers, so open dialogs can swallow keys.
+    window.addEventListener('keydown', (e) => this.onKey(e), true);
     document.addEventListener('fullscreenchange', () => {
       this.fsBtn.innerHTML = document.fullscreenElement ? ICONS.collapse : ICONS.expand;
     });
@@ -157,7 +222,7 @@ export class UI {
     this.soundBtn.setAttribute('aria-label', on ? 'Mute sound' : 'Play sound');
   }
 
-  private toggleFullscreen(): void {
+  toggleFullscreen(): void {
     if (document.fullscreenElement) document.exitFullscreen?.().catch(() => undefined);
     else document.documentElement.requestFullscreen?.().catch(() => this.toast('Full screen is not available here'));
   }
@@ -175,6 +240,7 @@ export class UI {
       <p class="menu-lede">A real-time universe built from physics: gravity, expansion, light bending around black holes, the glow of ionised gas. Choose where to begin.</p>
       <p class="menu-quote">“The cosmos is within us. We are made of star-stuff.”<span>Carl Sagan</span></p>`;
     const list = el('ol', 'menu-list');
+    list.setAttribute('aria-label', 'Worlds');
     this.experiences.forEach((x, i) => {
       const li = el('li');
       const b = el('button', 'menu-item');
@@ -193,22 +259,35 @@ export class UI {
     });
     const close = this.iconButton(ICONS.close, 'Close menu (Esc)', () => this.closeMenu());
     close.classList.add('menu-close');
-    const keys = el('p', 'menu-keys', 'Drag to look · Scroll to zoom · <kbd>P</kbd> controls · <kbd>H</kbd> hide interface · <kbd>M</kbd> menu');
+    const mod = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? '⌘' : 'Ctrl';
+    const keys = el(
+      'p',
+      'menu-keys',
+      `<span><kbd>↑</kbd><kbd>↓</kbd> choose · <kbd>↵</kbd> enter</span><span><kbd>${mod}</kbd><kbd>K</kbd> go anywhere</span><span><kbd>P</kbd> controls</span><span><kbd>H</kbd> hide interface</span><span><kbd>?</kbd> help</span>`,
+    );
     inner.append(intro, list);
     m.append(close, inner, keys);
     return m;
   }
 
   setExperience(meta: ExperienceMeta | null): void {
+    this.meta = meta;
     this.kickerEl.textContent = meta?.kicker ?? '';
     this.titleEl.textContent = meta?.title ?? '';
     for (const b of this.menuEl.querySelectorAll<HTMLButtonElement>('.menu-item')) {
       b.classList.toggle('is-current', b.dataset.id === meta?.id);
+      if (b.dataset.id === meta?.id) b.setAttribute('aria-current', 'page');
+      else b.removeAttribute('aria-current');
     }
     document.title = meta ? `${meta.title} · The Way of the Universe` : 'The Way of the Universe';
   }
 
   openMenu(): void {
+    if (!this.menuOpen) {
+      this.menuReturn = document.activeElement as HTMLElement | null;
+      this.uiSound('ui-open');
+    }
+    this.soundMenu?.close();
     this.menuOpen = true;
     this.menuEl.hidden = false;
     this.root.classList.add('menu-open');
@@ -216,9 +295,15 @@ export class UI {
     first?.focus({ preventScroll: true });
   }
   closeMenu(): void {
+    if (!this.menuOpen) return;
     this.menuOpen = false;
     this.menuEl.hidden = true;
     this.root.classList.remove('menu-open');
+    this.uiSound('ui-close');
+    const r = this.menuReturn;
+    this.menuReturn = null;
+    if (r && document.contains(r) && r !== document.body) r.focus({ preventScroll: true });
+    else (document.activeElement as HTMLElement | null)?.blur?.();
   }
   toggleMenu(): void {
     if (this.menuOpen) this.closeMenu();
@@ -232,24 +317,189 @@ export class UI {
   }
 
   private onKey(e: KeyboardEvent): void {
+    if (this.intro.active) return; // the title sequence handles its own keys
+    const mod = e.metaKey || e.ctrlKey;
+    if (mod && !e.altKey && e.code === 'KeyK') {
+      e.preventDefault();
+      e.stopPropagation();
+      this.togglePalette();
+      return;
+    }
+    if (this.palette.isOpen) return; // its input handles navigation (experiences ignore input targets)
     const t = e.target as HTMLElement | null;
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) {
+      if (e.code === 'Escape' && this.soundMenu?.isOpen) this.soundMenu.close();
+      return;
+    }
+    if (mod || e.altKey) return;
+    if (this.help.isOpen) {
+      if (e.code === 'Escape' || e.key === '?' || e.code === 'KeyH') {
+        e.preventDefault();
+        this.help.close();
+      }
+      if (e.key !== 'Tab') e.stopPropagation();
+      return;
+    }
     if (e.code === 'Escape') {
-      if (this.menuOpen) this.closeMenu();
+      if (this.soundMenu?.isOpen) this.soundMenu.close();
+      else if (this.menuOpen) this.closeMenu();
       else if (this.panel.open) this.panel.setOpen(false);
       else if (this.hidden) this.setHidden(false);
-    } else if (e.code === 'KeyM') this.toggleMenu();
+    } else if (e.key === '?') {
+      e.preventDefault();
+      this.openHelp();
+    } else if (e.code === 'Backquote') this.toggleStats();
+    else if (e.code === 'KeyM') this.toggleMenu();
     else if (e.code === 'KeyH') this.setHidden(!this.hidden);
     else if (e.code === 'KeyP') this.panel.toggle();
-    else if (this.menuOpen && /^Digit[1-9]$/.test(e.code)) {
-      const i = Number(e.code.slice(5)) - 1;
-      const x = this.experiences[i];
-      if (x) {
-        this.closeMenu();
-        this.handlers.navigate(x.id);
+    else if (this.menuOpen) {
+      if (/^Digit[1-9]$/.test(e.code)) {
+        const i = Number(e.code.slice(5)) - 1;
+        const x = this.experiences[i];
+        if (x) {
+          this.closeMenu();
+          this.handlers.navigate(x.id);
+        }
+      } else if (e.code === 'ArrowDown' || e.code === 'ArrowRight') this.moveMenuFocus(1, e);
+      else if (e.code === 'ArrowUp' || e.code === 'ArrowLeft') this.moveMenuFocus(-1, e);
+      else if (e.code === 'Home') this.moveMenuFocus(-999, e);
+      else if (e.code === 'End') this.moveMenuFocus(999, e);
+    }
+    // While the menu is up, the world behind it should not react to keys.
+    if (this.menuOpen && e.key !== 'Tab') e.stopPropagation();
+  }
+
+  private moveMenuFocus(delta: number, e: KeyboardEvent): void {
+    e.preventDefault();
+    const items = [...this.menuEl.querySelectorAll<HTMLButtonElement>('.menu-item')];
+    if (!items.length) return;
+    const cur = items.indexOf(document.activeElement as HTMLButtonElement);
+    let i = cur < 0 ? (delta > 0 ? 0 : items.length - 1) : cur + delta;
+    i = Math.max(0, Math.min(items.length - 1, i));
+    items[i].focus();
+    this.uiSound('ui-move');
+  }
+
+  /** Command palette (Ctrl/Cmd + K). */
+  togglePalette(open?: boolean): void {
+    const o = open ?? !this.palette.isOpen;
+    if (o) {
+      this.help.close();
+      this.soundMenu?.close();
+      this.palette.open();
+    } else this.palette.close();
+  }
+
+  /** Help overlay (`?`). */
+  openHelp(): void {
+    this.soundMenu?.close();
+    const local: Shortcut[] = [];
+    for (const set of this.shortcutSets) local.push(...set);
+    this.help.open(this.meta?.title ?? '', this.meta?.kicker ?? '', local, this.hintText);
+  }
+
+  /** FPS / quality indicator (backtick). */
+  toggleStats(on = !this.statsOn): void {
+    this.statsOn = on && !!this.handlers.stats;
+    this.statsEl.hidden = !this.statsOn;
+    this.statsClock = 0;
+  }
+
+  /**
+   * Opening title sequence over whatever is rendering (the prelude sky). Resolves true when it
+   * played to the end or was skipped, false if it was already seen this session.
+   */
+  playIntro(o: IntroOptions = {}): Promise<boolean> {
+    this.root.classList.add('intro-on');
+    const snd = this.handlers.sound;
+    const p = this.intro.play({ onSound: snd && !snd.enabled ? () => void snd.enable() : undefined, ...o });
+    return p.then((played) => {
+      this.root.classList.remove('intro-on');
+      return played;
+    });
+  }
+
+  /** Register shortcuts for the help overlay; returns an unregister function. */
+  registerShortcuts(list: Shortcut[]): () => void {
+    const copy = list.slice();
+    this.shortcutSets.add(copy);
+    return () => this.shortcutSets.delete(copy);
+  }
+
+  /** Register palette commands (destinations, actions); returns an unregister function. */
+  registerCommands(list: Command[]): () => void {
+    const copy = list.slice();
+    this.commandSets.add(copy);
+    return () => this.commandSets.delete(copy);
+  }
+
+  private uiSound(name: string): void {
+    const s = this.handlers.sound;
+    if (s?.enabled && s.options.ui) s.event(name);
+  }
+
+  /** Everything the palette can do right now. */
+  private commands(): Command[] {
+    const out: Command[] = [];
+    for (const set of this.commandSets) for (const c of set) out.push({ group: 'Destinations', ...c });
+    // Controls already on the panel (preset chips, buttons, short selects) — free destinations.
+    for (const sec of this.panel.el.querySelectorAll<HTMLElement>('.pnl-section')) {
+      const title = sec.querySelector('.pnl-title')?.textContent ?? '';
+      for (const b of sec.querySelectorAll<HTMLButtonElement>('.pnl-buttons .chip, .pnl-button .btn')) {
+        const text = b.textContent?.trim();
+        if (!text || b.disabled) continue;
+        const m = /^(\d)\s+(.+)$/.exec(text); // chips often carry their key: "2 Edge-on"
+        const label = m ? m[2] : text;
+        out.push({ label, group: 'In this world', hint: [title, m?.[1]].filter(Boolean).join(' · '), keywords: title, run: () => b.click() });
+      }
+      for (const row of sec.querySelectorAll<HTMLElement>('.pnl-select')) {
+        const sel = row.querySelector('select');
+        const lab = row.querySelector('label')?.textContent ?? '';
+        if (!sel || sel.disabled || sel.options.length > 16) continue;
+        for (const opt of sel.options) {
+          out.push({
+            label: opt.text,
+            group: 'In this world',
+            hint: lab,
+            keywords: `${lab} ${title}`,
+            run: () => {
+              sel.value = opt.value;
+              sel.dispatchEvent(new Event('change', { bubbles: true }));
+            },
+          });
+        }
       }
     }
+    this.experiences.forEach((x, i) =>
+      out.push({
+        label: x.title,
+        group: 'Worlds',
+        hint: x.id === this.meta?.id ? 'You are here' : i < 9 ? `${x.kicker} · ${i + 1}` : x.kicker,
+        keywords: `${x.kicker} ${x.blurb}`,
+        run: () => this.handlers.navigate(x.id),
+      }),
+    );
+    const snd = this.handlers.sound;
+    if (snd) {
+      out.push({ label: snd.enabled ? 'Turn sound off' : 'Turn sound on', group: 'Sound', keywords: 'audio mute music volume', run: () => (snd.enabled ? snd.disable() : void snd.enable()) });
+      out.push({
+        label: snd.options.music ? 'Stop the space jazz' : 'Play some space jazz',
+        group: 'Sound',
+        keywords: 'music lounge piano bass jazz',
+        run: () => {
+          snd.setOption('music', !snd.options.music);
+          if (!snd.enabled) void snd.enable();
+        },
+      });
+    } else out.push({ label: 'Toggle sound', group: 'Sound', run: () => this.syncSound(this.handlers.toggleSound()) });
+    if (!this.panel.isEmpty) out.push({ label: this.panel.open ? 'Hide controls' : 'Show controls', group: 'View', hint: 'P', run: () => this.panel.toggle() });
+    out.push({ label: 'Hide the interface', group: 'View', hint: 'H', keywords: 'clean screenshot', run: () => this.setHidden(true) });
+    out.push({ label: 'Full screen', group: 'View', keywords: 'fullscreen', run: () => this.toggleFullscreen() });
+    out.push({ label: 'Keyboard shortcuts', group: 'View', hint: '?', keywords: 'help keys controls', run: () => this.openHelp() });
+    if (this.handlers.stats) out.push({ label: 'Frame rate and quality', group: 'View', hint: '`', keywords: 'fps diagnostics performance', run: () => this.toggleStats() });
+    out.push({ label: 'Worlds menu', group: 'View', hint: 'M', run: () => this.openMenu() });
+    out.push({ label: 'Replay the title sequence', group: 'View', keywords: 'intro opening', run: () => void this.playIntro({ force: true }) });
+    return out;
   }
 
   private activity(): void {
@@ -265,10 +515,24 @@ export class UI {
 
   /** Call once per frame. */
   update(now = performance.now()): void {
-    const quiet = !this.neverIdle && now - this.lastActivity > 4200 && !this.overUI && !this.panel.open && !this.menuOpen;
+    const quiet =
+      !this.neverIdle &&
+      now - this.lastActivity > 4200 &&
+      !this.overUI &&
+      !this.panel.open &&
+      !this.menuOpen &&
+      !this.palette.isOpen &&
+      !this.help.isOpen &&
+      !this.soundMenu?.isOpen;
     if (quiet !== this.idle) {
       this.idle = quiet;
       this.root.classList.toggle('is-idle', quiet);
+    }
+    if (this.statsOn && this.handlers.stats && now - this.statsClock > 250) {
+      this.statsClock = now;
+      const st = this.handlers.stats();
+      this.statsEl.textContent = `${st.fps.toFixed(0).padStart(3, '\u2007')} fps · ${st.tier} · ×${st.scale.toFixed(2)} · ${st.width}×${st.height}`;
+      this.statsEl.classList.toggle('is-slow', st.fps < 45);
     }
   }
 
@@ -312,6 +576,7 @@ export class UI {
   }
 
   hint(text: string, ms = 7000): void {
+    this.hintText = text;
     this.hintEl.textContent = text;
     this.hintEl.classList.add('is-visible');
     clearTimeout(this.hintTimer);
@@ -319,6 +584,10 @@ export class UI {
   }
   clearHint(): void {
     this.hintEl.classList.remove('is-visible');
+  }
+  /** Forget the last hint (help falls back to generic controls). */
+  clearHintText(): void {
+    this.hintText = '';
   }
 
   info(card: InfoCard | null): void {
@@ -395,6 +664,7 @@ export class UIScope {
   private readouts: Readout[] = [];
   private sections: PanelSection[] = [];
   private nodes: HTMLElement[] = [];
+  private offs: Array<() => void> = [];
   readonly overlay: HTMLElement;
 
   constructor(readonly ui: UI) {
@@ -430,7 +700,28 @@ export class UIScope {
   openPanel(open = true): void {
     this.ui.panel.setOpen(open);
   }
+  /** List this world's controls in the help overlay (`?`). Removed on unmount. */
+  shortcuts(list: Shortcut[]): () => void {
+    const off = this.ui.registerShortcuts(list);
+    this.offs.push(off);
+    return off;
+  }
+  /**
+   * Add places to the command palette (Ctrl/Cmd + K), e.g. { label: 'Saturn', run: () => flyTo('saturn') }.
+   * Grouped under "Destinations" unless `group` is given. Removed on unmount.
+   */
+  destinations(list: Command[]): () => void {
+    const off = this.ui.registerCommands(list);
+    this.offs.push(off);
+    return off;
+  }
+  /** Alias of destinations() for actions ("Replay the merger", "Random seed"…). */
+  commands(list: Command[]): () => void {
+    return this.destinations(list.map((c) => ({ group: 'Actions', ...c })));
+  }
   dispose(): void {
+    for (const off of this.offs) off();
+    this.offs = [];
     for (const r of this.readouts) r.remove();
     for (const s of this.sections) this.ui.panel.remove(s);
     for (const n of this.nodes) n.remove();
@@ -439,5 +730,6 @@ export class UIScope {
     this.nodes = [];
     this.ui.info(null);
     this.ui.clearHint();
+    this.ui.clearHintText();
   }
 }
