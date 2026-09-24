@@ -98,15 +98,33 @@ const float ZONE_W = 0.35; // radial zone width in ln r (one zone per ~42 % in r
 float omegaK(float r) { return 1.0 / (r * sqrt(r) + uA); }
 
 // Turbulent streaks in log-polar coordinates, seamless in φ; zero-mean, unit-ish variance.
-// Features are ~10× longer in azimuth than in radius before shear (MRI turbulence is dominated
-// by azimuthally stretched structures), with thin ridged filaments for the hottest sheets.
+// One noise unit spans 1/AZ rad in azimuth and 1/RAD in ln r, so at any radius features are
+// RAD/AZ ≈ 20× (growing with each octave) longer along the orbit than across it before shear (which winds them further) — MRI turbulence is dominated
+// by azimuthally stretched structures (e.g. Hawley & Balbus 1991; Guan et al. 2009). Thin ridged
+// sheets carry the hottest gas; octave count scales with quality.
+#ifndef DISK_OCT
+#define DISK_OCT 4
+#endif
 float streaks(float lr, float ph, float seed) {
-  vec3 q = vec3(cos(ph) * 4.0, sin(ph) * 4.0, lr * 42.0) + vec3(seed * 1.7, seed * 0.37, seed * 3.1);
-  float n = fbm3(q, 4);
-  float f = 1.0 - abs(snoise(q * vec3(1.7, 1.7, 2.6) + 11.0));
+  const float AZ = 1.3, RAD = 26.0;
+  vec3 q = vec3(cos(ph) * AZ, sin(ph) * AZ, lr * RAD) + vec3(seed * 1.7, seed * 0.37, seed * 3.1);
+  float n = 0.0, amp = 1.0, norm = 0.0;
+  vec3 qq = q;
+  for (int i = 0; i < DISK_OCT; i++) {
+    n += amp * snoise(qq);
+    norm += amp;
+    qq = qq * vec3(1.7, 1.7, 2.5) + vec3(17.1, -9.3, 5.7);   // finer octaves are ever more streaky
+    amp *= 0.5;
+  }
+  n /= norm;
+  // Thin, hot current sheets: ridges of a higher-frequency field.
+  float f = 1.0 - abs(snoise(q * vec3(2.2, 2.2, 3.2) + 11.0));
   f *= f;
   f *= f;
-  return n * 1.5 + (f - 0.22) * 1.8;
+  f *= f;
+  // Broad cooler, denser lanes.
+  float lanes = smoothstep(0.2, 0.75, snoise(q * vec3(0.55, 0.55, 0.8) - 4.0));
+  return n * 2.1 + (f - 0.08) * 2.4 - lanes * 1.2;
 }
 
 // Pattern of zone k: regenerates every ~0.55 local orbits, crossfading two phases.
@@ -149,8 +167,9 @@ void main() {
   float edgeOut = 1.0 - smoothstep(uRout * 0.45, uRout, r);
   // Log-normal density (MRI-like), thinner and wispier outwards.
   float outer = smoothstep(uRout * 0.25, uRout * 0.9, r);
-  float tau = uTau0 * edgeIn * edgeOut * edgeOut * exp(uTurb * (1.7 + 1.0 * outer) * n - uTurb * (0.9 + 0.5 * outer));
-  float temp = tProf * (1.0 + uTurb * 0.13 * n);
+  float tau = uTau0 * edgeIn * edgeOut * edgeOut * exp(uTurb * (1.5 + 1.0 * outer) * n - uTurb * (0.6 + 0.6 * outer));
+  // Flux fluctuations of order unity (MRI simulations) → T = F^{1/4} varies by ~±25 %.
+  float temp = tProf * exp(uTurb * 0.28 * n);
 
   // Orbiting hot spot (a compact flare, cf. GRAVITY 2018 near-infrared flares of Sgr A*).
   if (uHot.w > 0.0) {
@@ -229,7 +248,7 @@ float erfApprox(float x) {
 
 // Radiative transfer through the disk slab along the chord a → b (≈ the geodesic over one step).
 void diskChord(vec3 a, vec3 b, float N, float ptS, float kphiS, float jit, float dist, inout vec3 L, inout float T) {
-  float c = 3.5 * uH;
+  float c = 2.8 * uH;   // wedge |z| < 2.8 H: 99.5 % of the Gaussian column
   float c2 = c * c;
   vec3 D = b - a;
   float qa = D.z * D.z - c2 * dot(D.xy, D.xy);
@@ -263,7 +282,10 @@ void diskChord(vec3 a, vec3 b, float N, float ptS, float kphiS, float jit, float
   // Segments short enough that r (and so T, H, the texture) is nearly constant along each; the
   // vertical structure is integrated exactly per segment (Gaussian column through a straight chord).
   float horiz = length(D.xy) * (s1 - s0);
-  int n = int(clamp(ceil(horiz / (0.1 * rm)), 1.0, float(DISK_SAMPLES)));
+  // Grazing rays cross a wide range of radii inside the slab: sample every ~4 % in radius (the
+  // loop exits as soon as the gas turns opaque, so the extra samples cost little).
+  int n = int(clamp(ceil(horiz / (0.04 * rm)), 1.0, float(DISK_SAMPLES)));
+  float sinInc = abs(D.z) / max(length(D), 1e-9);
   float segL = len / float(n);
   for (int j = 0; j < DISK_SAMPLES; j++) {
     if (j >= n) break;
@@ -283,11 +305,12 @@ void diskChord(vec3 a, vec3 b, float N, float ptS, float kphiS, float jit, float
     if (colFrac < 1e-7) continue;
     float v = (log(r) - uDiskMap.x) * uDiskMap.y;
     float u = atan(q.y, q.x) * (1.0 / TAU);
-    // Footprint-based LOD: pixel cone width at this distance vs texel size.
+    // Anisotropic footprint: the pixel cone's width along the orbit, and stretched by 1/sin(i)
+    // across radii where the ray grazes the disk. Hardware anisotropic filtering does the rest.
     float foot = (dist + length(q - a)) * uPixAngle;
-    float texel = min(TAU * r / uDiskTexel.x, r / (uDiskMap.y * uDiskTexel.y));
-    float lod = max(0.0, log2(foot / texel));
-    vec4 tex = textureLod(uDisk, vec2(u, v), lod);
+    vec2 gU = vec2(foot / (TAU * r), 0.0);
+    vec2 gV = vec2(0.0, foot / max(sinInc, 0.03) / r * uDiskMap.y);
+    vec4 tex = textureGrad(uDisk, vec2(u, v), gU, gV);
     float dtau = tex.r * colFrac;
     if (dtau < 1e-5) continue;
     float ut = tex.b, Om = tex.a;
@@ -304,7 +327,7 @@ void diskChord(vec3 a, vec3 b, float N, float ptS, float kphiS, float jit, float
       g = uShift > 1.5 ? gg : (uShift > 0.5 ? g / gg : 1.0);
     }
     if (uDebug > 0.5 && dbgCol.x < 0.0) {
-      dbgCol = uDebug < 1.5 ? vec3(tex.g) : uDebug < 2.5 ? vec3(g * 0.5) : uDebug < 3.5 ? vec3(lod * 0.1) : uDebug < 4.5 ? vec3(tex.r * 0.01) : uDebug < 9.5 ? vec3(v, r / 20.0, 0.0) : uDebug < 10.5 ? vec3(fract(u), uDiskMap.x, uDiskMap.y) : vec3(g * tex.g * uTpeak / 30000.0, N * 0.5, ptS);
+      dbgCol = uDebug < 1.5 ? vec3(tex.g) : uDebug < 2.5 ? vec3(g * 0.5) : uDebug < 3.5 ? vec3(log2(max(gV.y * uDiskTexel.y, 1.0)) * 0.1) : uDebug < 4.5 ? vec3(tex.r * 0.01) : uDebug < 9.5 ? vec3(v, r / 20.0, 0.0) : uDebug < 10.5 ? vec3(fract(u), uDiskMap.x, uDiskMap.y) : vec3(g * tex.g * uTpeak / 30000.0, N * 0.5, ptS);
     }
     vec3 S = planck(g * tex.g * uTpeak) * uDiskNorm;
     float att = 1.0 - exp(-dtau);
@@ -347,13 +370,18 @@ void main() {
   int nCross = 0;
   vec3 vEnd = v0 / N;
   float rStart = ksR(x);
+  float rMinDbg = rStart;
+  int nStepDbg = 0;
 
   for (int i = 0; i < MAX_STEPS; i++) {
     vec3 v1, f1;
     float r, vr;
     ksRhs(x, p, pt, v1, f1, r, vr);
     vEnd = v1;
-    if (vr < 0.0 && r < (uInside > 0.5 ? uHorizon * 1.0005 : uCapR)) { fate = 2.0; break; }
+    rMinDbg = min(rMinDbg, r);
+    // No photon that reaches infinity ever dips below the prograde photon orbit, so from outside
+    // the horizon anything inside uCapR is captured whatever its (numerically fragile) direction.
+    if (uInside > 0.5 ? (vr < 0.0 && r < uHorizon * 1.0005) : r < uCapR) { fate = 2.0; break; }
     if (r > uEscR && vr > 0.0) { fate = 1.0; break; }
     float speed = length(v1) + 1e-9;
     float grow = 1.0 + 2.0 * smoothstep(25.0, 120.0, r);
@@ -366,6 +394,19 @@ void main() {
     ksRhs(x + h * v3, p + h * f3, pt, v4, f4);
     vec3 xn = x + (h / 6.0) * (v1 + 2.0 * v2 + 2.0 * v3 + v4);
     vec3 pn = p + (h / 6.0) * (f1 + 2.0 * f2 + 2.0 * f3 + f4);
+    // Leaving the escape sphere: redo the step so it ends exactly on it. Every ray then hands over
+    // to the analytic weak-field tail at the same radius, so the sky map has no step-count seams
+    // (which would show up as rings in the lens Jacobian and streak the stars).
+    float rn = ksR(xn);
+    if (vr > 0.0 && rn > uEscR && r < uEscR) {
+      float hs = h * clamp((uEscR - r) / max(rn - r, 1e-6), 0.0, 1.0);
+      ksRhs(x + 0.5 * hs * v1, p + 0.5 * hs * f1, pt, v2, f2);
+      ksRhs(x + 0.5 * hs * v2, p + 0.5 * hs * f2, pt, v3, f3);
+      ksRhs(x + hs * v3, p + hs * f3, pt, v4, f4);
+      xn = x + (hs / 6.0) * (v1 + 2.0 * v2 + 2.0 * v3 + v4);
+      pn = p + (hs / 6.0) * (f1 + 2.0 * f2 + 2.0 * f3 + f4);
+      h = hs;
+    }
     // Equatorial crossing → overlay rings (drawn on the upper surface of the disk).
     if (x.z * xn.z < 0.0 && nCross < 2) {
       vec3 q = mix(x, xn, x.z / (x.z - xn.z));
@@ -373,12 +414,20 @@ void main() {
       if (nCross == 0) { rc0 = rq; tc0 = T; } else { rc1 = rq; tc1 = T; }
       nCross++;
     }
-    if (uDiskOn > 0.5) diskChord(x, xn, N, pt, kphi, jit, dist, L, T);
-    dist += length(xn - x);
+    nStepDbg = i;
+    // A chord much longer than the step asked for means RK4 blew up (a ray whipping round just
+    // outside the horizon in single precision): never let such a chord paint the disk.
+    float chord = length(xn - x);
+    bool sane = chord < 3.0 * uEps * r * grow;
+    if (uDiskOn > 0.5 && sane) diskChord(x, xn, N, pt, kphi, jit, dist, L, T);
+    if (!sane && r < 3.0) { fate = 2.0; break; }
+    dist += chord;
     x = xn;
     p = pn;
     if (T < 2e-3) { fate = 3.0; break; }
-    if (!(abs(x.x) < 1e7)) { fate = 2.0; break; }  // NaN guard: diving into the horizon
+    // NaN guard: rays grazing the ring singularity or diving at the horizon faster than the
+    // step control can follow can only have come from the hole.
+    if (!(dot(x, x) < 1e14) || !(dot(p, p) < 1e20)) { fate = 2.0; break; }
   }
 
   // Overlay rings: thin lines of constant pixel width at the first two crossings.
@@ -404,6 +453,8 @@ void main() {
   } else {
     T = 0.0;
   }
+  if (uDebug > 13.5) { oLight = vec4(rMinDbg / 5.0, rc0 / 5.0, float(nStepDbg) / float(MAX_STEPS), 0.0); return; }
+  if (uDebug > 12.5) { oLight = vec4(fate == 1.0 ? 1.0 : 0.0, fate == 2.0 ? 1.0 : 0.0, fate == 0.0 ? 1.0 : (fate == 3.0 ? 0.5 : 0.0), 0.0); return; }
   if (uDebug > 11.5) { float TT = 1000.0 * pow(40.0, vUv.x); oLight = vec4(vUv.y > 0.5 ? planck(TT) * 0.25 : vec3(texture(uPlanck, vec2((log(TT) - uPlanckMap.x) * uPlanckMap.y, 0.5)).a / -20.0 + 0.5), 0.0); return; }
   if (uDebug > 4.5 && uDebug < 8.5) { vec4 tt = textureLod(uDisk, vUv, 0.0); oLight = vec4(uDebug < 5.5 ? vec3(tt.g) : uDebug < 6.5 ? vec3(tt.a * 4.0) : uDebug < 7.5 ? vec3(tt.b * 0.5) : vec3(tt.r * 0.01), 0.0); return; }
   if (uDebug > 0.5) { oLight = vec4(max(dbgCol, 0.0), 0.0); return; }
@@ -423,6 +474,27 @@ void main() {
   vec4 c = texture(uCurrent, vUv);
   vec4 h = texture(uHistory, vUv);
   outColor = uAlpha >= 1.0 ? c : mix(h, c, uAlpha);
+}`;
+
+// ————————————————————————————————————————————————————————————————— metering (auto exposure)
+// Each output texel averages log₂ luminance of a 4×4 grid of trace texels in its cell; the CPU
+// reads the tiny target back asynchronously and exposes for a high percentile (the highlights).
+export const METER_FRAG = /* glsl */ `
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uAccum;
+uniform vec2 uCells;
+void main() {
+  vec2 cell = floor(vUv * uCells);
+  float s = 0.0;
+  for (int j = 0; j < 4; j++)
+    for (int i = 0; i < 4; i++) {
+      vec2 uv = (cell + (vec2(float(i), float(j)) + 0.5) / 4.0) / uCells;
+      vec3 c = texture(uAccum, uv).rgb;
+      s += log2(dot(c, vec3(0.2126, 0.7152, 0.0722)) + 1e-4);
+    }
+  outColor = vec4(clamp((s / 16.0 + 16.0) / 24.0, 0.0, 1.0), 0.0, 0.0, 1.0);
 }`;
 
 // ————————————————————————————————————————————————————————————————— 4. composite
@@ -454,6 +526,7 @@ uniform vec2 uPlanckMap;
 uniform sampler2D uCT;       // colour → temperature
 uniform vec2 uCTMap;         // qMin, 1/(qMax − qMin)
 uniform float uSkyShift;     // 1 = apply g to the sky
+uniform float uDbg;
 
 vec4 planckS(float T) {
   float u = (log(max(T, 1.0)) - uPlanckMap.x) * uPlanckMap.y;
@@ -503,6 +576,21 @@ float starTemp(float u) {
   return mix(11000.0, 30000.0, (u - 0.93) / 0.07);
 }
 
+// PCG4D (Jarzynski & Olano 2020, "Hash Functions for GPU Rendering"): a proper integer hash. The
+// float "hash without sine" shows faint diagonal correlations between neighbouring integer cells,
+// which lined stars up into streaks like satellite trails.
+uvec4 pcg4d(uvec4 v) {
+  v = v * 1664525u + 1013904223u;
+  v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
+  v ^= v >> 16u;
+  v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
+  return v;
+}
+vec4 cellHash(vec2 c, float face, float seed) {
+  uvec4 h = pcg4d(uvec4(uint(c.x), uint(c.y), uint(face), uint(seed * 7.0 + 3.0)));
+  return vec4(h) * (1.0 / 4294967296.0);
+}
+
 // Sum of lensed point stars of one layer near D.
 vec3 starLayer(vec3 D, vec3 t1, vec3 t2, mat2 Spix, float N, float mLo, float mHi, float seed, float dens, float g, float shiftOn) {
   vec3 acc = vec3(0.0);
@@ -516,7 +604,7 @@ vec3 starLayer(vec3 D, vec3 t1, vec3 t2, mat2 Spix, float N, float mLo, float mH
     for (int i = -1; i <= 1; i++) {
       vec2 c = cell + vec2(float(i), float(j));
       if (c.x < 0.0 || c.y < 0.0 || c.x >= N || c.y >= N) continue;
-      vec4 h = vec4(hash33(vec3(c, fu.x * 131.0 + seed)), hash13(vec3(c.yx + 17.0, fu.x * 71.0 + seed * 1.3)));
+      vec4 h = cellHash(c, fu.x, seed);
       if (h.w > dens) continue;
       vec2 suv = ((c + 0.15 + 0.7 * h.xy) / N) * 2.0 - 1.0;
       vec3 S = normalize(cubeDir(fu.x, suv));
@@ -573,7 +661,8 @@ vec3 d0At(vec2 tpos) {
 }
 // Sky direction and g of one trace texel; w = 0 if that ray did not reach the sky.
 vec4 fetchDir(ivec2 t) {
-  t = clamp(t, ivec2(0), ivec2(uTraceRes) - 1);
+  // Outside the trace: invalid, so the Jacobian falls back to one-sided differences at the border.
+  if (any(lessThan(t, ivec2(0))) || any(greaterThanEqual(t, ivec2(uTraceRes)))) return vec4(0.0);
   vec4 s = texelFetch(uSky, t, 0);
   if (s.w <= 0.0) return vec4(0.0);
   return vec4(normalize(d0At(vec2(t) + 0.5 + uJitter) + s.xyz), s.w);
@@ -621,6 +710,18 @@ void main() {
           float lnT = texture(uCT, vec2(clamp((q - uCTMap.x) * uCTMap.y, 0.0, 1.0), 0.5)).r;
           sky *= shiftRatio(exp(lnT), g);
         }
+      }
+      if (uDbg > 1.5) { vec3 fu = faceOf(D, 0); outColor = vec4(fract(fu.x * 0.37) , fu.y * 0.5 + 0.5, fu.z * 0.5 + 0.5, 1.0); return; }
+      if (uDbg > 0.5) {
+        vec3 t1 = normalize(abs(D.y) < 0.95 ? cross(D, vec3(0.0, 1.0, 0.0)) : cross(D, vec3(1.0, 0.0, 0.0)));
+        vec3 t2 = cross(D, t1);
+        mat2 J = mat2(dot(Dx, t1), dot(Dx, t2), dot(Dy, t1), dot(Dy, t2));
+        float px = 2.0 * uTan.y / uTraceRes.y * uScale;
+        mat2 JJ = J * transpose(J);
+        float tr = JJ[0][0] + JJ[1][1], dt = JJ[0][0] * JJ[1][1] - JJ[0][1] * JJ[1][0];
+        float l1 = 0.5 * tr + sqrt(max(0.25 * tr * tr - dt, 0.0)), l2 = max(0.5 * tr - sqrt(max(0.25 * tr * tr - dt, 0.0)), 1e-20);
+        outColor = vec4(sqrt(l1) / px * 0.5, sqrt(l2) / px * 0.5, sqrt(l1 / l2) * 0.1, 1.0);
+        return;
       }
       if (uStarsOn > 0.5) sky += stars(D, Dx, Dy, g, shiftOn, galDens) * uStarGain;
       col += T * sky;

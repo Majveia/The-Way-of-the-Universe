@@ -1,14 +1,29 @@
 import * as THREE from 'three';
 import { FullscreenQuad, FULLSCREEN_VERT } from '../../core/post/FullscreenQuad';
 import { blackbodyRGB } from '../../physics/blackbody';
-import { extinctionRGB, hiiRGB, oiiiRGB } from '../../physics/galaxyStars';
-import { radMyrFromKmsKpc } from '../../physics/galaxyPotential';
+import { extinctionRGB, hiiLines, hiiRGB, lineEfficacy, oiiiRGB, visualEfficacyFit as visEff } from '../../physics/galaxyStars';
+import { LINES } from '../../physics/spectrum';
+import { pcMyrFromKms, radMyrFromKmsKpc } from '../../physics/galaxyPotential';
 import { generateParticles, Kinematics, PARTICLE_LIGHT, defaultLive, type GalaxyLive, type GalaxyParticles } from './model';
 import { MAX_ARMS, type GalaxyParams } from './params';
 import { MAP_FRAG } from './shaders/maps';
 import { NOISE3D_FRAG } from './shaders/noise3d';
 import { STAR_FRAG, STAR_VERT } from './shaders/stars';
+import { HII_FRAG, HII_VERT } from './shaders/hii';
 import { VOLUME_COMPOSITE_FRAG, VOLUME_FRAG } from './shaders/volume';
+import { GalaxyIntegrator } from './integrator';
+import { LOCAL_STAR_VERT } from './shaders/localStars';
+import {
+  densityParams,
+  LOCAL_CELLS,
+  LOCAL_MAX_PER_CELL,
+  LOCAL_TIERS,
+  mwReference,
+  nearestLocalStars,
+  type DensityParams,
+} from './localStars';
+import { milkyWay } from './params';
+import { KIND_YOUNG, particleState, STRIDE, type ParticleState } from './model';
 
 /** Options for a galaxy layer. */
 export interface GalaxyLayerOptions {
@@ -55,6 +70,8 @@ export class GalaxyLayer {
   /** Volume gain (fades when the volume cannot follow the stars, e.g. dark matter removed). */
   volumeGain = 1;
   starsVisible = true;
+  /** Brightness multiplier of the old (non-young) star particles (look / debugging). */
+  oldGain = 1;
   volumeVisible = true;
   /** Debug: draw the face-on ISM map (0 = off, 1..4 = channel R/G/B/A, 5 = RGB). */
   debugMap = 0;
@@ -67,6 +84,20 @@ export class GalaxyLayer {
     this.volMat.uniforms.uMask.value = m;
   }
   particles: GalaxyParticles | null = null;
+  /**
+   * Metered radiance of the diffuse light: `lum` brightness-weighted log-mean (what the eye fixates
+   * on), `sky` plain log-mean of the whole view, `lit` fraction of the view above the floor; NaN
+   * until the first readback. Volume units. See METER_FRAG.
+   */
+  readonly meter = { lum: NaN, lit: 0, sky: NaN };
+  private meterRT: THREE.WebGLRenderTarget | null = null;
+  private meterMat: THREE.ShaderMaterial | null = null;
+  private meterBuf = new Float32Array(16 * 9 * 4);
+  private meterPending = false;
+  private meterFrame = 0;
+  /** Time (Myr) at which the dark halo was removed (NaN while it is present). */
+  darkOffTime = NaN;
+  private integ: GalaxyIntegrator | null = null;
   /** Resolves when the first particle set is on the GPU. */
   ready: Promise<void>;
 
@@ -90,9 +121,48 @@ export class GalaxyLayer {
   private starGeom: THREE.BufferGeometry | null = null;
   private starMat: THREE.ShaderMaterial;
   private stars: THREE.Points | null = null;
+  private hiiGeom: THREE.BufferGeometry | null = null;
+  private hiiMat: THREE.ShaderMaterial;
+  private hii: THREE.Points | null = null;
+  /** HII-region brightness multiplier (look). */
+  hiiGain = 1;
   private starScene = new THREE.Scene();
+  private localScene = new THREE.Scene();
+  private localTiers: Array<{ mat: THREE.ShaderMaterial; geom: THREE.BufferGeometry; pts: THREE.Points }> = [];
+  private dens!: DensityParams;
+  /** Is the local star field drawn this frame (camera inside or near the disk)? */
+  localActive = false;
+  /** Radius (pc) inside which the volume's light is replaced by the local star field. */
+  nearCut = 200;
 
   private volRT: THREE.WebGLRenderTarget | null = null;
+  /** Temporal accumulation of the jittered ray-march (history ping-pong). */
+  private accRT: [THREE.WebGLRenderTarget, THREE.WebGLRenderTarget] | null = null;
+  private accIdx = 0;
+  private accCount = 0;
+  private accMat = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    vertexShader: FULLSCREEN_VERT,
+    fragmentShader: /* glsl */ `
+      precision highp float;
+      in vec2 vUv;
+      out vec4 outColor;
+      uniform sampler2D tCur;
+      uniform sampler2D tHist;
+      uniform float uAlpha;
+      void main() { outColor = mix(texture(tHist, vUv), texture(tCur, vUv), uAlpha); }
+    `,
+    depthTest: false,
+    depthWrite: false,
+    uniforms: { tCur: { value: null }, tHist: { value: null }, uAlpha: { value: 1 } },
+  });
+  private readonly prevCam = new THREE.Matrix4();
+  private prevFov = 0;
+  private prevTime = NaN;
+  /** Force the next frame to discard the volume history (e.g. after a jump). */
+  resetHistory(): void {
+    this.accCount = 0;
+  }
   private volMat: THREE.ShaderMaterial;
   private compMat: THREE.ShaderMaterial;
   private volScale: number;
@@ -190,6 +260,7 @@ export class GalaxyLayer {
         uClump: { value: 0 },
         uArmFrac: { value: 0.8 },
         uTrunc: { value: 20000 },
+        uDiskSigma: { value: new THREE.Vector2() },
       },
     });
 
@@ -227,6 +298,10 @@ export class GalaxyLayer {
         uSaturation: { value: 0.9 },
         uYoungBoost: { value: 1 },
         uPopGain: { value: this.popGain },
+        uPxPerRad: { value: 500 },
+        uSmooth: { value: new THREE.Vector4(1, 1, 1, 1) },
+        uSmoothBar: { value: 1 },
+        uYoungMult: { value: 1 },
       },
       blending: THREE.CustomBlending,
       blendSrc: THREE.OneFactor,
@@ -236,6 +311,97 @@ export class GalaxyLayer {
       depthWrite: false,
       transparent: true,
     });
+
+    const lineEffHII = lineEfficacy(hiiLines(0.25));
+    const lineEffO3 = lineEfficacy([
+      [LINES.OIII_5007, 3],
+      [LINES.OIII_4959, 1],
+    ]);
+    this.hiiMat = new THREE.ShaderMaterial({
+      glslVersion: THREE.GLSL3,
+      vertexShader: HII_VERT,
+      fragmentShader: HII_FRAG,
+      uniforms: {
+        ...this.shared,
+        uCamModel: this.starMat.uniforms.uCamModel,
+        uOrigin: this.starMat.uniforms.uOrigin,
+        uFluxToRad: this.starMat.uniforms.uFluxToRad,
+        uMinRad: this.starMat.uniforms.uMinRad,
+        uMaxSize: { value: 64 },
+        uPxPerRad: { value: 500 },
+        uExtSamples: this.starMat.uniforms.uExtSamples,
+        uDensity: { value: 12 }, // n_e of extended (giant) HII regions, cm⁻³
+        uYoungMult: this.starMat.uniforms.uYoungMult,
+        uGain: { value: 1 },
+        uColHII: { value: new THREE.Vector3(...hiiRGB(0.25)).multiplyScalar(lineEffHII) },
+        uColOIII: { value: new THREE.Vector3(...oiiiRGB()).multiplyScalar(lineEffO3) },
+        uMode: this.starMat.uniforms.uMode,
+        uStatePos: this.starMat.uniforms.uStatePos,
+        uStateW: this.starMat.uniforms.uStateW,
+        uSwitchTime: this.starMat.uniforms.uSwitchTime,
+      },
+      blending: THREE.CustomBlending,
+      blendSrc: THREE.OneFactor,
+      blendDst: THREE.OneFactor,
+      blendEquation: THREE.AddEquation,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+    });
+
+    // Local star field: one Points draw per luminosity tier (vertex-generated, no attributes used).
+    for (let t = 0; t < LOCAL_TIERS.length; t++) {
+      const N = LOCAL_CELLS[t];
+      const per = LOCAL_MAX_PER_CELL[t];
+      if (!N || !per) continue;
+      const tier = LOCAL_TIERS[t];
+      const count = N * N * N * per;
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count), 1));
+      geom.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e9);
+      const mat = new THREE.ShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: LOCAL_STAR_VERT,
+        fragmentShader: STAR_FRAG,
+        uniforms: {
+          ...this.shared,
+          uTier: { value: t },
+          uCell: { value: tier.cell },
+          uN: { value: N },
+          uMaxPer: { value: per },
+          uCamCell: { value: new THREE.Vector3() },
+          uTierL: { value: new THREE.Vector4(tier.lLo, tier.lHi, tier.n0, tier.giants) },
+          uRadius: { value: tier.radius },
+          uBeta: { value: tier.beta },
+          uSeed: { value: 1 },
+          uThin: { value: new THREE.Vector3() },
+          uThick: { value: new THREE.Vector3() },
+          uBulge: { value: new THREE.Vector3() },
+          uFlareP: { value: new THREE.Vector2() },
+          uTrunc: { value: 1 },
+          uRef: { value: 1 },
+          uCamModel: this.starMat.uniforms.uCamModel,
+          uOrigin: this.starMat.uniforms.uOrigin,
+          uFluxToRad: this.starMat.uniforms.uFluxToRad,
+          uMinRad: this.starMat.uniforms.uMinRad,
+          uSizeRef: this.starMat.uniforms.uSizeRef,
+          uMaxSize: this.starMat.uniforms.uMaxSize,
+          uGain: { value: 1 },
+          uSaturation: this.starMat.uniforms.uSaturation,
+        },
+        blending: THREE.CustomBlending,
+        blendSrc: THREE.OneFactor,
+        blendDst: THREE.OneFactor,
+        blendEquation: THREE.AddEquation,
+        depthTest: false,
+        depthWrite: false,
+        transparent: true,
+      });
+      const pts = new THREE.Points(geom, mat);
+      pts.frustumCulled = false;
+      this.localScene.add(pts);
+      this.localTiers.push({ mat, geom, pts });
+    }
 
     this.volMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
@@ -273,6 +439,7 @@ export class GalaxyLayer {
         uNoise: { value: this.noiseRT.texture },
         uNoiseTile: { value: 2400 },
         uGain: { value: 1 },
+        uNearCut: { value: 0 },
         uDebug: { value: 0 },
         uMask: { value: 255 },
       },
@@ -304,6 +471,7 @@ export class GalaxyLayer {
     this.params = p;
     this.live = defaultLive(p);
     this.kin = new Kinematics(p, this.live);
+    this.kin.potential.darkMatter = this.darkMatter;
     this.lutTex.image.data = this.kin.lut;
     this.lutTex.needsUpdate = true;
     this.shared.uLutRmax.value = this.kin.lutRmax;
@@ -324,6 +492,106 @@ export class GalaxyLayer {
       this.mapsDirty = true;
       this.normsDirty = true;
     }
+  }
+
+  /** Is the dark-matter halo present? */
+  get darkMatter(): boolean {
+    return Number.isNaN(this.darkOffTime);
+  }
+
+  /**
+   * Remove (false) or restore (true) the dark halo. Removing it freezes every star's current
+   * position and velocity and integrates them from then on in the baryonic potential alone
+   * (GalaxyIntegrator). Restoring it returns the galaxy to its equilibrium orbits.
+   */
+  setDarkMatter(on: boolean): void {
+    if (on === this.darkMatter) return;
+    this.kin.potential.darkMatter = on;
+    if (on) {
+      this.darkOffTime = NaN;
+      this.integ?.dispose();
+      this.integ = null;
+      this.updateDarkFade();
+      return;
+    }
+    this.darkOffTime = this.time;
+    this.startIntegrator();
+  }
+
+  private startIntegrator(): void {
+    this.integ?.dispose();
+    this.integ = null;
+    if (!this.particles) return;
+    this.shared.uTime.value = this.time;
+    this.integ = new GalaxyIntegrator(this.renderer, this.particles.data, this.particles.count, this.shared);
+    this.integ.setPotential(this.params.potential, false);
+    this.integ.init(this.time);
+    this.updateDarkFade();
+  }
+
+  /** The Sun's position (model frame) at the current time: its guiding centre moves at Ω(R⊙). */
+  sunModel(out: THREE.Vector3): THREE.Vector3 | null {
+    const sun = this.params.sun;
+    if (!sun) return null;
+    const phi = sun.phi + this.kin.potential.omega(sun.R, true) * this.time;
+    return out.set(sun.R * Math.cos(phi), sun.R * Math.sin(phi), sun.z);
+  }
+
+  /** Place the Local Bubble and nearby clouds around the Sun (they orbit with it). */
+  private updateLocalISM(): void {
+    const s = this.shared;
+    const ism = this.params.localISM;
+    const sun = this.sunModel(this.tmpV);
+    if (!ism || !sun) {
+      s.uCloudCount.value = 0;
+      (s.uBubble.value as THREE.Vector4).set(0, 0, 0, 0);
+      return;
+    }
+    (s.uBubble.value as THREE.Vector4).set(sun.x, sun.y, sun.z, ism.bubble);
+    const phi = Math.atan2(sun.y, sun.x);
+    const gx = -Math.cos(phi), gy = -Math.sin(phi); // toward the Galactic Centre (l = 0)
+    const rx = -Math.sin(phi), ry = Math.cos(phi); // direction of rotation (l = 90°)
+    const C = s.uClouds.value as THREE.Vector4[];
+    const T = s.uCloudTau.value as number[];
+    const n = Math.min(8, ism.clouds.length);
+    for (let i = 0; i < n; i++) {
+      const c = ism.clouds[i];
+      const l = (c.l * Math.PI) / 180, b = (c.b * Math.PI) / 180;
+      const cb = Math.cos(b);
+      C[i].set(
+        sun.x + c.d * cb * (Math.cos(l) * gx + Math.sin(l) * rx),
+        sun.y + c.d * cb * (Math.cos(l) * gy + Math.sin(l) * ry),
+        sun.z + c.d * Math.sin(b),
+        c.r,
+      );
+      T[i] = c.tau * this.live.dust;
+    }
+    s.uCloudCount.value = n;
+  }
+
+  /**
+   * Advance simulation time by dt Myr (negative runs backwards). With the halo present every
+   * position is analytic in t; without it the GPU leapfrog integrates the same dt.
+   */
+  advance(dt: number): void {
+    this.time += dt;
+    if (!this.darkMatter && this.integ) {
+      this.shared.uTime.value = this.time;
+      this.integ.step(dt);
+    }
+    this.updateDarkFade();
+  }
+
+  /**
+   * The diffuse volume (unresolved light, gas, dust) is a field in the equilibrium galaxy and cannot
+   * follow the integrated stars, so it fades over ~60 Myr after the halo is removed and the star
+   * particles take over its light (total luminosity is conserved).
+   */
+  private updateDarkFade(): void {
+    const g = this.darkMatter ? 1 : Math.exp(-Math.abs(this.time - this.darkOffTime) / 60);
+    this.volumeGain = g;
+    this.popGain.x = this.oldGain / (0.14 + 0.86 * g);
+    this.shared.uDustAmount.value = this.live.dust * g;
   }
 
   private applyParams(): void {
@@ -367,7 +635,6 @@ export class GalaxyLayer {
     // ISM
     const rMin = 100;
     (s.uMapGeom.value as THREE.Vector3).set(Math.log(rMin), 1 / Math.log(p.rMax / rMin), rMin);
-    s.uDustAmount.value = this.live.dust;
     s.uDustH.value = p.gas.dustScaleHeight;
     const L = p.bar.halfLength;
     const hasBar = p.bar.lum > 0 && p.bar.strength > 0;
@@ -385,6 +652,7 @@ export class GalaxyLayer {
     mu.uClump.value = p.clumpiness;
     mu.uArmFrac.value = p.young.armFraction;
     mu.uTrunc.value = p.disk.lum > 0 ? p.disk.truncation * 1.1 : p.rMax;
+    (mu.uDiskSigma.value as THREE.Vector2).set(pcMyrFromKms(p.disk.sigmaR), p.disk.scaleLength);
 
     // Volume emission.
     const vu = this.volMat.uniforms;
@@ -406,28 +674,28 @@ export class GalaxyLayer {
     const fourPi = 4 * Math.PI;
     const d = p.disk;
     (vu.uDiskP.value as THREE.Vector4).set(
-      (d.lum * (1 - PARTICLE_LIGHT.disk)) / (2 * Math.PI * d.scaleLength ** 2) / fourPi,
+      (visEff(d.colorT) * d.lum * (1 - PARTICLE_LIGHT.disk)) / (2 * Math.PI * d.scaleLength ** 2) / fourPi,
       d.scaleLength,
       d.scaleHeight,
       d.truncation,
     );
     (vu.uThickP.value as THREE.Vector4).set(
-      (d.thickLum * (1 - PARTICLE_LIGHT.thick)) / (2 * Math.PI * d.thickScaleLength ** 2) / fourPi,
+      (visEff(d.thickColorT) * d.thickLum * (1 - PARTICLE_LIGHT.thick)) / (2 * Math.PI * d.thickScaleLength ** 2) / fourPi,
       d.thickScaleLength,
       d.thickScaleHeight,
       d.truncation,
     );
     (vu.uFlare.value as THREE.Vector2).set(d.flare, 2.5 * d.scaleLength);
     const b = p.bulge;
-    (vu.uBulgeP.value as THREE.Vector4).set((b.lum * (1 - PARTICLE_LIGHT.bulge) * b.a) / (2 * Math.PI) / fourPi, b.a, b.flatten, b.a * b.rMaxFactor);
+    (vu.uBulgeP.value as THREE.Vector4).set((visEff(b.colorT) * b.lum * (1 - PARTICLE_LIGHT.bulge) * b.a) / (2 * Math.PI) / fourPi, b.a, b.flatten, b.a * b.rMaxFactor);
     const [coreI, longI] = barIntegrals(p.bar.halfLength, p.bar.axisRatio, s.uBarStrength.value as number);
-    const barVol = p.bar.lum * (1 - PARTICLE_LIGHT.bar);
+    const barVol = visEff(p.bar.colorT) * p.bar.lum * (1 - PARTICLE_LIGHT.bar);
     (vu.uBarP.value as THREE.Vector4).set(hasBar ? (0.5 * barVol) / coreI / fourPi : 0, hasBar ? (0.5 * barVol) / longI / fourPi : 0, L, p.bar.axisRatio);
     if (p.id === 'milkyway') {
       // Nuclear star cluster (Plummer, b ≈ 3.2 pc, ~2 × 10⁷ L☉) and nuclear stellar disk (~5 × 10⁸ L☉).
       const bn = 3.2;
-      const Lnsc = 2e7;
-      const Lnsd = 5e8;
+      const Lnsc = 2e7 * visEff(p.bulge.colorT);
+      const Lnsd = 5e8 * visEff(p.bulge.colorT);
       const rd = 90;
       (vu.uNucP.value as THREE.Vector4).set((3 * Lnsc) / (4 * Math.PI * bn ** 3) / fourPi, bn, Lnsd / (2 * Math.PI * rd * rd * 90) / fourPi, rd);
     } else (vu.uNucP.value as THREE.Vector4).set(0, 1, 0, 1);
@@ -435,6 +703,18 @@ export class GalaxyLayer {
     vu.uScatter.value = 0.5 * 60 * this.live.dust * 0;
     vu.uNoiseTile.value = p.rMax > 15000 ? 2600 : 1400;
     this.normsDirty = true;
+    this.updateDarkFade();
+    this.dens = densityParams(p, mwRef());
+    for (const lt of this.localTiers) {
+      const u = lt.mat.uniforms;
+      (u.uThin.value as THREE.Vector3).set(...this.dens.thin);
+      (u.uThick.value as THREE.Vector3).set(...this.dens.thick);
+      (u.uBulge.value as THREE.Vector3).set(...this.dens.bulge);
+      (u.uFlareP.value as THREE.Vector2).set(...this.dens.flare);
+      u.uTrunc.value = this.dens.trunc;
+      u.uRef.value = this.dens.ref;
+      u.uSeed.value = p.seed >>> 0;
+    }
   }
 
   private updateVolumeNorms(): void {
@@ -442,10 +722,13 @@ export class GalaxyLayer {
     const vu = this.volMat.uniforms;
     const fourPi = 4 * Math.PI;
     const youngPart = this.particles?.populations.find((q) => q.name === 'young')?.lum ?? p.young.lum * PARTICLE_LIGHT.young;
-    const youngVol = Math.max(0, p.young.lum - youngPart) * Math.min(2, p.young.sfr * this.live.sfr);
-    (vu.uYoungP.value as THREE.Vector2).set(this.youngInt > 0 ? youngVol / this.youngInt / fourPi : 0, Math.max(40, p.young.scaleHeight * 1.6));
-    // Hα + [NII] + Hβ… of ionised gas: a few per cent of the young stars' light, very concentrated.
-    const hiiL = 0.2 * p.young.lum * p.gas.hii * Math.min(2, p.young.sfr * this.live.sfr);
+    // Diffuse light of unresolved young stars: a mix of B/A stars (≈ colorT), visual efficacy applied.
+    const youngVol = visEff(p.young.colorT) * Math.max(0, p.young.lum - youngPart) * Math.min(2, p.young.sfr * this.live.sfr);
+    (vu.uYoungP.value as THREE.Vector2).set(this.youngInt > 0 ? youngVol / this.youngInt / fourPi : 0, Math.max(40, p.young.scaleHeight));
+    // Diffuse ionised gas (the "warm ionised medium"): ≈ 40% of a galaxy's Hα (Haffner et al. 2009).
+    // Total optical line light ≈ 3 L(Hα) ≈ 2% of the OB population's bolometric output (Kennicutt
+    // 1998: L(Hα) = SFR / 7.9 × 10⁻⁴² erg s⁻¹); the HII-region sprites carry the rest.
+    const hiiL = 0.4 * 0.02 * lineEfficacy(hiiLines(0.25)) * p.young.lum * p.gas.hii * Math.min(2, p.young.sfr * this.live.sfr);
     (vu.uHIIP.value as THREE.Vector2).set(this.hiiInt > 0 ? hiiL / this.hiiInt / fourPi : 0, 60);
   }
 
@@ -514,6 +797,10 @@ export class GalaxyLayer {
     const g = await this.generate(this.params, this.nParticles);
     if (this.disposed || job !== this.jobId) return;
     this.upload(g);
+    if (!this.darkMatter) {
+      this.darkOffTime = this.time;
+      this.startIntegrator();
+    }
   }
 
   private generate(params: GalaxyParams, count: number): Promise<GalaxyParticles> {
@@ -564,6 +851,37 @@ export class GalaxyLayer {
     this.stars = new THREE.Points(geom, this.starMat);
     this.stars.frustumCulled = false;
     this.starScene.add(this.stars);
+    if (this.hii) {
+      this.starScene.remove(this.hii);
+      this.hiiGeom?.dispose();
+      this.hii = null;
+    }
+    this.starMat.uniforms.uYoungMult.value = g.youngMultiplicity;
+    // Particle surface densities for the smoothing lengths (see shaders/stars.ts).
+    const pd = this.params.disk;
+    const nOf = (n: string) => g.populations.find((q) => q.name === n)?.count ?? 0;
+    (this.starMat.uniforms.uSmooth.value as THREE.Vector4).set(
+      nOf('disk') / (2 * Math.PI * pd.scaleLength ** 2),
+      pd.scaleLength,
+      nOf('thick') / (2 * Math.PI * pd.thickScaleLength ** 2),
+      pd.thickScaleLength,
+    );
+    const bl = Math.max(1, this.params.bar.halfLength);
+    this.starMat.uniforms.uSmoothBar.value = nOf('bar') / (Math.PI * bl * bl * this.params.bar.axisRatio);
+    const young = g.populations.find((q) => q.name === 'young');
+    if (young && young.count > 0) {
+      const hg = new THREE.BufferGeometry();
+      hg.setAttribute('a0', geom.getAttribute('a0'));
+      hg.setAttribute('a1', geom.getAttribute('a1'));
+      hg.setAttribute('a2', geom.getAttribute('a2'));
+      hg.setDrawRange(young.start, young.count);
+      hg.boundingSphere = geom.boundingSphere;
+      this.hiiGeom = hg;
+      this.hii = new THREE.Points(hg, this.hiiMat);
+      this.hii.frustumCulled = false;
+      this.hii.renderOrder = -1;
+      this.starScene.add(this.hii);
+    }
     this.updateVolumeNorms();
   }
 
@@ -574,15 +892,48 @@ export class GalaxyLayer {
     const h = Math.max(1, Math.round(height * this.volScale));
     if (this.volRT && this.volRT.width === w && this.volRT.height === h) return;
     this.volRT?.dispose();
-    this.volRT = new THREE.WebGLRenderTarget(w, h, {
-      type: THREE.HalfFloatType,
-      format: THREE.RGBAFormat,
-      minFilter: THREE.LinearFilter,
-      magFilter: THREE.LinearFilter,
-      depthBuffer: false,
-      stencilBuffer: false,
-      generateMipmaps: false,
-    });
+    this.accRT?.[0].dispose();
+    this.accRT?.[1].dispose();
+    const mk = () =>
+      new THREE.WebGLRenderTarget(w, h, {
+        type: THREE.HalfFloatType,
+        format: THREE.RGBAFormat,
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        depthBuffer: false,
+        stencilBuffer: false,
+        generateMipmaps: false,
+      });
+    this.volRT = mk();
+    this.accRT = [mk(), mk()];
+    this.accCount = 0;
+  }
+
+  /**
+   * History weight for this frame: 1 (reset) when the view moved by more than ~½ volume pixel
+   * (rotation, or parallax of structure at the distance of the nearest emitting layer) or time
+   * jumped; otherwise a running mean that settles at 1/10.
+   */
+  private historyAlpha(camera: THREE.PerspectiveCamera, cam: THREE.Vector3): number {
+    const e = camera.matrixWorld.elements;
+    const p = this.prevCam.elements;
+    const pxPerRad = this.volRT!.height / (2 * Math.tan((camera.fov * Math.PI) / 360));
+    // Rotation: change of the camera basis vectors (radians, small-angle).
+    let rot = 0;
+    for (const i of [0, 1, 2, 4, 5, 6, 8, 9, 10]) rot = Math.max(rot, Math.abs(e[i] - p[i]));
+    const dPos = Math.hypot(e[12] - p[12], e[13] - p[13], e[14] - p[14]);
+    const nearest = Math.max(40, Math.min(Math.hypot(cam.x, cam.y, cam.z) * 0.5, Math.abs(cam.z) + 60));
+    const shift = (rot + dPos / nearest) * pxPerRad;
+    const jumped = !(Math.abs(this.time - this.prevTime) < 3) || Math.abs(camera.fov - this.prevFov) > 0.05;
+    this.prevCam.copy(camera.matrixWorld);
+    this.prevFov = camera.fov;
+    this.prevTime = this.time;
+    if (shift > 0.5 || jumped || this.accCount === 0) {
+      this.accCount = 1;
+      return 1;
+    }
+    this.accCount++;
+    return Math.max(1 / this.accCount, 0.1);
   }
 
   /** Camera position in the model frame (absolute pc). */
@@ -598,6 +949,7 @@ export class GalaxyLayer {
    */
   render(renderer: THREE.WebGLRenderer, camera: THREE.PerspectiveCamera, target: THREE.WebGLRenderTarget, o: GalaxyRenderOptions = {}): void {
     this.shared.uTime.value = this.time;
+    this.updateLocalISM();
     if (this.mapsDirty) this.renderMaps();
     const cam = this.cameraModel(camera, o.origin);
     const H = target.height;
@@ -610,6 +962,12 @@ export class GalaxyLayer {
       this.drawDebugMap(renderer, target);
       return;
     }
+    // The local star field takes over the light of the nearest stars when the viewer is in (or near)
+    // the stellar disk; the volume then leaves out emission within `nearCut` of the camera.
+    const Rc = Math.hypot(cam.x, cam.y);
+    this.localActive = this.starsVisible && this.darkMatter && Math.abs(cam.z) < 1500 && Rc < this.dens.trunc * 1.05;
+    const cutFade = 1 - THREE.MathUtils.smoothstep(Math.abs(cam.z), 600, 1500);
+    this.volMat.uniforms.uNearCut.value = this.localActive ? this.nearCut * cutFade : 0;
     if (this.useVolume && this.volumeVisible && this.volumeGain > 0.001) {
       if (!this.volRT) this.resize(target.width, target.height);
       const vu = this.volMat.uniforms;
@@ -621,12 +979,23 @@ export class GalaxyLayer {
       vu.uGain.value = this.radianceScale * this.volumeGain;
       this.quad.material = this.volMat;
       this.quad.render(renderer, this.volRT!);
+      // Temporal accumulation.
+      const au = this.accMat.uniforms;
+      const hist = this.accRT![this.accIdx];
+      const dst = this.accRT![1 - this.accIdx];
+      au.uAlpha.value = this.historyAlpha(camera, cam);
+      au.tCur.value = this.volRT!.texture;
+      au.tHist.value = hist.texture;
+      this.quad.material = this.accMat;
+      this.quad.render(renderer, dst);
+      this.accIdx = 1 - this.accIdx;
       const cu = this.compMat.uniforms;
-      cu.tVol.value = this.volRT!.texture;
+      cu.tVol.value = dst.texture;
       (cu.uTexel.value as THREE.Vector2).set(1 / this.volRT!.width, 1 / this.volRT!.height);
       this.quad.material = this.compMat;
       renderer.setRenderTarget(target);
       renderer.render(this.quad.scene, this.quad.camera);
+      if (++this.meterFrame % 6 === 1) this.runMeter(renderer, target);
     }
 
     if (this.stars && this.starsVisible) {
@@ -637,9 +1006,132 @@ export class GalaxyLayer {
       su.uMinRad.value = 0.0012 / Math.max(exposure, 1e-6);
       su.uSizeRef.value = 3 / Math.max(exposure, 1e-6);
       su.uMaxSize.value = Math.min(this.maxPointSize, 44);
+      if (this.integ && !this.darkMatter) {
+        su.uMode.value = 1;
+        su.uStatePos.value = this.integ.positions;
+        su.uStateW.value = this.integ.width;
+        su.uSwitchTime.value = this.darkOffTime;
+      } else su.uMode.value = 0;
+      const hu = this.hiiMat.uniforms;
+      hu.uPxPerRad.value = su.uPxPerRad.value = H / (2 * Math.tan(fov / 2));
+      hu.uMaxSize.value = Math.min(this.maxPointSize, 64);
+      hu.uGain.value = this.hiiGain * this.params.gas.hii;
       renderer.setRenderTarget(target);
       renderer.render(this.starScene, camera);
+      if (this.localActive) {
+        for (const lt of this.localTiers) {
+          const u = lt.mat.uniforms;
+          const C = u.uCell.value as number;
+          const R = u.uRadius.value as number;
+          // Skip tiers whose stars are all out of reach (camera far above or outside the disk).
+          lt.pts.visible = Math.abs(cam.z) < R + 2500 && Math.hypot(cam.x, cam.y) < this.dens.trunc * 1.1 + R;
+          (u.uCamCell.value as THREE.Vector3).set(Math.floor(cam.x / C), Math.floor(cam.y / C), Math.floor(cam.z / C));
+          u.uGain.value = this.radianceScale;
+        }
+        renderer.render(this.localScene, camera);
+      }
     }
+  }
+
+  /**
+   * The k stars nearest to `posPc` (render frame, pc) at the current time: procedural field stars of
+   * every luminosity class (the same ones the local star field draws), the OB stars of the orbit
+   * model, and the Sun (Milky Way). Sorted by distance. CPU; a few ms for k ≲ 100.
+   */
+  nearestStars(posPc: THREE.Vector3, k = 16): StarRecord[] {
+    const m = this.kin.fromRender(posPc.x, posPc.y, posPc.z, { x: 0, y: 0, z: 0 });
+    const field = nearestLocalStars(this.dens, this.params.seed >>> 0, m.x, m.y, m.z, k);
+    const out: Array<StarRecord & { d: number }> = field.map((f) => {
+      const v = new THREE.Vector3();
+      this.kin.toRender(f.x, f.y, f.h, v);
+      return { id: f.id, position: v, temperatureK: f.temperatureK, luminosity: f.luminosity, massSun: f.massSun, seed: f.seed, kind: 'field' as const, d: v.distanceTo(posPc) };
+    });
+    const reach = out.length ? out[out.length - 1].d : Infinity;
+    const sun = this.sunModel(new THREE.Vector3());
+    if (sun) {
+      const v = this.kin.toRender(sun.x, sun.y, sun.z, new THREE.Vector3()) as THREE.Vector3;
+      const d = v.distanceTo(posPc);
+      if (d < reach || out.length < k) out.push({ id: 0, position: v, temperatureK: 5772, luminosity: 1, massSun: 1, seed: 0, kind: 'sun', name: 'Sun', d });
+    }
+    const g = this.particles;
+    const young = g?.populations.find((q) => q.name === 'young');
+    if (g && young && this.darkMatter) {
+      const st: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+      const km = Math.max(1, g.youngMultiplicity);
+      for (let i = young.start; i < young.start + young.count; i++) {
+        if (g.data[i * STRIDE] !== KIND_YOUNG) continue;
+        particleState(this.kin, g.data, i, this.time, st);
+        if (st.lum <= 0) continue;
+        const d = Math.hypot(st.x - posPc.x, st.y - posPc.y, st.z - posPc.z);
+        if (d >= reach) continue;
+        out.push({
+          id: 2 ** 50 + i,
+          position: new THREE.Vector3(st.x, st.y, st.z),
+          temperatureK: st.temperature,
+          luminosity: st.lum / km,
+          massSun: g.data[i * STRIDE + 4],
+          seed: g.data[i * STRIDE + 11],
+          kind: 'young',
+          d,
+        });
+      }
+    }
+    out.sort((a, b) => a.d - b.d);
+    return out.slice(0, k).map(({ d: _d, ...r }) => r);
+  }
+
+  private runMeter(renderer: THREE.WebGLRenderer, target: THREE.WebGLRenderTarget): void {
+    if (this.meterPending || !this.volRT) return;
+    if (!this.meterRT) {
+      this.meterRT = new THREE.WebGLRenderTarget(16, 9, {
+        type: THREE.FloatType,
+        format: THREE.RGBAFormat,
+        minFilter: THREE.NearestFilter,
+        magFilter: THREE.NearestFilter,
+        depthBuffer: false,
+        stencilBuffer: false,
+        generateMipmaps: false,
+      });
+      this.meterMat = new THREE.ShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: FULLSCREEN_VERT,
+        fragmentShader: METER_FRAG,
+        depthTest: false,
+        depthWrite: false,
+        uniforms: { tVol: { value: null }, uFloor: { value: 0.5 } },
+      });
+    }
+    const mat = this.meterMat!;
+    mat.uniforms.tVol.value = this.accRT ? this.accRT[this.accIdx].texture : this.volRT.texture;
+    this.quad.material = mat;
+    this.quad.render(renderer, this.meterRT);
+    renderer.setRenderTarget(target);
+    this.meterPending = true;
+    const rt = this.meterRT;
+    renderer
+      .readRenderTargetPixelsAsync(rt, 0, 0, 16, 9, this.meterBuf)
+      .then(() => {
+        if (this.disposed) return;
+        const b = this.meterBuf;
+        let sl = 0;
+        let sw = 0;
+        let sa = 0;
+        let nl = 0;
+        for (let i = 0; i < 16 * 9; i++) {
+          sl += b[i * 4];
+          sw += b[i * 4 + 1];
+          sa += b[i * 4 + 2];
+          nl += b[i * 4 + 3];
+        }
+        const n = 16 * 9 * 16;
+        this.meter.lit = nl / n;
+        this.meter.lum = sw > 1e-3 ? Math.exp(sl / sw) : NaN;
+        this.meter.sky = Math.exp(sa / n);
+      })
+      .catch(() => {
+        /* metering is optional */
+      })
+      .finally(() => (this.meterPending = false));
   }
 
   private debugMat: THREE.ShaderMaterial | null = null;
@@ -663,10 +1155,20 @@ export class GalaxyLayer {
 
   dispose(): void {
     this.debugMat?.dispose();
+    this.meterRT?.dispose();
+    this.meterMat?.dispose();
+    this.integ?.dispose();
+    this.integ = null;
     this.disposed = true;
     this.worker?.terminate();
     this.worker = null;
     this.starGeom?.dispose();
+    this.hiiGeom?.dispose();
+    this.hiiMat.dispose();
+    for (const lt of this.localTiers) {
+      lt.geom.dispose();
+      lt.mat.dispose();
+    }
     this.starMat.dispose();
     this.volMat.dispose();
     this.compMat.dispose();
@@ -675,11 +1177,62 @@ export class GalaxyLayer {
     this.mapNormRT.dispose();
     this.noiseRT.dispose();
     this.volRT?.dispose();
+    this.accRT?.[0].dispose();
+    this.accRT?.[1].dispose();
+    this.accMat.dispose();
     this.lutTex.dispose();
   }
 }
 
 const ZERO = new THREE.Vector3();
+let MW_REF = 0;
+const mwRef = () => (MW_REF ||= mwReference(milkyWay(1)));
+
+/** A star record for navigation (Voyage): positions in the render frame, parsecs. */
+export interface StarRecord {
+  id: number;
+  position: THREE.Vector3;
+  temperatureK: number;
+  /** Bolometric luminosity, L☉. */
+  luminosity: number;
+  massSun: number;
+  seed: number;
+  /** 'sun', 'field' (procedural local star), or 'young' (an OB star of the orbit model). */
+  kind: 'sun' | 'field' | 'young';
+  name?: string;
+}
+
+/**
+ * Exposure metering: each texel of a 16 × 9 target summarises a block of the volume image as
+ * (Σ w·ln L, Σ w, max L) with w = L²/(L + L_floor), so empty sky does not drag the average down —
+ * the eye adapts to what it is looking at, and surface brightness does not depend on distance.
+ */
+const METER_FRAG = /* glsl */ `
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D tVol;
+uniform float uFloor;
+void main() {
+  vec2 cell = vec2(1.0 / 16.0, 1.0 / 9.0);
+  vec2 o = floor(vUv / cell) * cell;
+  float sl = 0.0, sw = 0.0, sa = 0.0, nl = 0.0;
+  for (int j = 0; j < 4; j++) {
+    for (int i = 0; i < 4; i++) {
+      vec2 uv = o + (vec2(float(i), float(j)) + 0.5) * cell * 0.25;
+      vec3 c = texture(tVol, uv).rgb;
+      float L = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+      // Brightness-weighted: the eye fixates on what is bright (the band, the bulge), not the gaps.
+      float w = L * L / (L + uFloor);
+      sl += w * log(L + 1e-12);
+      sw += w;
+      sa += log(L + uFloor * 0.05);
+      nl += step(uFloor * 0.3, L);
+    }
+  }
+  outColor = vec4(sl, sw, sa, nl);
+}
+`;
 
 /**
  * Integrals of the unnormalised bar shapes used by the volume shader (boxy/peanut core and long

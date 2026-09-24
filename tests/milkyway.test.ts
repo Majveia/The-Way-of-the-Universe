@@ -9,7 +9,8 @@ import {
   G_GAL,
   PCMYR_PER_KMS,
 } from '../src/physics/galaxyPotential';
-import { ccmExtinction, msLifetime, sampleKroupa, hiiRGB } from '../src/physics/galaxyStars';
+import { ccmExtinction, msLifetime, sampleKroupa, hiiRGB, visualEfficacy, visualEfficacyFit, stromgrenRadius, hiiLineLuminosity } from '../src/physics/galaxyStars';
+import { densityParams, lumDensity, mwReference, nearestLocalStars, LOCAL_TIERS } from '../src/worlds/galaxy/localStars';
 import { generateParticles, Kinematics, particleState, KIND_DISK, STRIDE, KIND_YOUNG, type ParticleState } from '../src/worlds/galaxy/model';
 import { milkyWay, preset, armPhi, wrapPi } from '../src/worlds/galaxy/params';
 import { pcg, hash2u, u01 } from '../src/worlds/galaxy/hash';
@@ -165,29 +166,31 @@ describe('GalaxyModel', () => {
     const g = generateParticles(p, 250000);
     const k = new Kinematics(p);
     const s: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
-    for (const t of [0, 60]) {
-      // Histogram of pattern-frame azimuth relative to the kinematic arm, stars at 5–8 kpc.
-      const bins = new Float64Array(36);
+    const cot = 1 / Math.tan((p.spiral.pitchDeg * Math.PI) / 180);
+    for (const t of [0, 60, 300]) {
+      // m = 2 Fourier component of the old-star surface density at 5–8 kpc, measured in the frame
+      // of the kinematic arm locus (pattern frame, φ_arm(R) = phase − cot(i) ln(R/r0)).
+      // A histogram argmax is noise-dominated; the Fourier phase and amplitude are robust.
+      let C = 0;
+      let S = 0;
+      let n = 0;
       for (let i = 0; i < g.count; i++) {
         if (g.data[i * STRIDE] !== KIND_DISK) continue;
         particleState(k, g.data, i, t, s);
         const R = Math.hypot(s.x, s.z);
         if (R < 5000 || R > 8000) continue;
-        const X = s.x;
-        const Y = -p.spin * s.z;
-        const phi = Math.atan2(Y, X) - k.omegaP * t;
-        const arm = p.spiral.phase - Math.log(R / p.spiral.r0) / Math.tan((p.spiral.pitchDeg * Math.PI) / 180);
-        // m = 2: fold by π
-        let d = wrapPi(2 * (phi - arm)) / 2;
-        const b = Math.floor(((d + Math.PI / 2) / Math.PI) * 36) % 36;
-        bins[b]++;
+        const phi = Math.atan2(-p.spin * s.z, s.x) - k.omegaP * t;
+        const d = 2 * (phi - (p.spiral.phase - Math.log(R / p.spiral.r0) * cot));
+        C += Math.cos(d);
+        S += Math.sin(d);
+        n++;
       }
-      let best = 0;
-      for (let b = 1; b < 36; b++) if (bins[b] > bins[best]) best = b;
-      const peak = ((best + 0.5) / 36) * Math.PI - Math.PI / 2;
-      expect(Math.abs(peak)).toBeLessThan(0.2); // within ~11° of the arm
-      const mean = bins.reduce((a, b2) => a + b2, 0) / 36;
-      expect(bins[best] / mean).toBeGreaterThan(1.12); // a real density contrast
+      const amp = (2 * Math.hypot(C, S)) / n; // δΣ/Σ
+      const phase = Math.atan2(S, C) / 2; // offset of the density maximum from the locus (rad)
+      expect(Math.abs(wrapPi(2 * phase) / 2)).toBeLessThan(0.15); // within ~9° of the arm
+      // Arm/inter-arm (1 + δ)/(1 − δ) ≈ 1.2–1.4: K-band contrasts of real spirals (Rix & Zaritsky 1995).
+      expect(amp).toBeGreaterThan(0.08);
+      expect(amp).toBeLessThan(0.3);
     }
   });
 
@@ -218,5 +221,63 @@ describe('GalaxyModel', () => {
     }
     expect(bright).toBeGreaterThan(20);
     expect(near / bright).toBeGreaterThan(0.6);
+  });
+});
+
+describe('local star field (procedural, CPU mirror of the GPU)', () => {
+  const p = milkyWay(1);
+  const dp = densityParams(p, mwReference(p));
+  const sun = p.sun!;
+  const sx = -sun.R; // model frame: the Sun at azimuth π
+  it('is normalised to the solar neighbourhood', () => {
+    expect(lumDensity(dp, sx, 0, sun.z) / dp.ref).toBeCloseTo(1, 6);
+    // Local luminosity function: ≈ 0.1 stars pc⁻³ and ≈ 0.04 L☉ pc⁻³ (Reid & Hawley 2005).
+    const n = LOCAL_TIERS.reduce((a, t) => a + t.n0, 0);
+    expect(n).toBeGreaterThan(0.08);
+    expect(n).toBeLessThan(0.14);
+  });
+  it('nearest stars are deterministic, sorted and at realistic distances', () => {
+    const a = nearestLocalStars(dp, 1, sx, 0, sun.z, 40);
+    const b = nearestLocalStars(dp, 1, sx, 0, sun.z, 40);
+    expect(a.map((s) => s.id)).toEqual(b.map((s) => s.id));
+    const d = a.map((s) => Math.hypot(s.x - sx, s.y, s.h - sun.z));
+    for (let i = 1; i < d.length; i++) expect(d[i]).toBeGreaterThanOrEqual(d[i - 1]);
+    // 40 stars at 0.1 pc⁻³ fill a sphere of ≈ 4.6 pc (the real count within 5 pc is ≈ 60–70 systems).
+    expect(d[39]).toBeGreaterThan(3);
+    expect(d[39]).toBeLessThan(7);
+    for (const s of a) {
+      expect(s.temperatureK).toBeGreaterThan(2000);
+      expect(s.temperatureK).toBeLessThan(40000);
+      expect(s.luminosity).toBeGreaterThan(0);
+    }
+    // Most nearby stars are M dwarfs.
+    expect(a.filter((s) => s.luminosity < 0.1).length / a.length).toBeGreaterThan(0.5);
+  });
+  it('star density follows the disk: far fewer stars 1 kpc above the plane', () => {
+    const inPlane = nearestLocalStars(dp, 1, sx, 0, 0, 30);
+    const above = nearestLocalStars(dp, 1, sx, 0, 1000, 30);
+    const r = (a: typeof inPlane, h: number) => Math.hypot(a[29].x - sx, a[29].y, a[29].h - h);
+    expect(r(above, 1000)).toBeGreaterThan(1.8 * r(inPlane, 0));
+  });
+});
+
+describe('visual efficacy', () => {
+  it('matches the numerical integral and the Sun is 1', () => {
+    for (const T of [3000, 4500, 5772, 9000, 15000, 30000]) {
+      expect(Math.log10(visualEfficacyFit(T) / visualEfficacy(T))).toBeLessThan(0.02);
+      expect(Math.log10(visualEfficacyFit(T) / visualEfficacy(T))).toBeGreaterThan(-0.02);
+    }
+    expect(visualEfficacy(5772)).toBeCloseTo(1, 6);
+    // Hot stars emit mostly ultraviolet: a 35 000 K O star gives ~6% of the Sun's light per watt.
+    expect(visualEfficacy(35000)).toBeLessThan(0.1);
+  });
+  it('HII regions: Strömgren radius and line luminosity', () => {
+    // Q = 10⁴⁹ s⁻¹ (an O7 star) at n = 30 cm⁻³ → R_S ≈ 7 pc; Orion (Q ≈ 10⁴⁹) glows at ~10⁴ L☉ in lines.
+    const r = stromgrenRadius(1e49, 30);
+    expect(r).toBeGreaterThan(5);
+    expect(r).toBeLessThan(9);
+    const L = hiiLineLuminosity(1e49);
+    expect(L).toBeGreaterThan(3e3);
+    expect(L).toBeLessThan(1e4);
   });
 });

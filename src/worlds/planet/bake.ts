@@ -113,7 +113,7 @@ function defaultBands(spec: PlanetSpec, rng: Rng): Array<[number, number, number
     return [[0.86, 0.76, 0.56], [0.8, 0.68, 0.48], [0.74, 0.6, 0.4], [0.66, 0.53, 0.36], [0.55, 0.47, 0.36]];
   }
   // Jupiter: cream zones, rusty belts.
-  return [[0.84, 0.77, 0.63], [0.76, 0.64, 0.47], [0.62, 0.45, 0.29], [0.48, 0.31, 0.18], [0.36, 0.23, 0.14]];
+  return [[0.64, 0.57, 0.44], [0.58, 0.45, 0.3], [0.47, 0.3, 0.16], [0.36, 0.2, 0.1], [0.26, 0.15, 0.08]];
 }
 
 // ——— GLSL ———
@@ -122,6 +122,41 @@ const BAKE_COMMON = /* glsl */ `
 precision highp float;
 ${COMMON_GLSL}
 ${NOISE_GLSL}
+// Band-limited fbm for the bake: octaves finer than ~2 texels of the target (measured with
+// screen-space derivatives of the noise coordinate) fade out instead of aliasing into speckle.
+float fbm3aa(vec3 p, int octaves) {
+  float w = max(length(fwidth(p)), 1e-7);
+  float nmax = log2(0.5 / w) + 1.0;
+  float sum = 0.0, amp = 0.5, norm = 0.0;
+  for (int i = 0; i < 12; i++) {
+    if (i >= octaves) break;
+    sum += amp * clamp(nmax - float(i), 0.0, 1.0) * snoise(p);
+    norm += amp;
+    p *= 2.0;
+    amp *= 0.5;
+  }
+  return sum / norm;
+}
+float ridged3aa(vec3 p, int octaves, float lacunarity, float gain) {
+  float w = max(length(fwidth(p)), 1e-7);
+  float nmax = log2(0.5 / w) / log2(lacunarity) + 1.0;
+  float sum = 0.0, amp = 0.5, norm = 0.0, prev = 1.0;
+  for (int i = 0; i < 12; i++) {
+    if (i >= octaves) break;
+    float n = 1.0 - abs(snoise(p));
+    n *= n;
+    float f = clamp(nmax - float(i), 0.0, 1.0);
+    // A faded octave contributes its mean (≈ 0.45) rather than noise.
+    sum += mix(0.45, n, f) * amp * prev;
+    norm += amp;
+    prev = mix(prev, n, f);
+    p *= lacunarity;
+    amp *= gain;
+  }
+  return sum / norm;
+}
+#define fbm3(p, o) fbm3aa(p, o)
+#define ridged3(p, o, l, g) ridged3aa(p, o, l, g)
 uniform vec3 uSeedOff;
 uniform float uSeaLevel;
 uniform float uTempK;
@@ -272,15 +307,47 @@ float terrainHeight(vec3 p, out vec4 aux) {
   aux.z = exp(-sqr(l1 / 0.09)) + exp(-sqr(l2 / 0.07));   // broad lineae stain
   return h;
 #elif defined(KIND_LAVA)
+  // Plate boundaries: F2 − F1 of 3D cellular noise, divided by its gradient along the surface so
+  // the cracks keep a constant width even where a cell wall meets the sphere at a grazing angle.
+  vec3 pe = normalize(vec3(p.z, 0.0, -p.x) + vec3(1e-5, 0.0, 0.0));
+  vec3 pn = cross(normalize(p), pe);
+  const float EPS = 0.004;
   vec2 wv = worley3(q * 3.2);
   float plates = wv.y - wv.x;
-  float h = fbm3(q * 1.8, 6) * 0.35 + smoothstep(0.0, 0.25, plates) * 0.12;
+  vec2 wva = worley3((q + pe * EPS) * 3.2), wvb = worley3((q + pn * EPS) * 3.2);
+  float gp = length(vec2(wva.y - wva.x - plates, wvb.y - wvb.x - plates)) / EPS;
+  float dPlate = plates / max(gp, 1e-3);          // ≈ angular distance to the nearest boundary (radii)
+  float h = fbm3(q * 1.8, 6) * 0.35 + smoothstep(0.0, 0.08, dPlate) * 0.12;
   vec2 wv2 = worley3(q * 9.0 + vec3(3.0));
-  float cracks = 1.0 - smoothstep(0.0, 0.06, plates);
-  float fine = 1.0 - smoothstep(0.0, 0.05, wv2.y - wv2.x);
+  vec2 wv2a = worley3((q + pe * EPS) * 9.0 + vec3(3.0)), wv2b = worley3((q + pn * EPS) * 9.0 + vec3(3.0));
+  float f2 = wv2.y - wv2.x;
+  float g2 = length(vec2(wv2a.y - wv2a.x - f2, wv2b.y - wv2b.x - f2)) / EPS;
+  float cracks = 1.0 - smoothstep(0.004, 0.014, dPlate);
+  float fine = 1.0 - smoothstep(0.002, 0.006, f2 / max(g2, 1e-3));
   aux.x = cracks;
   aux.y = fine;
   aux.z = fbm3(q * 4.0 + vec3(5.0), 4) * 0.5 + 0.5;
+  if (uTempK < 450.0) {
+    // Io: a cold sulphur-frosted crust with a few dozen active paterae (volcanic depressions with
+    // lava lakes), not a global network of cracks.
+    // Hot spots placed on the surface (angular radius 0.8°–3°, i.e. ~25–100 km on Io), some with
+    // large red plume-deposit rings.
+    vec3 pu = normalize(p);
+    float spots = 0.0, halo = 0.0;
+    for (int i = 0; i < 56; i++) {
+      vec3 h3 = hash31(float(i) * 7.13 + uVariant * 13.0);
+      vec3 h4 = hash31(float(i) * 3.71 + uVariant * 29.0 + 5.0);
+      float z = h4.x * 2.0 - 1.0, ph = h4.y * TAU;
+      vec3 c = vec3(sqrt(1.0 - z * z) * cos(ph), z, sqrt(1.0 - z * z) * sin(ph));
+      float r = radians(0.8 + 2.4 * h3.x * h3.y);
+      float a = acos(clamp(dot(pu, c), -1.0, 1.0));
+      spots = max(spots, (1.0 - smoothstep(r * 0.55, r, a)) * (0.5 + 0.5 * h3.z));
+      halo = max(halo, (1.0 - smoothstep(r * 1.5, r * 5.0, a)) * step(0.72, h3.z));
+    }
+    aux.x = spots;
+    aux.y = max(halo, spots);
+    h = fbm3(q * 1.8, 6) * 0.12 - aux.x * 0.05;
+  }
   vec2 cr = craterField(p, 6.0, 0.1 * uCraters, 6.0);
   h += cr.x * 0.1;
   return h;
@@ -343,6 +410,23 @@ float surfaceT(float lat, float elevKm) {
   return uTempK + 12.0 - 48.0 * sqr(sin(lat)) - 6.5 * max(elevKm, 0.0);
 }
 
+// Jupiter-like belt profile: 0 in zones, → 1 in belts (planetographic latitude, degrees).
+float beltFn(float x, float a, float b) {
+  return smoothstep(a - 1.3, a + 1.3, x) * (1.0 - smoothstep(b - 1.3, b + 1.3, x));
+}
+float jovianBelts(float l) {
+  float b = beltFn(l, 7.0, 17.5)          // North Equatorial Belt
+          + 0.95 * beltFn(l, -20.0, -7.5)   // South Equatorial Belt
+          + 0.55 * beltFn(l, 23.0, 28.5)    // North Temperate Belt
+          + 0.5 * beltFn(l, -34.0, -27.0)   // South Temperate Belt
+          + 0.4 * beltFn(l, 34.0, 38.5)
+          + 0.35 * beltFn(l, -44.0, -39.0)
+          + 0.3 * beltFn(l, 44.0, 49.0)
+          + 0.3 * beltFn(l, -54.0, -48.0)
+          + 0.12 * beltFn(l, -2.0, 2.0);   // equatorial band
+  return clamp(b, 0.0, 1.0);
+}
+
 vec4 albedoPass(vec3 d) {
   vec3 q = d + uSeedOff;
   float lat = asin(clamp(d.y, -1.0, 1.0));
@@ -389,13 +473,13 @@ vec4 albedoPass(vec3 d) {
   vec3 dust = vec3(0.44, 0.24, 0.12);
   vec3 dark = vec3(0.14, 0.09, 0.06);
   vec3 bright = vec3(0.56, 0.36, 0.2);
-  float prov = smoothstep(0.35, 0.7, aux.x + 0.1 * snoise(q * 8.0));
+  float prov = smoothstep(0.43, 0.6, aux.x + 0.08 * snoise(q * 8.0));
   vec3 col = mix(dark, dust, prov);
   col = mix(col, bright, smoothstep(0.62, 0.85, aux.x) * 0.6);
   // Bright dust settles in low basins; dark sand in crater floors.
   col *= 0.9 + 0.25 * smoothstep(-0.1, 0.3, h - uSeaLevel);
   // Polar caps (CO₂ + water ice) with swirled troughs.
-  float capLat = radians(90.0 - 22.0 * uIce);
+  float capLat = radians(90.0 - 44.0 * uIce);
   float swirl = snoise(vec3(d.x * 7.0 + d.z * 3.0, d.y * 3.0, d.z * 7.0 - d.x * 3.0) + uSeedOff);
   float cap = smoothstep(capLat - 0.06, capLat + 0.02, abs(lat) + 0.04 * swirl) * (0.75 + 0.25 * step(0.0, swirl + 0.6));
   col = mix(col, vec3(0.84, 0.82, 0.8), cap);
@@ -415,6 +499,16 @@ vec4 albedoPass(vec3 d) {
 #elif defined(KIND_LAVA)
   vec4 aux = AUX(d);
   float h = H(d);
+  if (uTempK < 450.0) {
+    // Io palette: yellow sulphur and white SO₂ frost, reddish-brown poles, black paterae ringed by
+    // red short-chain sulphur plume deposits (Pele-like).
+    vec3 col = mix(vec3(0.62, 0.53, 0.25), vec3(0.74, 0.72, 0.6), smoothstep(0.35, 0.75, aux.z));
+    col = mix(col, vec3(0.52, 0.4, 0.2), smoothstep(0.4, 0.7, snoise(q * 3.0) * 0.5 + 0.5) * 0.5);
+    col = mix(col, vec3(0.34, 0.24, 0.16), smoothstep(radians(50.0), radians(75.0), abs(lat)) * 0.8);
+    col = mix(col, vec3(0.55, 0.22, 0.09), smoothstep(0.0, 0.6, aux.y - aux.x) * 0.55);
+    col = mix(col, vec3(0.035, 0.03, 0.028), smoothstep(0.05, 0.5, aux.x));
+    return vec4(sqrt(col * uTint), 0.0);
+  }
   vec3 crust = vec3(0.055, 0.047, 0.043) * (0.8 + 0.4 * (snoise(q * 11.0) * 0.5 + 0.5));
   vec3 sulfur = vec3(0.45, 0.37, 0.12);
   // Sulphur frosts (Io-like) survive only on cooler crusts.
@@ -422,7 +516,7 @@ vec4 albedoPass(vec3 d) {
   vec3 col = mix(crust, sulfur, s * 0.5);
   float lake = smoothstep(uSeaLevel + 0.02, uSeaLevel - 0.02, h);
   col = mix(col, vec3(0.03, 0.02, 0.02), lake);
-  return vec4(sqrt(col * uTint), lake * 0.6);
+  return vec4(sqrt(col * uTint), 0.0);
 #elif defined(KIND_BARREN)
   vec4 aux = AUX(d);
   vec3 high = vec3(0.24, 0.23, 0.21);
@@ -443,82 +537,84 @@ vec4 albedoPass(vec3 d) {
   col *= 1.0 - 0.06 * smoothstep(0.9, 1.3, abs(lat));
   return vec4(sqrt(col * uTint), 0.0);
 #elif defined(KIND_GAS) || defined(KIND_ICEGIANT)
-  // Zonal jets + belts/zones; turbulent vortices from a few curl-noise advection steps (strongest at
-  // band edges where the shear is largest), storms as elliptical anticyclones.
+  // Belts and zones from a Jupiter-like latitude profile (NEB, SEB, NTB, STB… with sharp edges);
+  // zonally stretched turbulence strongest inside belts and at their edges; festoons along the
+  // equatorial zone; white ovals; a Great-Red-Spot-like anticyclone with a turbulent wake.
 #if defined(KIND_ICEGIANT)
-  float turb = 0.35;
-  float bandFreq = 3.0;
+  float turb = 0.3;
+  float latScale = 2.2;
 #else
   float turb = 1.0;
-  float bandFreq = 9.0 + 3.0 * uVariant;
+  float latScale = uHexagon > 0.0 ? 1.35 : 1.0;   // Saturn's bands are broader
 #endif
   vec3 p = d;
-  // Storm swirl (Great Red Spot–like): rotate the local frame around the storm centre.
+  // Storm swirl: rotate the local frame around the storm centre.
   vec3 sc = vec3(cos(uStormPos.x) * cos(uStormPos.y), sin(uStormPos.x), -cos(uStormPos.x) * sin(uStormPos.y));
-  vec3 se = normalize(vec3(sc.z, 0.0, -sc.x));
-  vec3 sn = cross(sc, se);
+  vec3 se = normalize(vec3(sc.z, 0.0, -sc.x));   // east
+  vec3 sn = cross(sc, se);                        // north
   vec2 sl = vec2(dot(d, se), dot(d, sn));
-  float sr = length(sl / vec2(0.2, 0.11));
-  float stormMask = uStorm * exp(-sr * sr * 1.3);
-  if (uStorm > 0.0 && sr < 2.5) {
-    float ang = 3.2 * exp(-sr * sr * 0.9);
+  float sr = dot(d, sc) > 0.0 ? length(sl / vec2(0.19, 0.105)) : 99.0;   // near hemisphere only
+  float stormMask = uStorm * smoothstep(1.05, 0.85, sr);
+  if (uStorm > 0.0 && sr < 2.2) {
+    float ang = 4.0 * exp(-sr * sr * 1.1) * (1.0 - 0.3 * sr);
     vec2 rl = rot2(ang) * sl;
     p = normalize(sc * sqrt(max(0.0, 1.0 - dot(rl, rl))) + se * rl.x + sn * rl.y);
   }
-  // Fake fluid: advect through curl noise, stretched zonally.
-  vec3 q = p;
-  float edge = 0.0;
-  for (int i = 0; i < 5; i++) {
-    float la = asin(clamp(q.y, -1.0, 1.0));
-    float shear = abs(cos(la * bandFreq * 2.0 + uVariant * 6.0));
-    vec3 cn = curlNoise(vec3(q.x * 2.5, q.y * 7.0, q.z * 2.5) + uSeedOff + float(i) * 1.7);
-    q = normalize(q + cn * 0.006 * turb * (0.4 + shear));
-    edge += shear;
-  }
-  float la = asin(clamp(q.y, -1.0, 1.0));
-  // Band function: several harmonics in latitude with seeded phases; sharpened.
-  float b = 0.5 + 0.5 * sin(la * bandFreq * 2.0 + uVariant * 6.0)
-          + 0.18 * sin(la * bandFreq * 4.3 + uVariant * 11.0)
-          + 0.12 * fbm3(vec3(0.0, la * 12.0, uVariant * 9.0), 3);
-  b = clamp(b, 0.0, 1.0);
-  float polar = smoothstep(radians(55.0), radians(75.0), abs(la));
-  float x = mix(b, 0.7 + 0.2 * b, polar);
-  vec3 col = bandColor(x);
+  float la0 = asin(clamp(p.y, -1.0, 1.0));
+  float lon0 = atan(-p.z, p.x);
+  // Turbulence: small meridional displacement, larger zonal stretching; stronger in belts.
+  vec3 zq = vec3(cos(lon0) * 3.0, la0 * 9.0, sin(lon0) * 3.0) + uSeedOff;
+  float latDeg0 = degrees(la0) / latScale + (uVariant - 0.5) * 3.0;
+  float beltness = jovianBelts(latDeg0);
+  float t1 = fbm3(zq * 1.7, 5);
+  float t2 = fbm3(vec3(zq.x * 4.0, zq.y * 3.0, zq.z * 4.0) + 7.0, 5);
+  float dLat = turb * radians(1.8) * (0.3 + beltness) * t1;
+  // Wake west of the storm (the SEB's chaotic region).
+  float wake = uStorm * exp(-sqr((degrees(la0 - uStormPos.x)) / 5.0)) * smoothstep(0.0, 0.6, sin(uStormPos.y - lon0));
+  dLat += wake * radians(1.5) * t2;
+  float la = la0 + dLat;
+  float latDeg = degrees(la) / latScale + (uVariant - 0.5) * 3.0;
+  float x = jovianBelts(latDeg);
+  // Polar regions: mottled, darker, bluer (Jupiter) — or Saturn's hexagon.
+  float polar = smoothstep(55.0, 70.0, abs(degrees(la)));
+  vec3 col = bandColor(clamp(0.05 + 0.9 * x + 0.22 * t2 * turb * (0.4 + beltness), 0.0, 1.0));
   // Fine zonal filaments.
-  float fil = fbm3(vec3(q.x * 6.0, q.y * 60.0, q.z * 6.0) + uSeedOff * 1.3, 5);
-  col *= 1.0 + 0.18 * fil * turb;
-  // Festoons/hot spots at the equatorial belt edges.
-  float fest = smoothstep(0.55, 0.9, snoise(vec3(q.x * 8.0, q.y * 18.0, q.z * 8.0) + 5.0)) * exp(-sqr(degrees(la) / 9.0)) * (1.0 - uHexagon);
-  col = mix(col, uBands[uBandCount - 1] * 0.75, fest * 0.5 * turb);
-  // Polar regions: mottled, darker, bluish (Jupiter) — or a hexagonal jet (Saturn).
-  vec3 polarCol = mix(uBands[uBandCount - 1], vec3(0.32, 0.34, 0.37), 0.5);
-  col = mix(col, polarCol * (0.8 + 0.4 * (snoise(q * 20.0) * 0.5 + 0.5)), polar * 0.65 * (1.0 - uHexagon));
+  float fil = fbm3(vec3(cos(lon0) * 8.0, la * 90.0, sin(lon0) * 8.0) + uSeedOff * 1.3 + vec3(t1 * 0.6), 5);
+  col *= 1.0 + 0.22 * fil * turb * (0.4 + beltness);
+  // Festoons: dark blue-grey plumes from the NEB's southern edge into the equatorial zone.
+  float edge = exp(-sqr((degrees(la) / latScale - 6.0) / 2.2));
+  float fest = smoothstep(0.35, 0.75, snoise(vec3(cos(lon0) * 9.0, la * 12.0, sin(lon0) * 9.0) + 5.0)) * edge * (1.0 - uHexagon);
+  col = mix(col, vec3(0.34, 0.36, 0.4), fest * 0.5 * turb);
+  vec3 polarCol = mix(uBands[uBandCount - 1], vec3(0.36, 0.38, 0.42), 0.45);
+  col = mix(col, polarCol * (0.85 + 0.3 * (fbm3(p * 14.0 + uSeedOff, 4) * 0.5 + 0.5)), polar * 0.7 * (1.0 - uHexagon));
   if (uHexagon > 0.0) {
     float lon = atan(-d.z, d.x);
     float hexR = radians(90.0 - 78.0) / cos(mod(lon + uVariant, TAU / 6.0) - PI / 6.0);
     float hx = smoothstep(0.012, 0.0, abs((PI * 0.5 - abs(lat)) - hexR)) * step(0.0, d.y);
     col = mix(col, uBands[uBandCount - 1] * 0.8, hx * 0.8);
-    col = mix(col, vec3(0.25, 0.3, 0.38), smoothstep(radians(84.0), radians(89.0), lat) * 0.6);
+    col = mix(col, vec3(0.3, 0.34, 0.4), smoothstep(radians(80.0), radians(89.0), lat) * 0.6);
   }
-  // White ovals and the storm body.
-  vec3 ov = vec3(0.0);
-  for (int i = 0; i < 6; i++) {
+  // White ovals in the southern temperate belts.
+  for (int i = 0; i < 5; i++) {
     vec3 h3 = hash31(float(i) * 13.1 + uVariant * 71.0);
-    float olat = radians(-45.0 + 90.0 * h3.x);
+    float olat = radians(-(31.0 + 10.0 * h3.x) * latScale);
     float olon = h3.y * TAU;
     vec3 oc = vec3(cos(olat) * cos(olon), sin(olat), -cos(olat) * sin(olon));
-    float od = acos(clamp(dot(d, oc), -1.0, 1.0)) / radians(1.2 + 2.5 * h3.z);
-    col = mix(col, vec3(0.93, 0.9, 0.86), exp(-od * od * 2.0) * 0.8 * turb);
+    vec3 oe = normalize(vec3(oc.z, 0.0, -oc.x));
+    vec3 on = cross(oc, oe);
+    vec2 ol = vec2(dot(d, oe), dot(d, on)) / (radians(1.4 + 1.6 * h3.z) * vec2(1.6, 1.0));
+    col = mix(col, vec3(0.8, 0.78, 0.74), step(0.0, dot(d, oc)) * exp(-dot(ol, ol) * 1.5) * 0.85 * turb * (1.0 - uHexagon));
   }
-  vec3 stormCol = vec3(0.66, 0.3, 0.15);
-  col = mix(col, stormCol * (0.85 + 0.3 * fil), stormMask * 0.85);
-  col = mix(col, uBands[0] * 1.05, uStorm * exp(-sqr(sr - 1.3) * 6.0) * 0.4);
+  // The storm: brick-red core, pale collar (the "Red Spot Hollow").
+  vec3 stormCol = vec3(0.56, 0.24, 0.11);
+  col = mix(col, uBands[0] * 1.04, uStorm * smoothstep(1.6, 1.15, sr) * smoothstep(0.8, 1.1, sr) * 0.7);
+  col = mix(col, stormCol * (0.9 + 0.25 * fil), stormMask * 0.9);
 #if defined(KIND_ICEGIANT)
   // Neptune-like dark spot with bright methane-ice companions.
   vec3 dc = vec3(cos(-0.35) * cos(uVariant * 6.0), sin(-0.35), -cos(-0.35) * sin(uVariant * 6.0));
   float dd = acos(clamp(dot(d, dc), -1.0, 1.0));
   col *= 1.0 - 0.35 * exp(-sqr(dd / 0.09)) * step(0.5, uVariant);
-  float cirrus = smoothstep(0.7, 0.95, snoise(vec3(q.x * 5.0, q.y * 26.0, q.z * 5.0) + 9.0));
+  float cirrus = smoothstep(0.7, 0.95, snoise(vec3(p.x * 5.0, p.y * 26.0, p.z * 5.0) + 9.0));
   col = mix(col, vec3(0.9, 0.93, 0.95), cirrus * 0.35 * smoothstep(0.1, 0.6, abs(d.y)));
 #endif
   return vec4(sqrt(max(col, 0.0) * uTint), 0.0);
@@ -564,6 +660,7 @@ vec4 normalPass(vec3 d) {
   float lake = smoothstep(uSeaLevel + 0.02, uSeaLevel - 0.02, h0);
   float heat = fbm3((d + uSeedOff) * 4.0 + vec3(5.0), 4) * 0.5 + 0.5;
   emission = clamp(max(aux.x * 0.95, aux.y * 0.55) * (0.6 + 0.4 * heat) + lake * 0.85, 0.0, 1.0);
+  if (uTempK < 450.0) emission = clamp(aux.x * (0.5 + 0.5 * heat), 0.0, 1.0);
 #endif
   return vec4(N * 0.5 + 0.5, emission);
 #else

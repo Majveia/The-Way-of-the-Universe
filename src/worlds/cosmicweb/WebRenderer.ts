@@ -144,6 +144,8 @@ export class WebRenderer {
   private lastDensityKey = '';
   /** Screen-space pixel density for sprite sizes. */
   pixelRatio = 1;
+  /** Composite brightness (× exposure) and galaxy brightness; tunable. */
+  readonly look = { bright: 0.3, galaxy: 2.2e-4 };
 
   constructor(renderer: THREE.WebGLRenderer, opts: WebRendererOptions) {
     this.renderer = renderer;
@@ -167,7 +169,7 @@ export class WebRenderer {
       return { tex, data, frame: -1 };
     });
     // Density atlas: G³ with G ≈ 64 (a few Mpc) — smooth enough for colour and smoothing lengths.
-    const G = Math.min(64, opts.np);
+    const G = opts.np >= 128 ? 96 : Math.min(64, opts.np);
     this.grid = G;
     this.tilesX = Math.ceil(Math.sqrt(G));
     while (G % this.tilesX !== 0) this.tilesX++;
@@ -268,6 +270,7 @@ export class WebRenderer {
         uStride: { value: 1 },
         uStrideOffset: { value: 0 },
         uGain: { value: 1 },
+        uEmit: { value: 1.0 },
       },
       ...ADDITIVE,
       depthTest: false,
@@ -284,8 +287,8 @@ export class WebRenderer {
       fragmentShader: COMPOSITE_FRAG,
       uniforms: {
         tAccum: { value: this.accum.texture },
-        uSoft: { value: 0.5 },
-        uBright: { value: 0.5 },
+        uSoft: { value: 2.0 },
+        uBright: { value: 0.3 },
         uFloor: { value: 0.0 },
         uSat: { value: 1.0 },
       },
@@ -461,6 +464,11 @@ export class WebRenderer {
     this.galaxyCount = n;
   }
 
+  /** Size of the accumulation target (pixels). */
+  get accumSize(): { width: number; height: number } {
+    return { width: this.accum.width, height: this.accum.height };
+  }
+
   resize(width: number, height: number): void {
     this.accum.setSize(Math.max(1, Math.round(width * this.accumScale)), Math.max(1, Math.round(height * this.accumScale)));
   }
@@ -488,7 +496,7 @@ export class WebRenderer {
   }
 
   /** Render the web into `target` (linear HDR, already cleared) with `camera`. */
-  render(target: THREE.WebGLRenderTarget, camera: THREE.PerspectiveCamera, st: WebFrameState, hasParticles: boolean): void {
+  render(target: THREE.WebGLRenderTarget | null, camera: THREE.PerspectiveCamera, st: WebFrameState, hasParticles: boolean): void {
     const r = this.renderer;
     const S = this.shared;
     // Primordial glow first (background at infinity).
@@ -551,7 +559,7 @@ export class WebRenderer {
       r.render(this.accumScene, camera);
       if (st.replicas > 0 && !st.wrap && !st.slab) {
         // Neighbouring periodic images, sparsely sampled and faint.
-        const stride = N > 1e6 ? 8 : N > 3e5 ? 4 : 2;
+        const stride = N > 1e6 ? 16 : N > 3e5 ? 8 : 4;
         am.uStride.value = stride;
         am.uGain.value = st.darkMatter * st.replicas * stride;
         this.particleGeo.setDrawRange(0, Math.floor(N / stride));
@@ -572,12 +580,12 @@ export class WebRenderer {
 
     // 3. composite into the HDR target
     const cm = this.compositeMat.uniforms;
-    cm.uBright.value = 0.55 * st.exposure;
+    cm.uBright.value = this.look.bright * st.exposure;
     this.quad.material = this.compositeMat;
     this.quad.render(r, target);
 
     // 4. galaxies (point sources, straight into HDR)
-    const gl = focal * focal * 2.2e-4 * st.exposure;
+    const gl = focal * focal * this.look.galaxy * st.exposure;
     if (st.fieldGalaxies > 0 && this.fieldCount > 0) {
       const fm = this.fieldMat.uniforms;
       fm.uD.value = st.D;
@@ -604,6 +612,18 @@ export class WebRenderer {
       this.outlineMat.color.setRGB(0.028 * st.outline, 0.026 * st.outline, 0.03 * st.outline);
       r.setRenderTarget(target);
       r.render(this.outlineScene, camera);
+    }
+  }
+
+  /** Debug/tuning: set any accumulation or composite uniform by name. */
+  tune(p: Record<string, number>): void {
+    for (const [k, v] of Object.entries(p)) {
+      if (k === 'bright' || k === 'galaxy') {
+        this.look[k] = v;
+        continue;
+      }
+      const u = this.accumMat.uniforms[k] ?? this.compositeMat.uniforms[k] ?? this.galaxyMat.uniforms[k];
+      if (u) u.value = v;
     }
   }
 

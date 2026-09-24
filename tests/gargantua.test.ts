@@ -33,6 +33,9 @@ import {
   type Vec3,
   type Vec4,
 } from '../src/worlds/blackhole/kerr';
+import { PlungeTrajectory, schwarzschildRainRadius, schwarzschildRainTime } from '../src/worlds/blackhole/plunge';
+import { innerHorizonRadius, shadowAngularWidth } from '../src/worlds/blackhole/kerr';
+import { exposureFactor, fovForDistance, MASS_PRESETS } from '../src/experiences/gargantua/presets';
 
 /** Static camera on the +x axis (optionally lifted to latitude `elev`) looking at the hole. */
 function camera(a: number, r: number, elev = 0) {
@@ -317,5 +320,79 @@ describe('tides', () => {
   it('a human survives the horizon of Sgr A* but not of a 10 M☉ hole', () => {
     expect(tidalAcceleration(4.3e6, 2, 2)).toBeLessThan(0.01);
     expect(tidalAcceleration(10, 2, 2)).toBeGreaterThan(1e7);
+  });
+});
+
+// ————————————————————————————————————————————————————————————— added: plunge, shadow size, UI maths
+
+describe('free-fall plunge (rain observer)', () => {
+  it('Schwarzschild: r(τ) follows (r₀^{3/2} − 3τ/√2)^{2/3}', () => {
+    const pl = new PlungeTrajectory(0, [20, 0, 3]);
+    const r0 = pl.r;
+    pl.step(30);
+    expect(pl.r).toBeCloseTo(schwarzschildRainRadius(r0, 30), 5);
+    // and on to near the singularity in the analytic proper time
+    const left = schwarzschildRainTime(pl.r, 0.3);
+    pl.step(left);
+    expect(pl.r).toBeCloseTo(0.3, 3);
+    expect(pl.tau).toBeCloseTo(schwarzschildRainTime(r0, 0.3), 5);
+  });
+  it('crosses the Kerr horizon smoothly and stays a unit timelike geodesic', () => {
+    const a = 0.9;
+    const pl = new PlungeTrajectory(a, [12, 0, 4]);
+    let crossed = false;
+    for (let i = 0; i < 4000 && pl.r > pl.endRadius; i++) {
+      pl.step(0.01 * pl.r);
+      if (pl.inside) crossed = true;
+      const u = pl.velocity();
+      expect(u.every(Number.isFinite)).toBe(true);
+    }
+    expect(crossed).toBe(true);
+    expect(pl.r).toBeLessThan(horizonRadius(a));
+    expect(pl.r).toBeGreaterThan(innerHorizonRadius(a));
+    // u·u = −1 at the end
+    const [x, y, z] = pl.pos;
+    const g = ksMetric(a, x, y, z);
+    expect(dot4(g, pl.velocity(), pl.velocity())).toBeCloseTo(-1, 8);
+    // E = −u_t = 1 and L_z = 0 are conserved along the fall (zero-angular-momentum observer)
+    const uc = [0, 0, 0, 0];
+    const u = pl.velocity();
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) uc[i] += g[i * 4 + j] * u[j];
+    expect(-uc[0]).toBeCloseTo(1, 8);
+    expect(x * uc[2] - y * uc[1]).toBeCloseTo(0, 8);
+  });
+  it('dr/dτ → −1 at the Schwarzschild horizon (the river flows at c there)', () => {
+    const pl = new PlungeTrajectory(0, [2, 0, 0]);
+    expect(pl.radialSpeed()).toBeCloseTo(-1, 8);
+  });
+});
+
+describe('shadow angular size at the camera', () => {
+  it('Schwarzschild matches Synge: sin ψ = √27 √(1 − 2/r) / r', () => {
+    for (const r of [10, 40]) {
+      const w = shadowAngularWidth(0, [r, 0, 0.5], 30);
+      const d = Math.hypot(r, 0.5);
+      const psi = Math.asin((Math.sqrt(27) * Math.sqrt(1 - 2 / d)) / d);
+      expect(w / 2).toBeCloseTo(psi, 3);
+    }
+  });
+  it('inside the photon sphere the shadow covers more than half the sky', () => {
+    expect(shadowAngularWidth(0, [2.6, 0, 0], 24)).toBeGreaterThan(Math.PI);
+  });
+});
+
+describe('camera helpers', () => {
+  it('lens narrows with distance and exposure stops down up close and face-on', () => {
+    expect(fovForDistance(5)).toBeCloseTo(64, 6);
+    expect(fovForDistance(60)).toBeCloseTo(26, 6);
+    expect(fovForDistance(1000)).toBeCloseTo(26, 6);
+    expect(exposureFactor(40, 0)).toBeCloseTo(1, 6);
+    expect(exposureFactor(4, 0)).toBeLessThan(0.5);
+    expect(exposureFactor(40, Math.PI / 2)).toBeCloseTo(0.65, 6);
+  });
+  it('mass presets are ordered physical values', () => {
+    expect(MASS_PRESETS.sgra.mass).toBeCloseTo(4.3e6, -4);
+    expect(MASS_PRESETS.m87.mass).toBeGreaterThan(1e9);
+    expect(MASS_PRESETS.cygx1.mass).toBeLessThan(100);
   });
 });

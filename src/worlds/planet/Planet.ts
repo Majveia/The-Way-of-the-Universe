@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { PlanetSpec, PlanetUpdate, PlanetView } from './types';
 import { resolveAtmosphereSpec, type AtmosphereRenderParams } from '../../physics/planets-atmosphere';
 import { AURORA_LINES, lambertPhase, lineColor } from '../../physics/planets-photometry';
+import { luminousEfficiency } from '../../physics/spectrum';
 import { acquireLUTs, generateLUTs, releaseLUTs, type AtmosphereLUTs } from './luts';
 import { BAKE_KINDS, bakeSurface, bakeSize, kindDefine, worldUniforms, type BakedSurface } from './bake';
 import { ringTexture } from './rings';
@@ -33,6 +34,8 @@ export interface PlanetRenderer extends PlanetView {
   setDate(ms: number): void;
   /** Mean albedo colour (linear) used for sub-pixel rendering. */
   readonly meanAlbedo: THREE.Color;
+  /** Planetocentric position of the named storm (gas giants with `storm`), rad; null otherwise. */
+  readonly stormPosition: { lat: number; lon: number } | null;
 }
 
 /**
@@ -42,11 +45,29 @@ export interface PlanetRenderer extends PlanetView {
  */
 export const LIGHTS_SCALE = 0.9;
 
+/**
+ * Aurora and airglow get the same night-vision exaggeration as the city lights (≈ 10⁴ over a daylight
+ * exposure), so their brightness relative to the cities is physical: a bright auroral arc
+ * (~100 kR in O I 557.7 nm, ≈ 3 × 10⁻⁴ W m⁻² sr⁻¹) is comparable to a city seen from orbit, and the
+ * ~250 R airglow layer is only visible edge-on at the limb, as in astronaut photographs.
+ */
+export const NIGHT_GLOW_SCALE = 120;
+
 const tmpM = new THREE.Matrix4();
 const tmpV = new THREE.Vector3();
 const tmpV2 = new THREE.Vector3();
 const tmpQ = new THREE.Quaternion();
 const tmpS = new THREE.Vector3();
+
+/**
+ * Linear RGB of an emission line carrying a given radiant power (relative to 555 nm): the
+ * chromaticity of λ scaled by its luminous efficiency V(λ), so a violet line is as dim as it is.
+ */
+function lineRadiance(nm: number, scale: number): THREE.Vector3 {
+  const c = lineColor(nm);
+  const k = (luminousEfficiency(nm) / luminousEfficiency(555)) * scale;
+  return new THREE.Vector3(c[0] * k, c[1] * k, c[2] * k);
+}
 
 let sharedEarthDefaults: { magAxis: THREE.Vector3 } | null = null;
 
@@ -204,10 +225,10 @@ export class Planet implements PlanetRenderer {
       uUmbraLight: { value: new THREE.Vector3(0, 0, 0) },
       uAurora: { value: auroraAmt },
       uAirglow: { value: airglowAmt },
-      uAuroraGreen: { value: new THREE.Vector3(...lineColor(AURORA_LINES.OI_GREEN)).multiplyScalar(0.9) },
-      uAuroraRed: { value: new THREE.Vector3(...lineColor(AURORA_LINES.OI_RED)).multiplyScalar(0.9) },
-      uAuroraBlue: { value: new THREE.Vector3(...lineColor(AURORA_LINES.N2_PLUS)).multiplyScalar(0.9) },
-      uAirglowColor: { value: new THREE.Vector3(...lineColor(AURORA_LINES.OI_GREEN)).lerp(new THREE.Vector3(...lineColor(AURORA_LINES.NA_D)), 0.35).multiplyScalar(0.018) },
+      uAuroraGreen: { value: lineRadiance(AURORA_LINES.OI_GREEN, 2 * NIGHT_GLOW_SCALE) },
+      uAuroraRed: { value: lineRadiance(AURORA_LINES.OI_RED, 2 * NIGHT_GLOW_SCALE) },
+      uAuroraBlue: { value: lineRadiance(AURORA_LINES.N2_PLUS, 2 * NIGHT_GLOW_SCALE) },
+      uAirglowColor: { value: lineRadiance(AURORA_LINES.OI_GREEN, 1).lerp(lineRadiance(AURORA_LINES.NA_D, 1), 0.35).multiplyScalar(0.004 * NIGHT_GLOW_SCALE) },
       uAuroraTime: { value: 0 },
       uAuroraShell: { value: new THREE.Vector4(1 + 90 / radiusKm, 1 + 420 / radiusKm, 1 / radiusKm, 0) },
       uRingTex: { value: null },
@@ -519,6 +540,13 @@ export class Planet implements PlanetRenderer {
     this.surfaceMat.uniforms.uDayB.value = tb;
   }
 
+  /** (ext) Planetocentric position of the named storm (rad), or null. */
+  get stormPosition(): { lat: number; lon: number } | null {
+    if (!this.spec.storm || !this.world) return null;
+    const v = this.world.uStormPos.value as THREE.Vector2;
+    return { lat: v.x, lon: v.y };
+  }
+
   setOptions(o: PlanetOptions): void {
     const c = this.common;
     if (o.clouds !== undefined) c.uCloudOpacity.value = o.clouds;
@@ -533,8 +561,10 @@ export class Planet implements PlanetRenderer {
   }
 
   setOccluders(list: Array<{ position: THREE.Vector3; radius: number; umbraLight?: THREE.Color }>): void {
-    this.occluders = list.slice(0, 2);
-    const ul = list.find((o) => o.umbraLight)?.umbraLight;
+    // Stored by reference (no per-frame garbage); only the first two are used.
+    this.occluders = list;
+    let ul: THREE.Color | undefined;
+    for (let i = 0; i < list.length && i < 2; i++) if (list[i].umbraLight) ul = list[i].umbraLight;
     this.common.uUmbraLight.value.set(ul?.r ?? 0, ul?.g ?? 0, ul?.b ?? 0);
   }
 
