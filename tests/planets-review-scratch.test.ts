@@ -126,3 +126,31 @@ it('explore integrator convergence', () => {
   }
   console.log(rows.join('\n'));
 });
+function compose(a: { L: number[]; T: number[] }, b: { L: number[]; T: number[] }) {
+  return { L: a.L.map((x, k) => x + a.T[k] * b.L[k]), T: a.T.map((x, k) => x * b.T[k]) };
+}
+it('explore split integrator', () => {
+  const rows: string[] = [];
+  const H = A.rayleighH;
+  const cmidR = 1 + 0.5 * (0.25 * H + 1.1 * H);
+  for (const vz of [0, 45, 70, 80, 85, 88]) {
+    const g = [0, 1, 0];
+    const vdir = [Math.sin(vz * DEG), Math.cos(vz * DEG), 0];
+    const cam = [g[0] + vdir[0] * 3, g[1] + vdir[1] * 3, g[2] + vdir[2] * 3];
+    const rd = [-vdir[0], -vdir[1], -vdir[2]];
+    const top = raySphere(cam, rd, A.top)!; const gr = raySphere(cam, rd, 1)!; const cm = raySphere(cam, rd, cmidR)!;
+    for (const sz of [0, 60, 85, 90, 93]) {
+      const sun = [Math.sin(sz * DEG) * Math.cos(0.7), Math.cos(sz * DEG), Math.sin(sz * DEG) * Math.sin(0.7)];
+      const ref = integrate(cam, rd, sun, top[0], gr[0], 800);
+      const old = integrate(cam, rd, sun, top[0], raySphere(cam, rd, 1 + 1.1 * H)![0], 14);
+      const errs: string[] = [`old14(missing slab air):${(100 * (old.L[2] - ref.L[2]) / ref.L[2]).toFixed(1)}%`];
+      for (const [n, m] of [[4, 3], [5, 3], [6, 3], [6, 4], [8, 4], [10, 4], [12, 4]]) {
+        const r = compose(integrate(cam, rd, sun, top[0], cm[0], n), integrate(cam, rd, sun, cm[0], gr[0], m));
+        const e = Math.max(...[0, 1, 2].map((k) => Math.abs(r.L[k] - ref.L[k]) / Math.max(ref.L[k], 1e-6)));
+        errs.push(`${n}+${m}:${(e * 100).toFixed(2)}%`);
+      }
+      rows.push(`vz ${vz} sz ${sz} ${errs.join(' ')}`);
+    }
+  }
+  console.log(rows.join('\n'));
+});

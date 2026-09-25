@@ -161,6 +161,11 @@ class Voyage implements Experience {
   }> = {};
   private viewButtons!: { setActive(i: number): void };
   private warpManual = 1 / (365.25 * 1440);
+  /** Probe draw callback (one closure for the experience's lifetime, not one per frame). */
+  private drawProbeSky = (c: THREE.Camera): void => this.local.sky.render(this.ctx.renderer, c, 0.5);
+  /** Galaxies drawn this frame, sorted far → near (reused). */
+  private galaxyOrder: GalaxyEntry[] = [];
+  private fartherFirst = (a: GalaxyEntry, b: GalaxyEntry): number => this.navRoot.distanceToSquared(b.frame.origin) - this.navRoot.distanceToSquared(a.frame.origin);
   /** Default framing: Sun azimuth/elevation from the nose (deg), chase camera offsets (rad). */
   departureSun = { az: 100, el: 20, camYaw: 0.4, camPitch: 0 };
 
@@ -1588,8 +1593,14 @@ class Voyage implements Experience {
       this.skyCam.updateProjectionMatrix();
     }
     const e = this.exposure;
-    // Environment probe: the local sky as the ship sees it.
-    if (this.view !== 'sky' && this.local.fade > 0.01) this.probe.update(r, (c) => this.local.sky.render(r, c, 0.5), this.time < 0.2 ? 6 : 1);
+    // Off-screen passes first — the environment probe (the local sky as the ship sees it) and the
+    // ship's shadow map — so the (multisampled) scene target is bound once and never has to be
+    // stored and reloaded mid-frame (a full MSAA store + load per switch on tile-based GPUs).
+    if (this.view !== 'sky' && this.local.fade > 0.01) this.probe.update(r, this.drawProbeSky, this.time < 0.2 ? 6 : 1);
+    if (this.view !== 'sky') {
+      this.ship.pixelRatio = eng.pixelRatio;
+      this.ship.updateShadow(r);
+    }
     r.setRenderTarget(target);
     // 1. The real sky of the solar neighbourhood (writes the background).
     this.local.renderSky(r, this.skyCam, eng.pixelRatio, eng.cssHeight);
@@ -1608,7 +1619,10 @@ class Voyage implements Experience {
       pixelRatio: eng.pixelRatio,
     });
     // 3. Galaxies in full, farthest first (their dust extinguishes what lies behind).
-    const order = cz.galaxies.filter((g) => g.weight > 0.001 && g.layer && !bhFull).sort((a, b) => this.navRoot.distanceToSquared(b.frame.origin) - this.navRoot.distanceToSquared(a.frame.origin));
+    const order = this.galaxyOrder;
+    order.length = 0;
+    if (!bhFull) for (const g of cz.galaxies) if (g.weight > 0.001 && g.layer) order.push(g);
+    if (order.length > 1) order.sort(this.fartherFirst);
     for (const g of order) {
       const lc = this.layerCam;
       convertPoint(nav.position, nav.frame, g.frame, _v2);
@@ -1660,12 +1674,10 @@ class Voyage implements Experience {
       this.sgra.render(target, _q2, this.skyCam.fov, camRg, this.postE, this.ctx.engine.frame);
       r.setRenderTarget(target);
     }
-    // 6. The ship.
+    // 6. The ship (its shadow map was drawn before the scene target was bound).
     if (this.view !== 'sky') {
-      r.clearDepth();
-      this.ship.pixelRatio = eng.pixelRatio;
-      this.ship.updateShadow(r);
       r.setRenderTarget(target);
+      r.clearDepth();
       const warpDir = travelDir ?? fl.forward(_v3);
       const imag = this.trip ? 0.42 * THREE.MathUtils.clamp(Math.log10(Math.max(this.speed / SPEED_OF_LIGHT, 1)) / 4, 0, 1) : this.speed > SPEED_OF_LIGHT ? 0.25 : 0;
       this.warpStrength += (imag - this.warpStrength) * 0.08;
