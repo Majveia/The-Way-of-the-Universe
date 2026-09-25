@@ -336,3 +336,305 @@ describe('Earth experience — view geometry', async () => {
     expect(v).toBeLessThan(0.95);
   });
 });
+
+// ——— Review (hardening pass): end-to-end frames, eclipses, integrator accuracy, glows, tiers ———
+
+const AU_KM = 149597870.7;
+const R_E = 6371;
+const toThree = (ra: number, dec: number) => astroToThree(new THREE.Vector3().copy(radecToVector(ra, dec, new THREE.Vector3())));
+
+/** Where the Sun→Moon axis meets the (spherical) Earth: geocentric lat/lon (deg), or null. */
+function shadowAxisPoint(ms: number): { lat: number; lon: number; moonKm: number; sunAng: number } | null {
+  const jd = msToJD(ms);
+  const s = sunState(jd);
+  const m = moonState(jd);
+  const S = radecToVector(s.ra, s.dec, { x: 0, y: 0, z: 0 });
+  const M = radecToVector(m.ra, m.dec, { x: 0, y: 0, z: 0 });
+  const sun: V3 = [S.x * s.distanceAU * AU_KM, S.y * s.distanceAU * AU_KM, S.z * s.distanceAU * AU_KM];
+  const moon: V3 = [M.x * m.distanceKm, M.y * m.distanceKm, M.z * m.distanceKm];
+  const d: V3 = [moon[0] - sun[0], moon[1] - sun[1], moon[2] - sun[2]];
+  const l = Math.hypot(...d);
+  const hit = raySphere(moon, [d[0] / l, d[1] / l, d[2] / l], R_E);
+  if (!hit) return null;
+  const p = moon.map((x, i) => x + (d[i] / l) * hit[0]);
+  let lon = (Math.atan2(p[1], p[0]) - gmst(jd)) / DEG;
+  lon = ((lon + 540) % 360) - 180;
+  return { lat: Math.asin(p[2] / R_E) / DEG, lon, moonKm: m.distanceKm, sunAng: Math.asin(695700 / (s.distanceAU * AU_KM)) };
+}
+
+describe('review — frames: ephemeris, sidereal rotation and the three.js scene agree', () => {
+  it('the subsolar point of the rotated Earth faces the Sun (texture longitude convention × GMST × astroToThree)', () => {
+    for (const ms of [Date.UTC(2026, 8, 25, 19, 42), Date.UTC(2024, 5, 20, 20, 51), Date.UTC(1990, 1, 14, 4, 48), Date.UTC(2027, 7, 2, 10, 7)]) {
+      const jd = msToJD(ms);
+      const s = sunState(jd);
+      // Body-fixed direction of (lat, lon) as the surface shader's equirectUV reads it: lon = atan(−z, x).
+      const lat = s.subsolarLat, lon = s.subsolarLon;
+      const body = new THREE.Vector3(Math.cos(lat) * Math.cos(lon), Math.sin(lat), -Math.cos(lat) * Math.sin(lon));
+      const earth = new THREE.Object3D();
+      earth.rotation.y = gmst(jd); // PlanetRenderer.setRotation(gmst)
+      earth.updateMatrixWorld();
+      const world = body.applyMatrix4(earth.matrixWorld);
+      const sun = toThree(s.ra, s.dec);
+      expect(world.angleTo(sun)).toBeLessThan(1e-9);
+    }
+  });
+  it('the Moon is tidally locked: longitude 0 faces the Earth, north pole on the ecliptic pole, right-handed', async () => {
+    const { moonOrientation } = await import('../src/experiences/earth/math');
+    const jd = msToJD(Date.UTC(2026, 8, 25, 20));
+    const m = moonState(jd);
+    const pos = toThree(m.ra, m.dec).multiplyScalar(m.distanceKm / R_E);
+    const eps = meanObliquity(jd);
+    const q = moonOrientation(pos, eps, new THREE.Quaternion());
+    const x = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
+    const y = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+    const z = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+    // |β| ≤ 5.3°: the sub-Earth point stays within the Moon's latitude range from its equator.
+    expect(x.angleTo(pos.clone().negate())).toBeLessThan(5.4 * DEG);
+    expect(y.angleTo(new THREE.Vector3(0, Math.cos(eps), Math.sin(eps)))).toBeLessThan(1e-9);
+    expect(new THREE.Vector3().crossVectors(x, y).dot(z)).toBeCloseTo(1, 9);
+    // Seen from Earth with north up, lunar east (Mare Crisium, +58°E) is on the right (IAU convention).
+    const crisium = new THREE.Vector3(Math.cos(58 * DEG), 0, -Math.sin(58 * DEG)).applyQuaternion(q);
+    const view = pos.clone().normalize();
+    const right = new THREE.Vector3().crossVectors(view, y).normalize();
+    expect(crisium.dot(right)).toBeGreaterThan(0.5);
+  });
+});
+
+describe('review — eclipses reproduce NASA geometry (Espenak & Meeus, Five Millennium Canon)', () => {
+  // Greatest eclipse (TD; the module takes UT ≈ TT, so ΔT ≈ 69 s shifts longitudes ≈ 0.3° west).
+  const cases: Array<[string, number, number, number]> = [
+    ['2027-08-02 total, Luxor', Date.UTC(2027, 7, 2, 10, 7, 50), 25.52, 33.13],
+    ['2024-04-08 total, Mexico', Date.UTC(2024, 3, 8, 18, 17, 16), 25.29, -104.14],
+    ['2017-08-21 total, Kentucky', Date.UTC(2017, 7, 21, 18, 25, 32), 36.97, -87.67],
+  ];
+  for (const [label, ms, lat, lon] of cases) {
+    it(`solar ${label}: the Moon's shadow axis meets the Earth within ~100 km, and the eclipse is total`, () => {
+      const p = shadowAxisPoint(ms)!;
+      expect(p).not.toBeNull();
+      // Geodetic → geocentric latitude differs by ≤ 0.19°; the series and ΔT add ≲ 0.7°.
+      expect(Math.abs(p.lat - lat)).toBeLessThan(0.9);
+      expect(Math.abs(p.lon - lon)).toBeLessThan(1.0);
+      // Seen from the point, the Moon (≥ 1 R⊕ closer than its centre distance) covers the Sun.
+      expect(Math.asin(1737.4 / (p.moonKm - R_E))).toBeGreaterThan(p.sunAng);
+    });
+  }
+  it('lunar 2025-09-07 and 2025-03-14: the renderer occlusion model puts the Moon in full umbra at greatest eclipse', () => {
+    const at = (ms: number) => {
+      const jd = msToJD(ms);
+      const s = sunState(jd);
+      const m = moonState(jd);
+      const S = radecToVector(s.ra, s.dec, { x: 0, y: 0, z: 0 });
+      const M = radecToVector(m.ra, m.dec, { x: 0, y: 0, z: 0 });
+      const p: V3 = [(M.x * m.distanceKm) / R_E, (M.y * m.distanceKm) / R_E, (M.z * m.distanceKm) / R_E];
+      // The Earth's shadow, enlarged ~2 % by its atmosphere (Danjon), as the experience passes it.
+      return occluderVisibility(p, [0, 0, 0], 1.012, [S.x, S.y, S.z], Math.asin(695700 / (s.distanceAU * AU_KM)));
+    };
+    for (const ms of [Date.UTC(2025, 8, 7, 18, 11, 48), Date.UTC(2025, 2, 14, 6, 58, 43)]) {
+      const o = at(ms);
+      expect(o.visible).toBe(0);
+      expect(o.umbra).toBeCloseTo(1, 6);
+    }
+    // Umbral first contact 16:27 UT: the Moon's centre is one lunar radius outside the umbra (partial).
+    const c1 = at(Date.UTC(2025, 8, 7, 16, 27));
+    expect(c1.umbra).toBe(0);
+    expect(c1.visible).toBeGreaterThan(0.2);
+    expect(c1.visible).toBeLessThan(0.9);
+    // Penumbral first contact 15:28 UT: the centre is still fully sunlit.
+    expect(at(Date.UTC(2025, 8, 7, 15, 28)).visible).toBe(1);
+  });
+});
+
+describe('review — atmosphere quadrature (surface pass) against a converged reference', () => {
+  const A = resolveAtmosphereSpec({ preset: 'earth' });
+  const H = A.rayleighH;
+  const cloudTop = 1 + 1.1 * H;
+  const cloudBase = 1 + 0.25 * H;
+  /** A ray from 3 R⊕ looking down at a ground point with view zenith angle vz; sun at zenith angle sz. */
+  const geometry = (vz: number, sz: number) => {
+    const vdir: V3 = [Math.sin(vz * DEG), Math.cos(vz * DEG), 0];
+    const ro: V3 = [vdir[0] * 3, 1 + vdir[1] * 3, 0];
+    const rd: V3 = [-vdir[0], -vdir[1], 0];
+    const sun: V3 = [Math.sin(sz * DEG) * Math.cos(0.7), Math.cos(sz * DEG), Math.sin(sz * DEG) * Math.sin(0.7)];
+    const top = raySphere(ro, rd, A.top)!;
+    const ground = raySphere(ro, rd, 1)!;
+    return { ro, rd, sun, t0: top[0], t1: ground[0] };
+  };
+  const relErr = (x: V3, ref: V3) => Math.max(...[0, 1, 2].map((k) => Math.abs(x[k] - ref[k]) / ref[k]));
+  const views: Array<[number, number]> = [[0, 0], [0, 60], [45, 30], [70, 60], [80, 85], [85, 0]];
+
+  it('the clear-sky path through the cloud deck keeps its air: the old split lost ~40 % of the in-scattered light', () => {
+    for (const [vz, sz] of views) {
+      const g = geometry(vz, sz);
+      const ref = integrateAtmoRef(A, g.ro, g.rd, g.sun, g.t0, g.t1, 800);
+      const ca = raySphere(g.ro, g.rd, cloudTop)![0];
+      const cb = raySphere(g.ro, g.rd, cloudBase)![0];
+      // Before: top → cloud top (14 steps), cloud base → ground (3 steps); the slab's air skipped.
+      const old = composeSeg(integrateAtmoRef(A, g.ro, g.rd, g.sun, g.t0, ca, 14), integrateAtmoRef(A, g.ro, g.rd, g.sun, cb, g.t1, 3));
+      expect(old.L[2] / ref.L[2]).toBeLessThan(0.85);
+      // Now: top → middle of the deck, deck → ground, with the 'high' tier's sample counts.
+      const st = planetSteps(1);
+      const cm = 0.5 * (ca + cb);
+      const now = composeSeg(integrateAtmoRef(A, g.ro, g.rd, g.sun, g.t0, cm, st.above), integrateAtmoRef(A, g.ro, g.rd, g.sun, cm, g.t1, st.below));
+      expect(relErr(now.L, ref.L)).toBeLessThan(0.03);
+      // Grazing views (85°) see the ground through T ≈ 0.05 in blue; 4 % of that is 0.002.
+      expect(relErr(now.T, ref.T)).toBeLessThan(vz >= 80 ? 0.045 : 0.012);
+    }
+  });
+  it('every quality tier stays within a few percent (low ≤ 7 %, medium ≤ 4 %)', () => {
+    for (const [detail, tol] of [[0.35, 0.07], [0.7, 0.04], [1.6, 0.02]] as const) {
+      const st = planetSteps(detail);
+      for (const [vz, sz] of views) {
+        const g = geometry(vz, sz);
+        const ref = integrateAtmoRef(A, g.ro, g.rd, g.sun, g.t0, g.t1, 800);
+        const cm = 0.5 * (raySphere(g.ro, g.rd, cloudTop)![0] + raySphere(g.ro, g.rd, cloudBase)![0]);
+        const r = composeSeg(integrateAtmoRef(A, g.ro, g.rd, g.sun, g.t0, cm, st.above), integrateAtmoRef(A, g.ro, g.rd, g.sun, cm, g.t1, st.below));
+        expect(relErr(r.L, ref.L)).toBeLessThan(tol);
+      }
+    }
+  });
+});
+
+describe('review — emission shells (aurora, airglow) are sampled over their own altitudes', () => {
+  const km = 1 / 6371;
+  const rc = 1 + 95 * km;
+  const s = 6 * km;
+  const layer = (r: number) => Math.exp(-(((r - rc) / s) ** 2));
+  const column = s * Math.sqrt(Math.PI); // ∫ exp(−(h/s)²) dh
+  it('shell samples are a partition: weights sum to the path length inside the shell', () => {
+    for (const [ro, rd] of [
+      [[0, 3, 0], [0, -1, 0]], // straight down
+      [[3, 1 + 30 * km, 0], [-1, 0, 0]], // limb, tangent at 30 km: crosses the shell twice
+      [[3, 1 + 105 * km, 0], [-1, 0, 0]], // limb, tangent inside the layer
+    ] as Array<[V3, V3]>) {
+      const sp = shellPath(ro, rd, -1e9, 1e9, rc - 3 * s, rc + 3 * s)!;
+      let w = 0;
+      for (let i = 0; i < 16; i++) w += shellSample(sp, (i + 0.5) / 16, 16)[1];
+      expect(w).toBeCloseTo(sp.lo1 - sp.a + (sp.b - sp.lo2), 9);
+    }
+  });
+  it('a thin layer is integrated accurately seen from above and at the limb with the tier sample counts', () => {
+    // Straight down through the layer: the column.
+    const down = shellIntegral([0, 3, 0], [0, -1, 0], -1e9, raySphere([0, 3, 0], [0, -1, 0], 1)![0], rc - 3 * s, rc + 3 * s, planetSteps(0.35).airglow, layer);
+    expect(Math.abs(down / column - 1)).toBeLessThan(0.02);
+    // Limb ray tangent at the layer's peak: reference by brute force.
+    const ro: V3 = [3, rc, 0];
+    const rd: V3 = [-1, 0, 0];
+    let ref = 0;
+    for (let i = 0; i < 400000; i++) {
+      const t = 1 + (i + 0.5) * 1e-5; // x from 2 to −2: the whole chord
+      ref += layer(Math.hypot(ro[0] + rd[0] * t, ro[1])) * 1e-5;
+    }
+    for (const detail of [0.7, 1]) {
+      const limb = shellIntegral(ro, rd, -1e9, 1e9, rc - 3 * s, rc + 3 * s, planetSteps(detail).airglow, layer);
+      expect(Math.abs(limb / ref - 1)).toBeLessThan(0.1);
+    }
+  });
+});
+
+describe('review — night-glow photometry (one night-vision gain for cities, aurora and airglow)', () => {
+  it('1 kR of O I 557.7 nm is 1.9 × 10⁻⁴ cd m⁻²; the gain maps a bright city to LIGHTS_SCALE', () => {
+    // 1 kR = 10¹³/4π photons s⁻¹ m⁻² sr⁻¹ × hc/λ (3.56 × 10⁻¹⁹ J) = 2.84 × 10⁻⁷ W m⁻² sr⁻¹; × 683 lm/W × V.
+    expect(kiloRayleighLuminance(557.73)).toBeGreaterThan(1.85e-4);
+    expect(kiloRayleighLuminance(557.73)).toBeLessThan(1.97e-4);
+    expect((CITY_LUMINANCE / UNIT_LUMINANCE) * NIGHT_GAIN).toBeCloseTo(LIGHTS_SCALE, 9);
+    expect(NIGHT_GAIN).toBeGreaterThan(5e4);
+    expect(NIGHT_GAIN).toBeLessThan(3e5);
+  });
+  it('a bright auroral arc seen straight down is ~1/15 of a saturated city; the red line tops the green', () => {
+    const g = auroraLineGains(6371);
+    const vertical = (gain: number, f: (h: number) => number) => (gain * profileColumnKm(f)) / 6371;
+    const green = vertical(g.green, auroraGreenProfile);
+    expect(green).toBeCloseTo(AURORA_BRIGHT_KR.green * kiloRayleighRadiance(AURORA_LINES_NM.green), 9);
+    expect(green / LIGHTS_SCALE).toBeGreaterThan(1 / 30);
+    expect(green / LIGHTS_SCALE).toBeLessThan(1 / 8);
+    // The emission the old renderer drew (only below the 100 km top of the scattering atmosphere) was
+    // ~2 % of the green column and none of the red.
+    expect(profileColumnKm(auroraGreenProfile, 88, 100) / profileColumnKm(auroraGreenProfile)).toBeLessThan(0.03);
+    expect(profileColumnKm(auroraRedProfile, 88, 100)).toBe(0);
+    // Red (O I 630.0 nm) emission lives above 200 km; green peaks near 110 km.
+    expect(profileColumnKm(auroraRedProfile, 200, 420) / profileColumnKm(auroraRedProfile)).toBeGreaterThan(0.8);
+    expect(profileColumnKm(auroraGreenProfile, 95, 200) / profileColumnKm(auroraGreenProfile)).toBeGreaterThan(0.8);
+  });
+});
+
+describe('review — quality tiers and portability', () => {
+  it('sample counts scale with the tier: low costs well under half of high per pixel', () => {
+    const cost = (d: number) => {
+      const s = planetSteps(d);
+      return s.above + s.below + 0.5 * (s.auroraLow + s.auroraHigh + s.airglow);
+    };
+    expect(cost(0.35) / cost(1)).toBeLessThan(0.5);
+    expect(cost(0.7)).toBeLessThan(cost(1));
+    expect(planetSteps(0.35).detailLevel).toBe(0);
+    expect(planetSteps(0.7).detailLevel).toBe(1);
+    expect(planetSteps(1).detailLevel).toBe(2);
+  });
+  it('RGBA8 LUT fallback (no renderable half floats) keeps sunset transmittance within a few percent', () => {
+    for (const [v, k] of [[0.9, 0], [0.2, 0], [0.02, 0], [0.05, 1], [0.3, 2]] as Array<[number, number]>) {
+      const q = Math.round(lutEncode(v, LUT_SCALE[k], true) * 255) / 255;
+      expect(Math.abs(lutDecode(q, LUT_SCALE[k], true) / v - 1)).toBeLessThan(0.06);
+      expect(lutDecode(lutEncode(v, LUT_SCALE[k], false), LUT_SCALE[k], false)).toBe(v);
+    }
+  });
+});
+
+describe('review — Pale Blue Dot, seasons, stars, sprites', () => {
+  it('the final field gives Voyager\'s pixel scale on any viewport: the Earth is the same sub-pixel dot everywhere', async () => {
+    const { fovForDistance, voyagerGeocentricAU, AU_RE, NAC_PIXEL_DEG } = await import('../src/experiences/earth/math');
+    const v = voyagerGeocentricAU();
+    const d = Math.hypot(v.x, v.y, v.z) * AU_RE;
+    for (const px of [390, 720, 1080, 1600]) {
+      const fov = fovForDistance(d, px);
+      expect(fov / px).toBeCloseTo(NAC_PIXEL_DEG, 6);
+      // Angular diameter 2.1 µrad over a 9.25 µrad NAC pixel: 0.23 px across (NASA's "0.12 pixel" is
+      // about its radius), however many CSS pixels the screen has.
+      const earthPx = (2 * Math.asin(1 / d)) / DEG / (fov / px);
+      expect(earthPx).toBeGreaterThan(0.2);
+      expect(earthPx).toBeLessThan(0.26);
+    }
+    expect(fovForDistance(4, 1080)).toBeCloseTo(34, 6);
+  });
+  it('seasonal imagery weights are continuous through the year and the year boundary', () => {
+    let prev: number[] | null = null;
+    const w = [0, 0, 0, 0];
+    const out = { a: 0, b: 0, t: 0 };
+    for (let ms = Date.UTC(2023, 11, 1); ms < Date.UTC(2025, 1, 1); ms += 3_600_000) {
+      const { a, b, t } = seasonalBlend(ms, out);
+      w.fill(0);
+      w[a] += 1 - t;
+      w[b] += t;
+      if (prev) for (let k = 0; k < 4; k++) expect(Math.abs(w[k] - prev[k])).toBeLessThan(0.002);
+      prev = w.slice();
+    }
+    // Mid-January is pure January.
+    const jan = seasonalBlend(Date.UTC(2025, 0, 16, 12));
+    expect(jan.a).toBe(0);
+    expect(jan.t).toBeLessThan(0.01);
+  });
+  it('utcYear matches Date for 20 000 timestamps across 1900–2100 (leap years, year boundaries)', () => {
+    for (let i = 0; i < 20000; i++) {
+      const ms = Date.UTC(1900, 0, 1) + ((i * 7919.123) % 1) * 0 + i * 315_576_000 + ((i * 2654435761) % 86_400_000);
+      expect(utcYear(ms)).toBe(new Date(ms).getUTCFullYear());
+    }
+    for (const y of [1999, 2000, 2024, 2100]) {
+      expect(utcYear(Date.UTC(y, 0, 1))).toBe(y);
+      expect(utcYear(Date.UTC(y, 0, 1) - 1)).toBe(y - 1);
+    }
+  });
+  it('star shader constants: hc/(λk) at 555 nm = 25 925 K; limb/centre at 555 nm ≈ 0.3 (Allen: 0.30 at 550 nm)', () => {
+    expect(C2_555).toBeCloseTo(25925, -1);
+    const T0 = limbTemperature(5772, 0), T1 = limbTemperature(5772, 1);
+    const ratio = Math.expm1(C2_555 / T1) / Math.expm1(C2_555 / T0);
+    expect(ratio).toBeGreaterThan(0.25);
+    expect(ratio).toBeLessThan(0.4);
+  });
+  it('the sub-pixel sprite (σ = 0.75 px Gaussian in a 5 px point) conserves flux: 2πσ² = 3.53', () => {
+    // POINT_VERT/STAR_POINT_VERT divide by 3.53; sum the truncated Gaussian over the 5 × 5 pixel grid.
+    for (const [ox, oy] of [[0, 0], [0.3, -0.2], [0.49, 0.49]]) {
+      let sum = 0;
+      for (let y = -2; y <= 2; y++) for (let x = -2; x <= 2; x++) sum += Math.exp(-((x - ox) ** 2 + (y - oy) ** 2) / (2 * 0.75 * 0.75));
+      if (ox === 0 && oy === 0) expect(sum / 3.53).toBeCloseTo(1, 1);
+      expect(Math.abs(sum / 3.53 - 1)).toBeLessThan(0.06);
+    }
+  });
+});

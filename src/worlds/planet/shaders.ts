@@ -10,10 +10,14 @@ import { ATMO_GLSL, ATMO_INTEGRATE_GLSL, ATMO_LOOKUP_GLSL, AURORA_GLSL, RING_TAU
  */
 
 export const PROXY_VERT = /* glsl */ `
+// Extra inflation of the proxy so its silhouette clears the true limb by a few pixels: with MSAA, samples
+// of a limb pixel outside a tight proxy would get neither the surface (not covered) nor the sky pass
+// (which leaves ground rays to the surface) — darkened pixels along the limb.
+uniform float uProxyScale;
 out vec3 vPos;
 void main() {
-  vPos = position;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  vPos = position * uProxyScale;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(vPos, 1.0);
 }`;
 
 const HEADER = /* glsl */ `
@@ -235,7 +239,8 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
   s.albedo = mix(day * 0.82, wcol, water * (1.0 - iceLike));
   s.spec = water * (1.0 - iceLike);
   // Relief from GEBCO elevation at the pixel footprint (≥ 1 texel), exaggerated by uRelief.
-  if (uRelief > 0.0 && water < 0.99) {
+  // Relief from the elevation map (four taps); dropped on the lowest quality tier.
+  if (DETAIL_LEVEL >= 1 && uRelief > 0.0 && water < 0.99) {
     float cl = max(cos(lat), 0.05);
     float du = max(1.0 / 4096.0, footprint / TAU / cl);
     float dv = max(1.0 / 2048.0, footprint / PI);
@@ -369,10 +374,12 @@ CloudHit cloudSlab(vec3 ro, vec3 rd, float a, float b, float footprint, vec3 E0)
   vec3 Es = uSunColor * Ts * occlusion(pm * uEllipsoid, umb) * E0;
   vec3 L = Es * max(muS, 0.0) * R * 0.96 + Esky * R;
   // Forward-scattering (silver lining) from thin cloud edges.
+#if DETAIL_LEVEL >= 1
   float back = phaseHG(dot(rd, uSunDir), 0.7) * 4.0 * PI;
   L += Es * back * max(muS + 0.1, 0.0) * (1.0 - h.T) * (1.0 - R) * 0.12;
   // Lit from below by cities.
   L += cityGlow(dm, footprint) * max(1.0 - R - h.T, 0.0) * 0.9;
+#endif
   h.L = L * (1.0 - h.T * 0.0);
   return h;
 }
@@ -438,7 +445,11 @@ void main() {
 #else
   float rsh = 1.0;
 #endif
+#if DETAIL_LEVEL >= 1
   float csh = cloudShadowAt(p);
+#else
+  float csh = 1.0;   // lowest tier: no cloud shadows
+#endif
   vec3 Esun = uSunColor * Tsun * occ * rsh * csh;
   Esky *= mix(1.0, occ, 0.9) * mix(1.0, rsh, 0.5);
   float NoL = max(dot(s.N, uSunDir), 0.0);

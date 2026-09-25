@@ -245,6 +245,7 @@ export class Planet implements PlanetRenderer {
       uRingTex: { value: null },
       uRingRange: { value: new THREE.Vector2(0, 0) },
       uRingOpacity: { value: spec.rings?.opacity ?? 1 },
+      uProxyScale: { value: 1 },
     };
     if (this.luts) {
       // Shared LUT/atmosphere uniforms, but the stellar angular size is per planet.
@@ -313,6 +314,7 @@ export class Planet implements PlanetRenderer {
           ...this.common,
           ...this.bodyU,
           uHalf: { value: half },
+          uProxyScale: { value: 1 },
           uRingColor: { value: new THREE.Vector3(rc[0], rc[1], rc[2]) },
           uRingColorB: { value: new THREE.Vector3(rc[0] * 0.78, rc[1] * 0.8, rc[2] * 0.9) },
           uRingAlbedo: { value: 0.55 },
@@ -465,7 +467,10 @@ export class Planet implements PlanetRenderer {
     mesh.matrixWorld.decompose(tmpV2, tmpQ, tmpS);
     const worldR = this.spec.radius * (this.object.matrixWorld.getMaxScaleOnAxis() || 1);
     const dist = tmpV.setFromMatrixPosition(camera.matrixWorld).distanceTo(tmpV2);
-    this.common.uPixelRadius.value = perspective ? (worldR / Math.max(dist, 1e-12)) * p11 * 0.5 * h : 1000;
+    const pxR = perspective ? (worldR / Math.max(dist, 1e-12)) * p11 * 0.5 * h : 1000;
+    this.common.uPixelRadius.value = pxR;
+    // Keep the proxies' silhouettes ≥ 2.5 px outside the limb (see PROXY_VERT).
+    this.common.uProxyScale.value = 1 + Math.min(0.05, 2.5 / Math.max(pxR, 1));
     const caps = renderer.capabilities as unknown as { reverseDepthBuffer?: boolean; logarithmicDepthBuffer?: boolean };
     if (caps.logarithmicDepthBuffer) {
       this.common.uDepthMode.value = 2;
@@ -478,7 +483,7 @@ export class Planet implements PlanetRenderer {
     if (!this.prepared) this.prepare(renderer);
     this.beforeSpin(renderer, camera, this.surface);
     // Inside the (inflated) proxy? Render back faces so the ground still covers the view.
-    const inside = tmpV.copy(this.spinU.uCamPos.value).divide(this.ellipsoid).length() < 1.0016;
+    const inside = tmpV.copy(this.spinU.uCamPos.value).divide(this.ellipsoid).length() < 1.0016 * (this.common.uProxyScale.value as number);
     const side = inside ? THREE.BackSide : THREE.FrontSide;
     if (this.surfaceMat.side !== side) {
       this.surfaceMat.side = side;

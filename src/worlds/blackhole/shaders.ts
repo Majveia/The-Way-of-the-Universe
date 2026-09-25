@@ -22,6 +22,10 @@
  */
 import { COMMON_GLSL } from '../../shaders/lib/common';
 import { NOISE_GLSL } from '../../shaders/lib/noise';
+import { STEP_LAW } from './kerr';
+
+/** A number as a GLSL float literal. */
+const f = (v: number): string => (Number.isInteger(v) ? `${v}.0` : `${v}`);
 
 // ————————————————————————————————————————————————————————————————— shared Kerr–Schild code
 export const KERR_GLSL = /* glsl */ `
@@ -457,11 +461,11 @@ void main() {
   float rStart = ksR(x);
   float rMinDbg = rStart;
   int nStepDbg = 0;
-  // Per-ray step scale. A ray whose impact parameter b = |x × p|/E is large never comes close and
-  // bends gently everywhere, so it tolerates proportionally longer steps (RK4's error is set by the
-  // curvature, ∝ b²/r⁴): ≈ 30 % fewer steps in the default view at the same sky/disk accuracy
-  // (checked against float64 integrations at 1/20 of the step, see tests/gargantua.test.ts).
-  float kb = uInside > 0.5 ? 1.0 : clamp(length(cross(x, p)) / max(abs(pt), 1e-6) * (1.0 / 8.0), 1.0, 2.5);
+  // Per-ray step scale (STEP_LAW in kerr.ts, shared with the CPU tracer). A ray whose impact
+  // parameter b = |x × p|/E is large never comes close and bends gently everywhere, so it tolerates
+  // proportionally longer steps (RK4's error is set by the curvature, ∝ b²/r⁴): ≈ 30 % fewer steps
+  // in the default view at the same accuracy (tests/gargantua.test.ts checks every tier).
+  float kb = uInside > 0.5 ? 1.0 : clamp(length(cross(x, p)) / max(abs(pt), 1e-6) * ${f(1 / STEP_LAW.bRef)}, 1.0, ${f(STEP_LAW.kMax)});
   float wedge = 2.8 * uH;                      // disk slab half-opening |z| < wedge · ϖ
   float wA = length(x.xy);
 
@@ -476,10 +480,10 @@ void main() {
     if (uInside > 0.5 ? (vr < 0.0 && r < uHorizon * 1.0005) : r < uCapR) { fate = 2.0; break; }
     if (vr > 0.0 && r > uEscR * 0.9995) { fate = 1.0; break; }
     float speed = length(v1) + 1e-9;
-    float grow = 1.0 + 2.0 * smoothstep(25.0, 120.0, r);
-    float hc = uEps * r * min(grow * kb, 2.5);   // coordinate length of this step
+    float grow = 1.0 + ${f(STEP_LAW.growK)} * smoothstep(${f(STEP_LAW.growR0)}, ${f(STEP_LAW.growR1)}, r);
+    float hc = uEps * r * min(grow * kb, ${f(STEP_LAW.cap)});   // coordinate length of this step
     float h = hc / speed;
-    h = min(h, 8.0 * uEps * length(p) / (length(f1) + 1e-9));
+    h = min(h, ${f(STEP_LAW.pLimit)} * uEps * length(p) / (length(f1) + 1e-9));
     // The last step lands on the escape sphere (dr/dλ is known), where the analytic tail takes
     // over: every ray hands over at the same radius, so the lens map has no step-count seams
     // (which would ring the lens Jacobian and streak the stars) and no step is ever redone.
@@ -534,8 +538,9 @@ void main() {
   // Sky, in the camera frame (invariant when the camera only turns about the spin axis): the
   // deflection relative to the unlensed pixel direction (small almost everywhere, so even half
   // floats keep sub-pixel precision) and g_sky = ν_camera/ν_emitted of starlight. The sign of w
-  // records whether the ray met the disk (for the lens cache): escaped w = ±g, otherwise 0 / −1e-6.
-  oSky = vec4(0.0, 0.0, 0.0, touched ? -1e-6 : 0.0);
+  // records whether the ray met the disk (for the lens cache): escaped w = ±g (g ≤ 1e4), otherwise
+  // 0 / −6e4 (large sentinels: GPUs that flush half-float denormals would turn a tiny one into −0).
+  oSky = vec4(0.0, 0.0, 0.0, touched ? -6e4 : 0.0);
   if (fate == 1.0) {
     vec3 dirCam = normalize(uKsToCam * weakTail(x, normalize(vEnd)));
     float g = clamp(1.0 / max(N * pt, 1e-6), 1e-3, 1e4);
@@ -546,7 +551,7 @@ void main() {
   if (uDebug > 14.5) { oLight = vec4(float(nStepDbg + 1), float(dbgSamples / 1000), float(dbgSamples - (dbgSamples / 1000) * 1000), fate); return; }
   if (uDebug > 13.5) { oLight = vec4(rMinDbg / 5.0, rc0 / 5.0, float(nStepDbg) / float(MAX_STEPS), 0.0); return; }
   if (uDebug > 12.5) { oLight = vec4(fate == 1.0 ? 1.0 : 0.0, fate == 2.0 ? 1.0 : 0.0, fate == 0.0 ? 1.0 : (fate == 3.0 ? 0.5 : 0.0), 0.0); return; }
-  if (uDebug > 11.5) { float TT = 1000.0 * pow(40.0, vUv.x); oLight = vec4(vUv.y > 0.5 ? planck(TT) * 0.25 : vec3(texture(uPlanck, vec2((log(TT) - uPlanckMap.x) * uPlanckMap.y, 0.5)).a / -20.0 + 0.5), 0.0); return; }
+  if (uDebug > 11.5) { float TT = 1000.0 * pow(40.0, vUv.x); oLight = vec4(vUv.y > 0.5 ? planck(TT) * 0.25 : vec3(textureLod(uPlanck, vec2((log(TT) - uPlanckMap.x) * uPlanckMap.y, 0.5), 0.0).a / -20.0 + 0.5), 0.0); return; }
   if (uDebug > 4.5 && uDebug < 8.5) { vec4 tt = textureLod(uDisk, vUv, 0.0); oLight = vec4(uDebug < 5.5 ? vec3(tt.g) : uDebug < 6.5 ? vec3(tt.a * 4.0) : uDebug < 7.5 ? vec3(tt.b * 0.5) : vec3(tt.r * 0.01), 0.0); return; }
   if (uDebug > 0.5) { oLight = vec4(max(dbgCol, 0.0), 0.0); return; }
   oLight = vec4(L, T);
@@ -618,6 +623,37 @@ uniform sampler2D uCT;       // colour → temperature
 uniform vec2 uCTMap;         // qMin, 1/(qMax − qMin)
 uniform float uSkyShift;     // 1 = apply g to the sky
 uniform float uDbg;
+uniform float uUpsample;     // 1 = Catmull–Rom reconstruction of the disk light, 0 = bilinear
+
+// Disk light + transmittance, upsampled from the trace resolution: Catmull–Rom through five
+// bilinear taps (the four corner taps of the 16-tap kernel carry < 1 % weight and are dropped),
+// clamped to the four nearest texels so the sharp shadow edge and photon ring cannot ring.
+vec4 diskLight(vec2 uv) {
+  if (uUpsample < 0.5) return texture(uAccum, uv);
+  vec2 res = uTraceRes;
+  vec2 sp = uv * res;
+  vec2 t1 = floor(sp - 0.5) + 0.5;
+  vec2 f = sp - t1;
+  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  vec2 w3 = f * f * (-0.5 + 0.5 * f);
+  vec2 w12 = w1 + w2;
+  vec2 t0 = (t1 - 1.0) / res, t3 = (t1 + 2.0) / res, t12 = (t1 + w2 / w12) / res;
+  vec4 c = textureLod(uAccum, vec2(t12.x, t0.y), 0.0) * (w12.x * w0.y)
+         + textureLod(uAccum, vec2(t0.x, t12.y), 0.0) * (w0.x * w12.y)
+         + textureLod(uAccum, t12, 0.0) * (w12.x * w12.y)
+         + textureLod(uAccum, vec2(t3.x, t12.y), 0.0) * (w3.x * w12.y)
+         + textureLod(uAccum, vec2(t12.x, t3.y), 0.0) * (w12.x * w3.y);
+  c /= w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+  ivec2 i0 = ivec2(t1 - 0.5);
+  ivec2 hi = ivec2(res) - 1;
+  vec4 a = texelFetch(uAccum, clamp(i0, ivec2(0), hi), 0);
+  vec4 b = texelFetch(uAccum, clamp(i0 + ivec2(1, 0), ivec2(0), hi), 0);
+  vec4 d = texelFetch(uAccum, clamp(i0 + ivec2(0, 1), ivec2(0), hi), 0);
+  vec4 e = texelFetch(uAccum, clamp(i0 + ivec2(1, 1), ivec2(0), hi), 0);
+  return clamp(c, min(min(a, b), min(d, e)), max(max(a, b), max(d, e)));
+}
 
 vec4 planckS(float T) {
   float u = (log(max(T, 1.0)) - uPlanckMap.x) * uPlanckMap.y;
@@ -747,7 +783,7 @@ vec3 stars(vec3 D, vec3 Dx, vec3 Dy, float g, float shiftOn, float galDens) {
   float lmax = 0.5 * tr + sqrt(max(0.25 * tr * tr - dt, 0.0));
   float foot = sqrt(lmax);
   vec3 total = vec3(0.0);
-  for (int L = 0; L < 3; L++) {
+  for (int L = 0; L < STAR_LAYERS; L++) {
     float N = uLayerN[L];
     float cellAng = 2.0 / N;
     float wPoint = 1.0 - smoothstep(0.22, 0.45, foot / cellAng);
@@ -767,14 +803,14 @@ vec4 fetchDir(ivec2 t) {
   if (any(lessThan(t, ivec2(0))) || any(greaterThanEqual(t, ivec2(uTraceRes)))) return vec4(0.0);
   vec4 s = texelFetch(uSky, t, 0);
   float g = abs(s.w);
-  if (g < 1e-4) return vec4(0.0);
+  if (g < 1e-4 || s.w < -5e4) return vec4(0.0);   // captured (see the trace pass)
   vec2 ndc = (vec2(t) + 0.5 + uJitter) / uTraceRes * 2.0 - 1.0;
   vec3 dCam = normalize(vec3(ndc * uTan, -1.0));
   return vec4(uCamToSky * normalize(dCam + s.xyz), g);
 }
 
 void main() {
-  vec4 acc = texture(uAccum, vUv);
+  vec4 acc = diskLight(vUv);
   vec3 col = acc.rgb;
   float T = acc.a;
   if (T > 1e-4) {

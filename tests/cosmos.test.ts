@@ -15,7 +15,8 @@ import { cosmicSFRD, r200c, stellarMass, v200 } from '../src/physics/cosmosGalax
 import { Cosmology } from '../src/physics/cosmology';
 import { Rng } from '../src/physics/random';
 import { Simulation, buildSchedule, makeExpansion } from '../src/worlds/cosmicweb/Simulation';
-import { SnapshotStore } from '../src/worlds/cosmicweb/SnapshotStore';
+import { KeyframeEncoder, SnapshotStore } from '../src/worlds/cosmicweb/SnapshotStore';
+import { accumScaleFor, accumSpec, atlasSpec, chooseFormats, fallbackAccum, fallbackAtlas, type AccumMode, type AtlasMode } from '../src/worlds/cosmicweb/formats';
 import { PLANCK_COSMO, type Keyframe, type SimConfig, type WorkerMessage } from '../src/worlds/cosmicweb/types';
 import { CosmicTimeline } from '../src/experiences/cosmos/timeline';
 import { projectHalos } from '../src/worlds/cosmicweb/webCache';
@@ -669,5 +670,122 @@ describe('Review: the smooth shape of the Eisenstein & Hu transfer function', ()
     expect(Math.abs(s / c - 1)).toBeLessThan(0.02);
     // Sound horizon: the full expression (eq. 6) and the fit (eq. 26) agree to ~1 %.
     expect(rel(eh.s, (44.5 * Math.log(9.83 / eh.om)) / Math.sqrt(1 + 10 * eh.ob ** 0.75))).toBeLessThan(0.015);
+  });
+});
+
+describe('Review: portable render-target formats', () => {
+  const FLOAT = 1015, HALF = 1016, LINEAR = 1006;
+  const all = [true, false];
+  it('never needs float32 filtering or float32 blending that the device lacks', () => {
+    for (const colorBufferFloat of all)
+      for (const colorBufferHalfFloat of all)
+        for (const floatBlend of all) {
+          const f = chooseFormats({ colorBufferFloat, colorBufferHalfFloat, floatBlend });
+          // The accumulator is sampled with LINEAR filtering (upsampled): never float32 (OES_texture_float_linear
+          // is missing on iOS and many Android GPUs, where such a texture samples as black).
+          const a = accumSpec(f.accum);
+          expect(a.type).not.toBe(FLOAT);
+          if (a.filter === LINEAR) expect(a.type === HALF || a.type === 1009).toBe(true);
+          // Float32 atlas only where float32 blending exists; float formats only with a colour-buffer extension.
+          const t = atlasSpec(f.atlas);
+          if (t.type === FLOAT) expect(floatBlend && colorBufferFloat).toBe(true);
+          if (t.type === HALF || a.type === HALF) expect(colorBufferFloat || colorBufferHalfFloat).toBe(true);
+        }
+  });
+
+  it('fallback chains always end in a plain 8-bit target (never black)', () => {
+    for (const start of ['rg16f', 'rgba16f', 'rgba8'] as AccumMode[]) {
+      let m: AccumMode | null = start, last: AccumMode = start;
+      for (let i = 0; m && i < 5; i++) {
+        last = m;
+        m = fallbackAccum(m);
+      }
+      expect(last).toBe('rgba8');
+    }
+    for (const start of ['r32f', 'r16f', 'rgba16f', 'rgba8'] as AtlasMode[]) {
+      let m: AtlasMode | null = start, last: AtlasMode = start;
+      for (let i = 0; m && i < 6; i++) {
+        last = m;
+        m = fallbackAtlas(m);
+      }
+      expect(last).toBe('rgba8');
+    }
+    // 8-bit encodings keep sums inside [0, 1] for the ranges they document.
+    expect(accumSpec('rgba8').encode * 4).toBeCloseTo(1, 12);
+    expect(atlasSpec('rgba8').encode * 32).toBeCloseTo(1, 12);
+  });
+
+  it('the light accumulator stays at ≤ 1 pixel per CSS pixel and scales with the tier', () => {
+    expect(accumScaleFor(1, 1)).toBe(1);
+    expect(accumScaleFor(1, 2)).toBe(0.5);
+    expect(accumScaleFor(0.7, 1.5)).toBeCloseTo(0.85 / 1.5, 12);
+    expect(accumScaleFor(0.35, 1)).toBe(0.7);
+    // Dynamic resolution below one device pixel per CSS pixel is followed, not undone.
+    expect(accumScaleFor(1, 0.6)).toBe(1);
+  });
+});
+
+describe('Review: keyframes encoded off the main thread', () => {
+  const makeFrames = (count: number, frames: number, seed: number) => {
+    const rnd = mulberry32(seed);
+    const out: Uint16Array[] = [];
+    let cur = new Uint16Array(3 * count);
+    for (let i = 0; i < cur.length; i++) cur[i] = Math.floor(rnd() * 65536);
+    for (let f = 0; f < frames; f++) {
+      const next = new Uint16Array(cur.length);
+      for (let i = 0; i < cur.length; i++) {
+        const jump = rnd() < 0.01 ? 5000 : 300;
+        next[i] = (cur[i] + Math.round((rnd() - 0.5) * jump) + 65536) & 0xffff;
+      }
+      cur = next;
+      out.push(cur.slice());
+    }
+    return out;
+  };
+  const kf = (f: number, extra: Partial<Keyframe>): Keyframe =>
+    ({ index: f, step: f, t: f, a: 1, D: 1, positions: null, halos: null as never, galaxies: null as never, pk: null, stats: null as never, ...extra }) as Keyframe;
+
+  it('worker-encoded frames decode exactly like frames encoded by the store itself', () => {
+    const count = 400;
+    const truth = makeFrames(count, 19, 21);
+    const enc = new KeyframeEncoder();
+    const a = new SnapshotStore(count), b = new SnapshotStore(count);
+    truth.forEach((p, f) => {
+      a.add(kf(f, { enc: enc.encode(p.slice()) }));
+      b.add(kf(f, { positions: p.slice() }));
+    });
+    expect(a.bytes).toBe(b.bytes);
+    for (const f of [0, 5, 7, 8, 12, 18]) {
+      const da = a.positions(f), db = b.positions(f);
+      expect(Array.from(da)).toEqual(Array.from(db));
+      let err = 0;
+      for (let i = 0; i < da.length; i++) {
+        let e = Math.abs(da[i] - truth[f][i]);
+        e = Math.min(e, 65536 - e);
+        err = Math.max(err, e);
+      }
+      expect(err).toBeLessThanOrEqual(4);
+    }
+  });
+
+  it('prefetch decodes the next keyframe in slices, identical to a direct decode', () => {
+    const count = 300;
+    const truth = makeFrames(count, 12, 5);
+    const s = new SnapshotStore(count), ref = new SnapshotStore(count);
+    truth.forEach((p, f) => {
+      s.add(kf(f, { positions: p.slice() }));
+      ref.add(kf(f, { positions: p.slice() }));
+    });
+    // Without the previous frame decoded there is nothing to build on.
+    expect(s.prefetch(3, 100)).toBe(false);
+    s.positions(2);
+    let calls = 0;
+    while (!s.prefetch(3, 100)) calls++;
+    expect(calls).toBeGreaterThanOrEqual(8); // 900 values in slices of 100
+    expect(s.isDecoded(3)).toBe(true);
+    expect(Array.from(s.positions(3))).toEqual(Array.from(ref.positions(3)));
+    // I-frames (every 8th keyframe) are ready at once.
+    expect(s.prefetch(8, 1)).toBe(true);
+    expect(Array.from(s.positions(8))).toEqual(Array.from(ref.positions(8)));
   });
 });

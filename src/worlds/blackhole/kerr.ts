@@ -566,6 +566,30 @@ export function buildTetradInto(a: number, pos: Vec3, u: Vec4, right: Vec3, up: 
   return out;
 }
 
+/**
+ * Camera pose up to a rotation about the spin axis — the symmetry of a Kerr black hole with an
+ * axisymmetric disk: the camera's cylindrical radius ϖ and height z, and its right/up/back axes in
+ * the local (ϖ̂, φ̂, ẑ) frame, written to out[0 … 10]. Two poses with equal keys see identical rays
+ * (in the camera frame), which is what lets the renderer reuse its lens map while the camera orbits
+ * the hole. Undefined (NaN) on the axis itself.
+ */
+export function axisymmetricPoseKey(pos: Vec3, right: Vec3, up: Vec3, back: Vec3, out: Float64Array | number[]): Float64Array | number[] {
+  const w = Math.hypot(pos[0], pos[1]);
+  const cx = pos[0] / w, cy = pos[1] / w;
+  out[0] = w > 1e-9 ? w : NaN;
+  out[1] = pos[2];
+  out[2] = right[0] * cx + right[1] * cy;
+  out[3] = -right[0] * cy + right[1] * cx;
+  out[4] = right[2];
+  out[5] = up[0] * cx + up[1] * cy;
+  out[6] = -up[0] * cy + up[1] * cx;
+  out[7] = up[2];
+  out[8] = back[0] * cx + back[1] * cy;
+  out[9] = -back[0] * cy + back[1] * cx;
+  out[10] = back[2];
+  return out;
+}
+
 /** Lorentz factor between two observers: γ = −u·v. */
 export function relativeGamma(a: number, pos: Vec3, u: Vec4, v: Vec4): number {
   return -dot4(ksMetric(a, pos[0], pos[1], pos[2]), u, v);
@@ -614,7 +638,7 @@ export interface TraceOptions {
 /**
  * Trace a light ray backwards from an observer. `pCov` is the covariant momentum (p_t, p_x, p_y,
  * p_z) of the *time-reversed* photon (k = −p), built as k_μ = −E0_μ + dⁱ E_iμ from a tetrad.
- * Same algorithm as the GPU shader (adaptive RK4, h ∝ r), with float64 precision.
+ * Same algorithm and step control as the GPU shader (STEP_LAW), with float64 precision.
  */
 /** dr/dλ (Boyer–Lindquist r) from a state and its derivative: ∇r · dx/dλ. */
 export function radialVelocity(a: number, s: ArrayLike<number>, d: ArrayLike<number>, r = ksRadius(a, s[0], s[1], s[2])): number {
@@ -634,6 +658,28 @@ export const captureRadius = (a: number): number => {
   const rh = horizonRadius(a);
   return rh + 0.5 * (photonOrbitRadius(a, true) - rh);
 };
+
+/**
+ * Step control shared by the GPU trace (shaders.ts builds its GLSL from these numbers) and
+ * traceRay, so a tapped pixel is traced exactly as it was drawn. Each RK4 step has coordinate
+ * length eps · r · min(grow(r) · kb, CAP), with grow = 1 + GROW_K · smoothstep(R0, R1, r) (longer
+ * steps far out) and kb = clamp(b / B_REF, 1, K_MAX) for a ray of impact parameter b = |x × p|/E:
+ * a ray that never comes close bends gently everywhere (RK4's error is set by the path's curvature,
+ * ∝ b²/r⁴), so it takes proportionally longer steps. A second limit keeps the step below
+ * P_LIMIT · eps of the momentum's e-folding "time" (stability where p grows near the horizon), and
+ * the last step lands on the escape sphere. Accuracy per tier: tests/gargantua.test.ts.
+ */
+export const STEP_LAW = { growR0: 25, growR1: 120, growK: 2, bRef: 8, kMax: 2.5, cap: 2.5, pLimit: 8 } as const;
+
+/** Step lengthening for a ray of impact parameter b (1 … K_MAX). */
+export const impactStepScale = (b: number): number => Math.min(STEP_LAW.kMax, Math.max(1, b / STEP_LAW.bRef));
+
+/** Coordinate length of an RK4 step at Boyer–Lindquist radius r (see STEP_LAW). */
+export function stepLength(eps: number, r: number, kb: number): number {
+  const t = Math.min(1, Math.max(0, (r - STEP_LAW.growR0) / (STEP_LAW.growR1 - STEP_LAW.growR0)));
+  const grow = 1 + STEP_LAW.growK * t * t * (3 - 2 * t);
+  return eps * r * Math.min(grow * kb, STEP_LAW.cap);
+}
 
 export function traceRay(a: number, pos: Vec3, kCov: Vec4, o: TraceOptions = {}): RayResult {
   const eps = o.eps ?? 0.04;
@@ -657,6 +703,9 @@ export function traceRay(a: number, pos: Vec3, kCov: Vec4, o: TraceOptions = {})
   const energy = pt;
   const lz = -(s[0] * s[4] - s[1] * s[3]);
   const insideStart = r0 < rH;
+  // Impact parameter |x × p| / E (exact for a = 0; a step-size heuristic otherwise).
+  const b = Math.hypot(s[1] * s[5] - s[2] * s[4], s[2] * s[3] - s[0] * s[5], s[0] * s[4] - s[1] * s[3]) / Math.max(Math.abs(pt), 1e-12);
+  const kb = insideStart ? 1 : impactStepScale(b);
   for (; steps < maxSteps; steps++) {
     const r = ksRadius(a, s[0], s[1], s[2]);
     rMin = Math.min(rMin, r);
@@ -666,16 +715,16 @@ export function traceRay(a: number, pos: Vec3, kCov: Vec4, o: TraceOptions = {})
       fate = 'captured';
       break;
     }
-    if (r > rEsc && vr > 0) {
+    if (vr > 0 && r > rEsc * 0.9995) {
       fate = 'escaped';
       break;
     }
-    // Step control: a fixed fraction of r in coordinate length, and never more than a fraction of
-    // the momentum's e-folding "time" (keeps RK4 stable where p grows near the horizon).
     const speed = Math.hypot(d[0], d[1], d[2]) + 1e-12;
     const pn = Math.hypot(s[3], s[4], s[5]) + 1e-12;
     const dpn = Math.hypot(d[3], d[4], d[5]) + 1e-12;
-    const h = Math.min((eps * Math.max(r, 0.2) * (r > 40 ? 3 : 1)) / speed, (8 * eps * pn) / dpn);
+    let h = Math.min(stepLength(eps, Math.max(r, 0.05), kb) / speed, (STEP_LAW.pLimit * eps * pn) / dpn);
+    // Land on the escape sphere, where the analytic tail takes over.
+    if (vr > 0 && r + h * vr > rEsc) h = Math.max((rEsc - r) / vr, 1e-3);
     const z0 = s[2];
     const x0 = s[0], y0 = s[1];
     rk4Step(a, s, pt, h, work);
@@ -835,6 +884,17 @@ export function tidalAcceleration(massSun: number, rInRg: number, lengthM = 2): 
  * being captured. For a = 0 this reproduces Synge's (1966) sin ψ = √27 √(1 − 2/r) / r.
  */
 export function shadowAngularWidth(a: number, pos: Vec3, iterations = 22): number {
+  const it = shadowAngularWidthSteps(a, pos, iterations);
+  let r = it.next();
+  while (!r.done) r = it.next();
+  return r.value;
+}
+
+/**
+ * shadowAngularWidth one ray at a time: each `next()` traces a single geodesic (≈ 0.3–1 ms), so a
+ * caller can spread the ~2 × (iterations + 1) traces over frames instead of stalling one.
+ */
+export function* shadowAngularWidthSteps(a: number, pos: Vec3, iterations = 22): Generator<void, number, void> {
   const d = Math.hypot(pos[0], pos[1], pos[2]);
   const back: Vec3 = [pos[0] / d, pos[1] / d, pos[2] / d];
   let up: Vec3 = [-back[2] * back[0], -back[2] * back[1], 1 - back[2] * back[2]];
@@ -851,15 +911,19 @@ export function shadowAngularWidth(a: number, pos: Vec3, iterations = 22): numbe
   const rEsc = Math.max(d * 1.05, 60);
   const cap = (psi: number, side: number) =>
     traceRay(a, pos, rayMomentum(tet, [side * Math.sin(psi), 0, -Math.cos(psi)]), { eps: 0.05, rEscape: rEsc, maxSteps: 4000 }).fate !== 'escaped';
-  const half = (side: number) => {
-    if (!cap(0, side)) return 0;
+  let total = 0;
+  for (const side of [1, -1]) {
+    const inside = cap(0, side);
+    yield;
+    if (!inside) continue;
     let lo = 0, hi = Math.PI;
     for (let i = 0; i < iterations; i++) {
       const mid = 0.5 * (lo + hi);
       if (cap(mid, side)) lo = mid;
       else hi = mid;
+      yield;
     }
-    return 0.5 * (lo + hi);
-  };
-  return half(1) + half(-1);
+    total += 0.5 * (lo + hi);
+  }
+  return total;
 }

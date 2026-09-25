@@ -22,11 +22,12 @@ const css = `
 .vy-label.cool b { color: var(--cool); }
 .vy-reticle { position:absolute; left:0; top:0; pointer-events:none; will-change:transform; transition: opacity .5s var(--ease); }
 .vy-reticle svg { display:block; overflow:visible; }
-.vy-reticle .vy-rt { position:absolute; left: 22px; top: -9px; white-space:nowrap; font: 400 11px/1.35 var(--font-ui); letter-spacing:.1em; color: var(--accent); text-shadow: 0 0 4px #000, 0 0 12px #000, 0 0 20px rgba(0,0,0,.8); }
+.vy-reticle .vy-rt { position:absolute; left: 22px; top: -9px; white-space:nowrap; font: 400 11px/1.35 var(--font-ui); letter-spacing:.1em; color: var(--accent); text-shadow: 0 0 2px #000, 0 0 5px #000, 0 0 10px #000, 0 0 18px #000, 0 0 30px rgba(0,0,0,.85); }
 .vy-reticle .vy-rt span { display:block; font-family: var(--font-mono); font-size:10px; letter-spacing:.02em; color: var(--ink-2); }
+.vy-reticle.flip .vy-rt { left: auto; right: 22px; text-align: right; }
 .vy-home { position:absolute; left:0; top:0; pointer-events:none; will-change:transform; transition: opacity .6s var(--ease); }
 .vy-home svg { display:block; overflow:visible; }
-.vy-home .vy-hm { position:absolute; left: 34px; top: -8px; white-space:nowrap; font: 400 10.5px/1.35 var(--font-ui); letter-spacing:.12em; color: var(--cool); text-shadow: 0 0 4px #000, 0 0 12px #000; }
+.vy-home .vy-hm { position:absolute; left: 34px; top: -8px; white-space:nowrap; font: 400 10.5px/1.35 var(--font-ui); letter-spacing:.12em; color: var(--cool); text-shadow: 0 0 2px #000, 0 0 5px #000, 0 0 10px #000, 0 0 18px #000, 0 0 30px rgba(0,0,0,.85); }
 .vy-home .vy-hm span { display:block; font-family: var(--font-mono); font-size:9.5px; letter-spacing:.02em; color: var(--ink-3); }
 .vy-caption { position:absolute; left:50%; bottom: 19%; transform: translate(-50%, 8px); width: min(540px, 62vw); text-align:center; pointer-events:none; opacity:0; transition: opacity 1.2s var(--ease), transform 1.2s var(--ease); text-shadow: 0 0 6px #000, 0 0 18px #000; }
 .vy-caption.on { opacity:1; transform: translate(-50%, 0); }
@@ -63,6 +64,7 @@ export class Hud {
   private shownText: string[] = [];
   private shownSub: string[] = [];
   private shownCool: boolean[] = [];
+  private reticleFlip = false;
   private uiBoxes: Array<[number, number, number, number]> = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
   labelsOn = true;
 
@@ -134,10 +136,13 @@ export class Hud {
     if (rp) {
       this.reticle.style.opacity = '1';
       this.reticle.style.transform = `translate3d(${rp[0].toFixed(1)}px, ${rp[1].toFixed(1)}px, 0)`;
+      // Near the right edge the label goes to the left of the reticle (never clipped).
+      const flip = rp[0] > w - 200;
+      if (flip !== this.reticleFlip) this.reticle.classList.toggle('flip', (this.reticleFlip = flip));
       if (this.reticleText.textContent !== target!.text) this.reticleText.textContent = target!.text;
       const sub = target!.sub ?? '';
       if (this.reticleSub.textContent !== sub) this.reticleSub.textContent = sub;
-      this.boxes.push([rp[0] - 26, rp[1] - 26, rp[0] + 190, rp[1] + 30]);
+      this.boxes.push(flip ? [rp[0] - 190, rp[1] - 26, rp[0] + 26, rp[1] + 30] : [rp[0] - 26, rp[1] - 26, rp[0] + 190, rp[1] + 30]);
     } else this.reticle.style.opacity = '0';
     // "You are here" marker.
     const hp = home ? this.project(home.dir, camera, w, h) : null;

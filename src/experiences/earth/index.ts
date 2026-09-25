@@ -3,7 +3,7 @@ import type { Experience, ExperienceContext, FrameInfo } from '../../core/types'
 import type { Control } from '../../ui/Panel';
 import type { Readout } from '../../ui/UI';
 import { Sky } from '../../worlds/sky/Sky';
-import { createPlanet, planetSpec, type PlanetRenderer } from '../../worlds/planet';
+import { createPlanet, planetSpec, type PlanetRenderer, type PlanetUpdate } from '../../worlds/planet';
 import { createStar, type StarRenderer } from '../../worlds/star';
 import { gmst, meanObliquity, solarElevation, moonState, msToJD, radecToVector, sunState, VOYAGER1_PALE_BLUE_DOT } from '../../physics/planets-ephemeris';
 import { astroToThree } from '../../physics/kepler';
@@ -150,6 +150,10 @@ class EarthExperience implements Experience {
   private gallerySection: HTMLElement | null = null;
   private lightButtons: { setActive(i: number): void } | null = null;
   private label: HTMLDivElement | null = null;
+  private readonly labelState = { on: false, x: NaN, y: NaN };
+  private readonly planetUpdate: PlanetUpdate = { time: 0, sunPosition: this.sunPos, camera: new THREE.PerspectiveCamera() };
+  private readonly galleryUpdate: PlanetUpdate = { time: 0, sunPosition: this.gSun, camera: new THREE.PerspectiveCamera() };
+  private readonly starUpdate: { time: number; camera: THREE.Camera } = { time: 0, camera: new THREE.PerspectiveCamera() };
   private uiClock = 0;
 
   // Scratch.
@@ -359,7 +363,9 @@ class EarthExperience implements Experience {
     const detail = ctx.quality.detail;
     this.computeEphemeris();
 
-    this.sky = new Sky({ frame: 'equatorial', stars: Math.round(20000 * detail), milkyWay: 0.35, brightness: 0.9 });
+    // The Milky Way stays faint: at the Earth's daylight exposure it would be invisible, and brighter it
+    // reads as a grey-brown haze on an OLED black (docs/VISION.md). Its cube bake scales with the tier.
+    this.sky = new Sky({ frame: 'equatorial', stars: Math.round(20000 * detail), milkyWay: 0.22, brightness: 0.9, bandResolution: detail >= 0.9 ? 1024 : 512 });
     this.earth = createPlanet(planetSpec('earth', 1, { detail }));
     this.moon = createPlanet(planetSpec('moon', MOON_R, { detail }));
     this.sun = createStar({ seed: 3, temperatureK: 5772, radius: SUN_R, intensity: SUN_INTENSITY, activity: 0.6, detail });
@@ -437,17 +443,29 @@ class EarthExperience implements Experience {
     this.cam.update(f.dt, this.world ? 0 : simDt);
     this.cam.apply(this.aspect);
     const camera = this.cam.camera;
-    const r = this.ctx.renderer;
-    this.earth.update({ time: tShader, sunPosition: this.sunPos, camera, sunAngularRadius: this.sunAng, renderer: r });
-    this.moon.update({ time: tShader, sunPosition: this.sunPos, camera, sunAngularRadius: this.sunAng, renderer: r });
-    this.sun.update({ time: tShader, camera });
+    // Reused update records (no per-frame garbage).
+    const pu = this.planetUpdate;
+    pu.time = tShader;
+    pu.camera = camera;
+    pu.sunAngularRadius = this.sunAng;
+    pu.renderer = this.ctx.renderer;
+    this.earth.update(pu);
+    this.moon.update(pu);
+    const su = this.starUpdate;
+    su.time = tShader;
+    su.camera = camera;
+    this.sun.update(su);
     if (this.gPlanet) {
       this.gPlanet.setRotation(this.gSpin);
-      this.gPlanet.update({ time: tShader, sunPosition: this.gSun, camera, renderer: r });
+      const gu = this.galleryUpdate;
+      gu.time = tShader;
+      gu.camera = camera;
+      gu.renderer = this.ctx.renderer;
+      this.gPlanet.update(gu);
     }
     if (this.gStar) {
       this.gStar.object.rotation.y = this.gSpin;
-      this.gStar.update({ time: tShader, camera });
+      this.gStar.update(su);
     }
 
     // Pale Blue Dot: exposure follows the distance (the glare and stray light are drawn in render()).
@@ -783,15 +801,25 @@ class EarthExperience implements Experience {
   private updateUI(dt: number): void {
     // Pale Blue Dot marker follows the Earth's projected position.
     if (this.label) {
+      // Touch the DOM only on change, and size from the engine (reading clientWidth after a style
+      // write would force a synchronous layout every frame).
       const t = this.world ? 0 : pbdProgress(this.cam.altitudeRadius);
       const on = t > 0.97;
-      this.label.style.opacity = on ? '1' : '0';
+      const ls = this.labelState;
+      if (on !== ls.on) {
+        ls.on = on;
+        this.label.style.opacity = on ? '1' : '0';
+      }
       if (on) {
         const p = this.tmp.copy(this.origin).project(this.cam.camera);
-        const el = this.ctx.ui.overlay;
-        const w = el.clientWidth || window.innerWidth;
-        const h = el.clientHeight || window.innerHeight;
-        this.label.style.transform = `translate(${((p.x + 1) / 2) * w}px, ${((1 - p.y) / 2) * h}px)`;
+        const e = this.ctx.engine;
+        const x = Math.round(((p.x + 1) / 2) * e.cssWidth);
+        const y = Math.round(((1 - p.y) / 2) * e.cssHeight);
+        if (x !== ls.x || y !== ls.y) {
+          ls.x = x;
+          ls.y = y;
+          this.label.style.transform = `translate(${x}px, ${y}px)`;
+        }
       }
     }
     this.uiClock -= Math.max(dt, 1 / 60);

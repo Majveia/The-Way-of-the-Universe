@@ -179,7 +179,7 @@ class Voyage implements Experience {
   private galaxyOrder: GalaxyEntry[] = [];
   private fartherFirst = (a: GalaxyEntry, b: GalaxyEntry): number => this.navRoot.distanceToSquared(b.frame.origin) - this.navRoot.distanceToSquared(a.frame.origin);
   /** Last values written to the flight widget's DOM (write only on change). */
-  private hudCache: { bar: string; scale: string; crumbFrame: Frame | null; crumbHome: boolean } = { bar: '', scale: '', crumbFrame: null, crumbHome: false };
+  private hudCache: { bar: string; scale: string; crumbFrame: Frame | null; crumbHome: boolean; noScale: boolean } = { bar: '', scale: '', crumbFrame: null, crumbHome: false, noScale: false };
   /** HUD labels in use this frame (pool index). */
   private labelCount = 0;
   private addLabel = (dirRoot: THREE.Vector3, text: string, sub: string, pri: number, cool = false): void => {
@@ -737,7 +737,10 @@ class Voyage implements Experience {
       this.faceDirection(toAcen);
       this.setView('chase');
       this.shipCam.distance = 34;
-      this.shipCam.yawBias = this.departureSun.camYaw;
+      // Portrait screens see only ~27° across: a smaller three-quarter angle keeps the target (straight
+      // ahead of the nose) in view.
+      const portrait = this.ctx.engine.cssWidth < this.ctx.engine.cssHeight;
+      this.shipCam.yawBias = this.departureSun.camYaw * (portrait ? 0.35 : 1);
       this.shipCam.pitchBias = this.departureSun.camPitch;
       this.autoEngage = 2.2;
     } else if (name === 'relativistic' || name === '0.9c') {
@@ -1753,7 +1756,8 @@ class Voyage implements Experience {
       const b = convertPoint(tgtPos, tgtFrame, lca, _v7);
       distM = a.distanceTo(b) * lca.metres;
       const fd = distM < 0.1 * UNIT.LY || distM > 3e5 * UNIT.PC ? (distM > 3e5 * UNIT.PC ? formatParsecs(distM, 3) : formatDistance(distM, 3)) : formatDistance(distM, 3);
-      this.ro.dist.set(fd.value, fd.unit);
+      if (distM < 1) this.ro.dist.set('—', '');
+      else this.ro.dist.set(fd.value, fd.unit);
     }
 
     // Flight status widget.
@@ -1809,6 +1813,9 @@ class Voyage implements Experience {
     for (const x of SCALE_UNITS) if (raw >= x[1]) unit = x;
     const n = niceScaleBar(raw / unit[1]);
     const px = (n * unit[1]) / (ref * pxAngle);
+    // (no scale bar in the planetarium view: it measures lengths at the nearest body)
+    const planetarium = this.view === 'sky';
+    if (planetarium !== this.hudCache.noScale) (p.scale.parentElement as HTMLElement).style.visibility = (this.hudCache.noScale = planetarium) ? 'hidden' : '';
     const st = `${formatNumber(n, 3)} ${unit[0]}`;
     if (p.scale.textContent !== st) p.scale.textContent = st;
     const sw = `${px.toFixed(0)}px`;

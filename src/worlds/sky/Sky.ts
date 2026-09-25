@@ -125,15 +125,18 @@ void main() {
  */
 const BAND_FN_GLSL = /* glsl */ `
 uniform float uSeed;
+// Galactic longitude, 0 at the centre. atan(0, 0) is undefined in GLSL (NaN on some GPUs): the poles
+// get l = 0.
+float glon(vec3 d) { return abs(d.x) + abs(d.z) > 0.0 ? atan(-d.z, d.x) : 0.0; }
 float bandWarm(vec3 d) {
   // Colour: old warm light toward the bulge, bluer star-forming disk elsewhere.
-  float l = atan(-d.z, d.x);
+  float l = glon(d);
   float bulge = exp(-(l * l) / (2.0 * 0.26 * 0.26)) * exp(-abs(d.y) / 0.14);
   return clamp(bulge * 1.6 + 0.2, 0.0, 1.0);
 }
 vec3 band(vec3 d) {
   float sb = d.y;                       // sin(b)
-  float l = atan(-d.z, d.x);            // galactic longitude, 0 at the centre
+  float l = glon(d);
   float cl = cos(l);
   vec3 p = d * 2.4 + uSeed;
   // Thin disk + central bulge brightness (exponential in |sin b|).
@@ -870,13 +873,17 @@ export class Sky {
     const scene = new THREE.Scene().add(quad);
     const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     try {
-      // Two half-float channels (4 B/texel: 25 MB at N = 1024); RGBA16F if RG16F is not renderable.
+      // Two half-float channels (4 B/texel: 34 MB with mips at N = 1024); RGBA16F if RG16F is not
+      // renderable. A complete framebuffer also guarantees mipmap generation (renderable + filterable).
       for (const format of [THREE.RGFormat, THREE.RGBAFormat] as const) {
+        // Mipmapped: the hardware LOD (from the screen derivatives of the looked-up direction) then
+        // filters the band wherever it is minified — at wide fields of view, in the 128² ship probe,
+        // and ahead of a relativistic observer, where aberration compresses the sky (4.4× at 0.9 c).
         const rt = new THREE.WebGLCubeRenderTarget(size, {
           type: THREE.HalfFloatType,
           format,
-          generateMipmaps: false,
-          minFilter: THREE.LinearFilter,
+          generateMipmaps: true,
+          minFilter: THREE.LinearMipmapLinearFilter,
           magFilter: THREE.LinearFilter,
           depthBuffer: false,
           stencilBuffer: false,
@@ -891,9 +898,12 @@ export class Sky {
       if (!this.bandCube) return;
       for (let face = 0; face < 6; face++) {
         bakeMat.uniforms.uFace.value = face;
+        // (build the mip chain once, after the last face)
+        this.bandCube.texture.generateMipmaps = face === 5;
         renderer.setRenderTarget(this.bandCube, face);
         renderer.render(scene, cam);
       }
+      this.bandCube.texture.generateMipmaps = false;
       // Same uniforms object as the procedural material, so every setter drives both.
       this.bandMatBaked = new THREE.ShaderMaterial({
         glslVersion: THREE.GLSL3,

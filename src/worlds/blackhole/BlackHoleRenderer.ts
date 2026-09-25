@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { FullscreenQuad, FULLSCREEN_VERT } from '../../core/post/FullscreenQuad';
 import {
+  axisymmetricPoseKey,
   buildTetradInto,
   captureRadius,
   createTetrad,
@@ -141,18 +142,24 @@ interface QualitySettings {
   diskOct: number;
   /** Anisotropic filtering of the disk texture (grazing views). */
   aniso: number;
+  /** Analytic star layers drawn in the composite (the faintest is dropped on low). */
+  starLayers: number;
 }
 
 /**
- * Tiers. GPU cost of the trace ≈ pixels × (steps × ~420 + disk samples × ~190) ALU slots; see the
- * cost model in docs/modules/gargantua.md's review notes (steps ≈ 35 / 30 / 25 per pixel at the
- * default view for high / medium / low).
+ * Tiers, sized with a GPU cost model (ALU slots; ~1.25e12/s on a 2.5-TFLOPS laptop GPU):
+ *  - trace: pixels × (RK4 steps × ~500 + disk samples × ~190). Measured at the default view
+ *    (warp-max over 8 × 4 tiles): 37 / 29 / 23 steps and 3.7 / 4.0 / 4.1 samples per pixel for
+ *    high / medium / low → ≈ 19k / 15k / 12k slots. While the camera only orbits the spin axis
+ *    (the idle view) the lens cache traces ~30 % of those pixels again.
+ *  - disk texture: texels × ~250 (the noise is baked once); composite: output pixels × ~900.
+ * High at 1080p: trace 500k px ≈ 10 ms when everything moves, ≈ 3 ms idle; + ~2 ms composite.
  */
 const QUALITY: Record<BlackHoleQuality, QualitySettings> = {
-  low: { traceScale: 0.5, tracePixels: 150e3, maxSteps: 170, eps: 0.16, diskSamples: 8, diskTex: [1024, 256], diskOct: 3, aniso: 4 },
-  medium: { traceScale: 0.6, tracePixels: 300e3, maxSteps: 220, eps: 0.13, diskSamples: 12, diskTex: [1536, 384], diskOct: 4, aniso: 8 },
-  high: { traceScale: 0.72, tracePixels: 620e3, maxSteps: 280, eps: 0.1, diskSamples: 14, diskTex: [2048, 512], diskOct: 5, aniso: 16 },
-  ultra: { traceScale: 1, tracePixels: 1.6e6, maxSteps: 400, eps: 0.08, diskSamples: 20, diskTex: [3072, 768], diskOct: 6, aniso: 16 },
+  low: { traceScale: 0.5, tracePixels: 150e3, maxSteps: 170, eps: 0.16, diskSamples: 8, diskTex: [1024, 256], diskOct: 3, aniso: 4, starLayers: 2 },
+  medium: { traceScale: 0.6, tracePixels: 300e3, maxSteps: 220, eps: 0.13, diskSamples: 12, diskTex: [1536, 384], diskOct: 4, aniso: 8, starLayers: 3 },
+  high: { traceScale: 0.72, tracePixels: 500e3, maxSteps: 280, eps: 0.1, diskSamples: 14, diskTex: [2048, 512], diskOct: 5, aniso: 16, starLayers: 3 },
+  ultra: { traceScale: 1, tracePixels: 1.6e6, maxSteps: 400, eps: 0.08, diskSamples: 20, diskTex: [3072, 768], diskOct: 6, aniso: 16, starLayers: 3 },
 };
 
 /** Star layers: cells per cube-face edge and magnitude ranges (dN/dm ∝ 10^{0.35 m}). */
@@ -284,6 +291,7 @@ export class BlackHoleRenderer {
   private dirty = true;
   private profileKey = '';
   private noiseKey = '';
+  private framesSinceBake = 0;
   private diskNormKey = -1;
   private diskNorm = 1;
   private lastFwd = new THREE.Vector3();
@@ -459,7 +467,7 @@ export class BlackHoleRenderer {
     const avg = populationColor([3400, 4500, 5700, 6900, 9000, 15000], [0.1, 0.26, 0.22, 0.2, 0.15, 0.07]);
     this.compMat = new THREE.ShaderMaterial({
       ...common,
-      fragmentShader: COMPOSITE_FRAG,
+      fragmentShader: `#define STAR_LAYERS ${this.quality.starLayers}\n${COMPOSITE_FRAG}`,
       uniforms: {
         uAccum: { value: null },
         uSky: { value: null },
@@ -486,6 +494,7 @@ export class BlackHoleRenderer {
         uCTMap: { value: new THREE.Vector2(this.ctRange.qMin, 1 / (this.ctRange.qMax - this.ctRange.qMin)) },
         uSkyShift: { value: 1 },
         uDbg: { value: 0 },
+        uUpsample: { value: 1 },
       },
     });
   }
@@ -589,10 +598,15 @@ export class BlackHoleRenderer {
     };
     let rt = this.float.full ? make(THREE.FloatType) : null;
     if (rt && !isComplete(this.renderer, rt)) {
+      // Some tile-based GPUs refuse 2 × RGBA32F attachments (bits per pixel) despite the extension.
       rt.dispose();
       rt = null;
     }
     rt ??= make(THREE.HalfFloatType);
+    if (!isComplete(this.renderer, rt)) {
+      rt.dispose();
+      throw new Error('This GPU cannot render the black hole’s two half-float targets at once (multiple render targets).');
+    }
     this.traceRT = rt;
     this.lightRT = new THREE.WebGLRenderTarget(tw, th, { ...opts, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
     this.accum = [new THREE.WebGLRenderTarget(tw, th, opts), new THREE.WebGLRenderTarget(tw, th, opts)];
@@ -624,12 +638,18 @@ export class BlackHoleRenderer {
     (this.traceMat.uniforms.uDiskMap.value as THREE.Vector2).set(lnR0, 1 / span);
   }
 
-  /** Bake the disk's turbulence noise on its (φ, ln r) grid — only when that grid or the seed changes. */
+  /**
+   * Bake the disk's turbulence noise on its (φ, ln r) grid — only when that grid or the seed changes,
+   * and at most every few frames while a slider sweeps the disk's edges or the spin (a bake is
+   * ~4 ms on a mid laptop at 2048 × 512; a few frames of slightly stretched noise are invisible).
+   */
   private updateNoise(): void {
     const du = this.diskMat.uniforms;
     const key = `${du.uLnR0.value}|${du.uLnSpan.value}|${this.params.seed}`;
-    if (key === this.noiseKey) return;
+    this.framesSinceBake++;
+    if (key === this.noiseKey || (this.noiseKey !== '' && this.framesSinceBake < 10)) return;
     this.noiseKey = key;
+    this.framesSinceBake = 0;
     const nu = this.noiseMat.uniforms;
     nu.uLnR0.value = du.uLnR0.value;
     nu.uLnSpan.value = du.uLnSpan.value;
@@ -685,17 +705,7 @@ export class BlackHoleRenderer {
    */
   private lensKey(pos: Vec3, tw: number, th: number, escR: number): Float64Array {
     const k = this.curKey;
-    const x = pos[0], y = pos[1], z = pos[2];
-    const w = Math.hypot(x, y);
-    const cx = w > 1e-9 ? x / w : 1, cy = w > 1e-9 ? y / w : 0;
-    k[0] = w;
-    k[1] = z;
-    for (let i = 0; i < 3; i++) {
-      const v = this.kAxes[i];
-      k[2 + i * 3] = v[0] * cx + v[1] * cy; // ϖ̂
-      k[3 + i * 3] = -v[0] * cy + v[1] * cx; // φ̂
-      k[4 + i * 3] = v[2];
-    }
+    axisymmetricPoseKey(pos, this.kRight, this.kUp, this.kBack, k);
     k[11] = tw;
     k[12] = th;
     k[13] = this.tanX;
@@ -704,17 +714,24 @@ export class BlackHoleRenderer {
     k[16] = this.geomVersion;
     k[17] = this.customU ? NaN : 0; // a custom (plunge) velocity is never cached
     k[18] = this.params.showIsco || this.params.showPhotonOrbits ? NaN : 0;
-    k[19] = w > 1e-6 ? 0 : NaN; // on the axis the local frame is undefined
+    k[19] = Math.hypot(pos[0], pos[1]) > 1e-6 ? 0 : NaN; // on the axis the local frame is undefined
     k[20] = this.traceMat.uniforms.uDebug.value;
     for (let i = 21; i < KEY_N; i++) k[i] = 0;
     return k;
   }
 
+  /**
+   * Same geometry as the cached frame? Poses may differ by 2e-5 (relative position, axis
+   * components): rays then move by ≲ 1/50 of a trace pixel, and a camera easing into place (rig
+   * damping, look-around smoothing) reuses the cache instead of re-tracing for seconds.
+   */
   private keyMatches(): boolean {
     const a = this.cacheKey, b = this.curKey;
     const scale = Math.max(1, Math.abs(b[0]), Math.abs(b[1]));
     for (let i = 0; i < KEY_N; i++) {
-      const tol = i < 2 ? 1e-9 * scale : i < 11 ? 1e-9 : i === 15 ? 1e-9 * b[15] : 0;
+      // 0–1 position, 2–10 axes, 11–12 trace size (exact), 13–15 field of view and escape radius
+      // (relative), 16+ flags and versions (exact).
+      const tol = i < 2 ? 2e-5 * scale : i < 11 ? 2e-5 : i === 11 || i === 12 || i > 15 ? 0 : 2e-5 * Math.abs(b[i]);
       if (!(Math.abs(a[i] - b[i]) <= tol)) return false;
     }
     return true;
@@ -892,6 +909,21 @@ export class BlackHoleRenderer {
     this.historyValid = true;
     this.jitter.copy(this.cacheJitter);
     this.composite(target);
+    if (!this.checkedPrograms) this.checkPrograms();
+  }
+
+  private checkedPrograms = false;
+  /**
+   * A shader the driver refuses to link draws nothing: the view would stay black with only a
+   * console message. Turn that into an error the app shows (checked once, after the first frame).
+   */
+  private checkPrograms(): void {
+    this.checkedPrograms = true;
+    for (const m of [this.noiseMat, this.diskMat, this.traceMat, this.accumMat, this.compMat]) {
+      const prog = (this.renderer.properties.get(m) as { currentProgram?: { diagnostics?: { runnable: boolean } } }).currentProgram;
+      if (prog?.diagnostics && !prog.diagnostics.runnable)
+        throw new Error('The black-hole ray tracer’s shaders failed to compile on this GPU (details in the console).');
+    }
   }
 
   /**

@@ -177,17 +177,19 @@ uniform ivec3 uGlowSteps;    // samples: aurora below 200 km, aurora above 200 k
 uniform vec4 uAuroraShell;   // x: bottom r, y: top r, z: km→radius factor, w: unused
 
 // ——— A ray inside a spherical shell ———
-// The part of the ray [ts, te] with rIn < |p| < rOut is at most two segments: the near one ends where
-// the ray is lowest (entering rIn, or its point of closest approach if it stays above rIn), the far
-// one starts there. Samples are spread quadratically toward those low ends, i.e. uniformly in
-// altitude, where thin emitting layers need them.
-struct ShellPath { float a; float lo1; float lo2; float b; };
+// The part of the ray [ts, te] with rIn < |p| < rOut is at most two segments. A ray that crosses rIn
+// has a near segment ending there and a far one starting where it re-emerges; altitude then varies
+// ~linearly along each, so samples are uniform. A ray that stays above rIn is one path with its lowest
+// point (closest approach) inside; altitude grows quadratically away from it, so samples are spread
+// quadratically toward it — uniformly in altitude, where thin emitting layers need them.
+struct ShellPath { float a; float lo1; float lo2; float b; bool tangent; };
 bool shellPath(vec3 ro, vec3 rd, float ts, float te, float rIn, float rOut, out ShellPath sp) {
   vec2 o = raySphere(ro, rd, vec3(0.0), rOut);
   sp.a = max(ts, o.x);
   sp.b = min(te, o.y);
   sp.lo1 = sp.a;
   sp.lo2 = sp.b;
+  sp.tangent = true;
   if (sp.b <= sp.a) return false;
   float tm = clamp(-dot(ro, rd), sp.a, sp.b);
   sp.lo1 = tm;
@@ -196,6 +198,7 @@ bool shellPath(vec3 ro, vec3 rd, float ts, float te, float rIn, float rOut, out 
   if (i.x < i.y) {
     sp.lo1 = clamp(i.x, sp.a, sp.b);
     sp.lo2 = clamp(i.y, sp.a, sp.b);
+    sp.tangent = false;
   }
   return (sp.lo1 - sp.a) + (sp.b - sp.lo2) > 0.0;
 }
@@ -205,6 +208,9 @@ vec2 shellSample(ShellPath sp, float u, float n) {
   float L2 = sp.b - sp.lo2;
   float L = L1 + L2;
   float f1 = L1 / L;
+  if (!sp.tangent) {
+    return u < f1 ? vec2(sp.a + L * u, L / n) : vec2(sp.lo2 + L * (u - f1), L / n);
+  }
   if (u < f1) {
     float v = 1.0 - u / f1;
     return vec2(sp.lo1 - L1 * v * v, 2.0 * v * L / n);
@@ -271,6 +277,8 @@ vec3 auroraEmission(vec3 ro, vec3 rd, float ts, float te, float jitter) {
     ShellPath lp;
     if (!shellPath(ro, rd, ts, te, layer == 0 ? uAuroraShell.x : rMid, layer == 0 ? rMid : uAuroraShell.y, lp)) continue;
     int n = layer == 0 ? uGlowSteps.x : uGlowSteps.y;
+    // A ray crossing the band (seen from above) traverses it quickly and uniformly: fewer samples.
+    if (!lp.tangent) n = max(layer == 0 ? 4 : 2, (2 * n) / 3);
     for (int i = 0; i < 32; i++) {
       if (i >= n) break;
       vec2 s = shellSample(lp, (float(i) + jitter) / float(n), float(n));

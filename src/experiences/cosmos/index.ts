@@ -1211,6 +1211,8 @@ class CosmicWebExperience implements Experience {
 
   debugView(id: ViewId): void {
     this.setView(id, true);
+    // Automation: land on the destination at once (interactive view changes keep their flights).
+    this.orbit.update(1e3);
   }
 
   preset(id: PresetId): void {

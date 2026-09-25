@@ -29,6 +29,8 @@ export interface ShellPath {
   lo1: number;
   lo2: number;
   b: number;
+  /** The ray stays above the inner radius (one path around its lowest point). */
+  tangent: boolean;
 }
 export function shellPath(ro: V3, rd: V3, ts: number, te: number, rIn: number, rOut: number): ShellPath | null {
   const o = raySphere(ro, rd, rOut);
@@ -39,18 +41,21 @@ export function shellPath(ro: V3, rd: V3, ts: number, te: number, rIn: number, r
   const tm = Math.min(Math.max(-dot(ro, rd), a), b);
   let lo1 = tm;
   let lo2 = tm;
+  let tangent = true;
   const i = raySphere(ro, rd, rIn);
   if (i && i[0] < i[1]) {
     lo1 = Math.min(Math.max(i[0], a), b);
     lo2 = Math.min(Math.max(i[1], a), b);
+    tangent = false;
   }
-  return lo1 - a + (b - lo2) > 0 ? { a, lo1, lo2, b } : null;
+  return lo1 - a + (b - lo2) > 0 ? { a, lo1, lo2, b, tangent } : null;
 }
 export function shellSample(sp: ShellPath, u: number, n: number): [number, number] {
   const L1 = sp.lo1 - sp.a;
   const L2 = sp.b - sp.lo2;
   const L = L1 + L2;
   const f1 = L1 / L;
+  if (!sp.tangent) return u < f1 ? [sp.a + L * u, L / n] : [sp.lo2 + L * (u - f1), L / n];
   if (u < f1) {
     const v = 1 - u / f1;
     return [sp.lo1 - L1 * v * v, (2 * v * L) / n];
