@@ -71,13 +71,22 @@ export function atlasSpec(m: AtlasMode): TargetSpec {
   return { type: UNSIGNED_BYTE, format: RGBA, filter: NEAREST, encode: 1 / 32 };
 }
 
+/** Pixel budget of the light accumulator per quality tier (the sprite fill scales with it). */
+export function accumBudget(detail: number): number {
+  return detail >= 1.5 ? 2.2e6 : detail >= 1 ? 1.3e6 : detail >= 0.6 ? 0.7e6 : 0.45e6;
+}
+
 /**
  * Light-accumulator resolution relative to the HDR target. The accumulated dark-matter light is a
  * smooth field (every sprite carries an SPH kernel at least ~1 CSS px wide), so it is rendered at
- * no more than one pixel per CSS pixel and upsampled bilinearly by the composite: on a DPR-2 screen
- * that is a quarter of the sprite fragments for the same image. Lower tiers render coarser still.
+ * no more than one pixel per CSS pixel, within a per-tier pixel budget, and upsampled bilinearly
+ * by the composite: on a DPR-2 screen that is a quarter of the sprite fragments for the same
+ * image. Inside the box (immersive views) every pixel sees a deep column of large sprites and the
+ * dark matter is only a soft glow behind the galaxies, so it is accumulated at half that scale.
  */
-export function accumScaleFor(detail: number, pixelRatio: number): number {
+export function accumScaleFor(detail: number, pixelRatio: number, targetPixels = 0, immersive = false): number {
   const tier = detail >= 1 ? 1 : detail >= 0.6 ? 0.85 : 0.7;
-  return tier / Math.max(1, pixelRatio);
+  let s = tier / Math.max(1, pixelRatio);
+  if (targetPixels > 0) s = Math.min(s, Math.sqrt(accumBudget(detail) / targetPixels));
+  return immersive ? 0.5 * s : s;
 }

@@ -125,8 +125,12 @@ const REPLICA_OFFSETS = (() => {
  * smoothing lengths, most of the sprite fill (see docs in the accumulation shader).
  */
 const VOID_FADE = new THREE.Vector2(0.12, 0.3);
-/** Importance thinning of sub-mean-density sprites: below ρ/ρ̄ = x keep (ρ/x)^y of them, at least z. */
-const THIN = new THREE.Vector3(1.0, 1.0, 0.12);
+/**
+ * Importance thinning of low-density sprites: below ρ/ρ̄ = x keep (ρ/x)^y of them, at least z.
+ * x follows the growth of structure (1 + D, see render()): the young, low-contrast web is thinned
+ * only below the mean density, the contrasted web of today below twice the mean.
+ */
+const THIN = new THREE.Vector3(2.0, 1.0, 0.1);
 
 const tmpColor = new THREE.Color();
 const tmpSize = new THREE.Vector2();
@@ -194,7 +198,13 @@ export class WebRenderer {
   private lastZA = NaN;
   private targetW = 1;
   private targetH = 1;
-  private sizedFor = { w: 0, h: 0, pr: 0 };
+  private sizedFor = { w: 0, h: 0, pr: 0, imm: false };
+  /** Camera inside the box (wrapped views): coarser accumulator, no thinning (see accumScaleFor). */
+  private immersive = false;
+  /** Least fraction of sub-mean-density sprites drawn outside the box (0 = thinning off; tunable). */
+  private thinMin = THIN.z;
+  /** Set when tune() fixed the thinning threshold (experiments); otherwise it follows D. */
+  private thinPinned = false;
   /** Screen-space pixel density (device px per CSS px of the target) for sprite sizes. */
   pixelRatio = 1;
   /** Composite brightness (× exposure) and galaxy brightness; tunable. */
@@ -682,12 +692,13 @@ export class WebRenderer {
   resize(width: number, height: number): void {
     this.targetW = Math.max(1, width);
     this.targetH = Math.max(1, height);
-    const s = accumScaleFor(this.opts.detail, this.pixelRatio);
+    const s = accumScaleFor(this.opts.detail, this.pixelRatio, this.targetW * this.targetH, this.immersive);
     const aw = Math.max(1, Math.round(this.targetW * s)), ah = Math.max(1, Math.round(this.targetH * s));
     if (aw !== this.accum.width || ah !== this.accum.height) this.accum.setSize(aw, ah);
     this.sizedFor.w = width;
     this.sizedFor.h = height;
     this.sizedFor.pr = this.pixelRatio;
+    this.sizedFor.imm = this.immersive;
   }
 
   /** Build the density atlas for the current interpolated positions. */
@@ -718,8 +729,9 @@ export class WebRenderer {
     // Follow the target (dynamic resolution) and the pixel density.
     const tw = target ? target.width : r.getDrawingBufferSize(tmpSize).x;
     const th = target ? target.height : tmpSize.y;
+    this.immersive = st.wrap;
     const z = this.sizedFor;
-    if (tw !== z.w || th !== z.h || this.pixelRatio !== z.pr) this.resize(tw, th);
+    if (tw !== z.w || th !== z.h || this.pixelRatio !== z.pr || this.immersive !== z.imm) this.resize(tw, th);
     r.getClearColor(tmpColor);
     const clearAlpha = r.getClearAlpha();
     r.setClearColor(0x000000, 0);
@@ -774,6 +786,11 @@ export class WebRenderer {
         am.uMinPx.value = Math.min(maxR, Math.max(0.9, 1.1 * (this.accum.height / this.targetH) * this.pixelRatio));
         am.uMaxPx.value = Math.min(maxR, 0.12 * this.accum.height);
         am.uGain.value = st.darkMatter;
+        // Thinning only from outside the box: inside it, near sprites are large and a reweighted
+        // one would show as a blotch; there the coarser accumulator carries the saving instead.
+        const thin = am.uThin.value as THREE.Vector3;
+        thin.z = st.wrap ? 0 : this.thinMin;
+        if (!this.thinPinned) thin.x = 1 + Math.min(1, Math.max(0, st.D));
         r.setRenderTarget(this.accum);
         r.clear(true, false, false);
         r.render(this.accumScene, camera);
@@ -836,9 +853,12 @@ export class WebRenderer {
       }
       if (k === 'thinRho' || k === 'thinExp' || k === 'thinMin') {
         const t = this.accumMat.uniforms.uThin.value as THREE.Vector3;
-        if (k === 'thinRho') t.x = v;
+        if (k === 'thinRho') {
+          t.x = v;
+          this.thinPinned = true;
+        }
         else if (k === 'thinExp') t.y = v;
-        else t.z = v;
+        else t.z = this.thinMin = v;
         continue;
       }
       const u = this.accumMat.uniforms[k] ?? this.compositeMat.uniforms[k] ?? this.galaxyMat.uniforms[k];

@@ -715,13 +715,24 @@ describe('Review: portable render-target formats', () => {
     expect(atlasSpec('rgba8').encode * 32).toBeCloseTo(1, 12);
   });
 
-  it('the light accumulator stays at ≤ 1 pixel per CSS pixel and scales with the tier', () => {
+  it('the light accumulator stays at ≤ 1 pixel per CSS pixel, within a per-tier budget', () => {
     expect(accumScaleFor(1, 1)).toBe(1);
     expect(accumScaleFor(1, 2)).toBe(0.5);
     expect(accumScaleFor(0.7, 1.5)).toBeCloseTo(0.85 / 1.5, 12);
     expect(accumScaleFor(0.35, 1)).toBe(0.7);
     // Dynamic resolution below one device pixel per CSS pixel is followed, not undone.
     expect(accumScaleFor(1, 0.6)).toBe(1);
+    // Budgets: high ≤ 1.3 Mpx at 1080p; a DPR-2 2560×1600 laptop lands at one pixel per CSS pixel.
+    const s1080 = accumScaleFor(1, 1, 1920 * 1080);
+    expect(1920 * 1080 * s1080 * s1080).toBeLessThanOrEqual(1.3e6 + 1);
+    expect(accumScaleFor(1, 2, 2560 * 1600)).toBe(0.5);
+    // Low tier at 720p keeps its historical 0.7 scale; every tier costs less than the one above it.
+    expect(accumScaleFor(0.35, 1, 1280 * 720)).toBe(0.7);
+    const px = (d: number) => 1920 * 1080 * accumScaleFor(d, 1, 1920 * 1080) ** 2;
+    expect(px(0.35)).toBeLessThan(px(0.7));
+    expect(px(0.7)).toBeLessThan(px(1));
+    // Inside the box: half the linear resolution.
+    expect(accumScaleFor(1, 1, 1920 * 1080, true)).toBeCloseTo(0.5 * s1080, 12);
   });
 });
 
