@@ -38,9 +38,14 @@ const VIEWS: Array<{ id: ViewId; label: string }> = [
   { id: 'void', label: 'Void' },
 ];
 const SPEEDS = [0.25, 0.5, 1, 2, 4];
+const SPEED_TEXT = SPEEDS.map((x) => `×${x}`);
+/** Values decoded / particles packed per frame while playback approaches the next keyframe. */
+const PREFETCH_VALUES = 900_000;
+const STAGE_PARTICLES = 300_000;
 /** Track units per second at ×1 — the whole history in about a minute. */
 const BASE_RATE = 1 / 62;
 const THIN = ' ';
+const SIMULATING = `Simulating${THIN}…`;
 
 const fmtZ = (z: number) => {
   const a = Math.abs(z);
@@ -114,6 +119,11 @@ class CosmicWebExperience implements Experience {
     cmb: null,
   };
   private slabAxis = new THREE.Vector3(0, 1, 0);
+  /** Reused every frame while the primordial glow is visible (no per-frame allocation). */
+  private cmbState = { T: 3000, radiance: 0, aniso: 0 };
+  private zKey = NaN;
+  private zText = '';
+  private disposed = false;
 
   // current keyframe interval
   private kA = -1;
@@ -279,10 +289,13 @@ class CosmicWebExperience implements Experience {
   private onInfo(info: SimInfo): void {
     this.info = info;
     const L = info.box / this.cosmo.h;
-    if (this.web && (this.web.opts.count !== info.count || this.web.opts.np !== info.np)) {
-      this.web.dispose();
-      this.web = null;
-    }
+    // Every run gets a fresh renderer: the Lagrangian overdensities (field galaxies), σL and the
+    // collapsed-fraction variances belong to the run — reusing the old one after "Re-run" with a
+    // new seed lit field galaxies at the previous universe's peaks.
+    this.web?.dispose();
+    this.web = null;
+    this.fireballFallback?.dispose();
+    this.fireballFallback = null;
     const varR = info.sigmaL * info.sigmaL;
     const sig11 = this.sigmaAtMass11();
     const opts = {
@@ -296,8 +309,8 @@ class CosmicWebExperience implements Experience {
       varBright: Math.max(0.3, sig11 - varR),
       detail: this.ctx.quality.detail,
     };
-    if (!this.web) this.web = new WebRenderer(this.ctx.renderer, opts);
-    else Object.assign(this.web.opts, opts);
+    this.web = new WebRenderer(this.ctx.renderer, opts);
+    this.web.pixelRatio = this.ctx.engine.pixelRatio;
     this.web.resize(this.ctx.engine.width, this.ctx.engine.height);
     this.statusLine?.(`${info.count.toLocaleString('en-US')} particles · ${info.nm}³ mesh · ${formatNumber(L, 3)} Mpc box · m = ${formatScientific(info.particleMass, 2)} M☉`);
     // Power-spectrum axes for this run.
@@ -873,7 +886,13 @@ class CosmicWebExperience implements Experience {
     const glow = fireballRadiance(T);
     // Soft-capped so the 4000 K fireball stays a deep, saturated orange on screen.
     const glowShown = 0.2 * (1 - Math.exp(-glow / 0.2));
-    st.cmb = glow > 1e-5 && !e.recollapses ? { T, radiance: glowShown, aniso: z < 1090 ? 0.02 : 0 } : glow > 1e-5 ? { T, radiance: glowShown, aniso: z < 1090 && t < e.tTurn ? 0.02 : 0 } : null;
+    if (glow > 1e-5) {
+      const c = this.cmbState;
+      c.T = T;
+      c.radiance = glowShown;
+      c.aniso = z < 1090 && (!e.recollapses || t < e.tTurn) ? 0.02 : 0;
+      st.cmb = c;
+    } else st.cmb = null;
     const lz = Math.log(1 + Math.max(z, 0));
     const dmIn = 1 - smooth(Math.log(40), Math.log(420), lz);
     // Up close (immersive views) the smoothed dark matter becomes a soft glow and the galaxies —
@@ -923,9 +942,30 @@ class CosmicWebExperience implements Experience {
       this.readoutClock = 0.12;
       this.updateReadouts(t, a, z, D);
     }
-    const busy = this.waiting ? `Simulating${THIN}…` : this.progressLine && this.u >= tl.uIC * 0.99 ? this.progressLine : '';
-    this.timeline.update(this.u, buffered, this.playing, `z ${fmtZ(z)}`, `×${SPEEDS[this.speedIdx]}`, busy);
+    const busy = this.waiting ? SIMULATING : this.progressLine && this.u >= tl.uIC * 0.99 ? this.progressLine : '';
+    // The redshift label changes a few times a second at most: rebuild it only then.
+    const az = Math.abs(z);
+    const zKey = az >= 100 ? Math.round(z) : az >= 10 ? Math.round(z * 10) + 0.25 : Math.round(z * 100) + 0.5;
+    if (zKey !== this.zKey) {
+      this.zKey = zKey;
+      this.zText = `z ${fmtZ(z)}`;
+    }
+    this.timeline.update(this.u, buffered, this.playing, this.zText, SPEED_TEXT[this.speedIdx], busy);
     this.updateRings();
+    this.prefetchNext();
+  }
+
+  /**
+   * While playing forward, decode and pack the keyframe after the current interval a slice per
+   * frame, so crossing into the next interval costs only a texture upload (no 10–20 ms stall).
+   */
+  private prefetchNext(): void {
+    const store = this.client.store;
+    const web = this.web;
+    if (!store || !web || !this.playing || this.kB < 0) return;
+    const next = this.kB + 1;
+    if (next >= store.length) return;
+    if (store.prefetch(next, PREFETCH_VALUES)) web.stage(next, store.positions(next), STAGE_PARTICLES);
   }
 
   private selectInterval(t: number, D: number): void {
@@ -1022,30 +1062,7 @@ class CosmicWebExperience implements Experience {
 
   private updateRings(): void {
     const h = this.currentHalos();
-    const W = this.ctx.canvas.clientWidth, H = this.ctx.canvas.clientHeight;
-    const place = (el: HTMLElement, i: number, label: string | null) => {
-      if (!h || i < 0 || i >= h.count) {
-        el.hidden = true;
-        return;
-      }
-      this.haloWorld(h, i, this.v1);
-      const dist = this.v1.distanceTo(this.camera.position);
-      this.v1.project(this.camera);
-      if (this.v1.z < -1 || this.v1.z > 1) {
-        el.hidden = true;
-        return;
-      }
-      const sx = (this.v1.x * 0.5 + 0.5) * W, sy = (-this.v1.y * 0.5 + 0.5) * H;
-      const rw = (h.r200[i] / 1000) * (this.coords === 'physical' ? 1 : 1 / Math.max(this.e.aAt(this.t), 1e-3));
-      const fpx = H / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2));
-      const r = THREE.MathUtils.clamp((rw * fpx) / Math.max(dist, 1e-3), 7, 120);
-      el.hidden = false;
-      el.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px)`;
-      el.style.setProperty('--r', `${r.toFixed(1)}px`);
-      const sp = el.querySelector('span') as HTMLElement;
-      if (label !== null && sp.textContent !== label) sp.textContent = label;
-    };
-    place(this.ringSel, this.selected, '');
+    this.placeRing(this.ringSel, h, this.selected, false);
     // Hover highlight while the pointer is moving over the canvas.
     this.hoverClock--;
     const now = performance.now();
@@ -1055,7 +1072,43 @@ class CosmicWebExperience implements Experience {
         this.hover = this.nearestHalo(h, this.ctx.input.pointer.x, this.ctx.input.pointer.y, 20);
       }
     } else this.hover = -1;
-    place(this.ringHover, this.hover !== this.selected ? this.hover : -1, h && this.hover >= 0 ? fmtMass(h.mass[this.hover]) : '');
+    this.placeRing(this.ringHover, h, this.hover !== this.selected ? this.hover : -1, true);
+  }
+
+  /** Position a halo ring (DOM writes only when something visibly changed). */
+  private placeRing(el: HTMLElement, h: HaloCatalog | null, i: number, labelled: boolean): void {
+    if (!h || i < 0 || i >= h.count) {
+      if (!el.hidden) el.hidden = true;
+      return;
+    }
+    this.haloWorld(h, i, this.v1);
+    const dist = this.v1.distanceTo(this.camera.position);
+    this.v1.project(this.camera);
+    if (this.v1.z < -1 || this.v1.z > 1) {
+      if (!el.hidden) el.hidden = true;
+      return;
+    }
+    const W = this.ctx.canvas.clientWidth, H = this.ctx.canvas.clientHeight;
+    const sx = (this.v1.x * 0.5 + 0.5) * W, sy = (-this.v1.y * 0.5 + 0.5) * H;
+    const rw = (h.r200[i] / 1000) * (this.coords === 'physical' ? 1 : 1 / Math.max(this.e.aAt(this.t), 1e-3));
+    const fpx = H / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2));
+    const r = THREE.MathUtils.clamp((rw * fpx) / Math.max(dist, 1e-3), 7, 120);
+    if (el.hidden) el.hidden = false;
+    const d = el as HTMLElement & { _x?: number; _y?: number; _r?: number; _i?: number; _h?: HaloCatalog };
+    if (d._x === undefined || Math.abs(d._x - sx) > 0.05 || Math.abs(d._y! - sy) > 0.05) {
+      d._x = sx;
+      d._y = sy;
+      el.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px)`;
+    }
+    if (d._r === undefined || Math.abs(d._r - r) > 0.05) {
+      d._r = r;
+      el.style.setProperty('--r', `${r.toFixed(1)}px`);
+    }
+    if (labelled && (d._i !== i || d._h !== h)) {
+      d._i = i;
+      d._h = h;
+      (el.firstElementChild as HTMLElement).textContent = fmtMass(h.mass[i]);
+    }
   }
 
   private nearestHalo(h: HaloCatalog, x: number, y: number, radius: number): number {
@@ -1119,6 +1172,7 @@ class CosmicWebExperience implements Experience {
   }
 
   unmount(): void {
+    this.disposed = true;
     clearTimeout(this.captionTimer);
     clearTimeout(this.fateClock);
     this.client.dispose();
@@ -1157,6 +1211,8 @@ class CosmicWebExperience implements Experience {
 
   debugView(id: ViewId): void {
     this.setView(id, true);
+    // Automation: land on the destination at once (interactive view changes keep their flights).
+    this.orbit.update(1e3);
   }
 
   preset(id: PresetId): void {
@@ -1175,7 +1231,7 @@ class CosmicWebExperience implements Experience {
       const check = () => {
         const st = this.client.store;
         const last = st?.last();
-        if (this.client.finished || (last && 1 / last.a - 1 <= z + 1e-6)) resolve();
+        if (this.disposed || this.client.finished || (last && 1 / last.a - 1 <= z + 1e-6)) resolve();
         else setTimeout(check, 250);
       };
       check();
@@ -1186,7 +1242,7 @@ class CosmicWebExperience implements Experience {
     this.web?.tune(p);
   }
 
-  debugGPU(): Record<string, number> | null {
+  debugGPU(): Record<string, number | string> | null {
     return this.web ? this.web.debugStats() : null;
   }
 

@@ -89,7 +89,7 @@ export const DESTINATIONS: Destination[] = [
     companion: { star: 'Toliman', name: 'α Centauri B', teff: 5260, radius: 0.8591, orbit: ALPHA_CEN_ORBIT },
     standoffAU: 55,
     facts: [
-      ['A', 'G2V · 1.08 M☉ · 1.22 R☉'],
+      ['A', 'G2V · 1.11 M☉ · 1.22 R☉'],
       ['B', 'K1V · 0.91 M☉ · 0.86 R☉'],
       ['Orbit', '79.9 yr · 11–36 AU apart'],
       ['From here', 'the Sun shines at mag 0.5 in Cassiopeia'],

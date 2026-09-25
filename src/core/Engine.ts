@@ -74,6 +74,8 @@ export class Engine {
   private fastTime = 0;
   private dpr = 1;
   private onFrame: ((f: FrameInfo) => void) | null = null;
+  /** Optional instrumentation around each whole frame (benchmark harness). */
+  probe: { begin(): void; end(): void } | null = null;
   private resizeListeners = new Set<(w: number, h: number) => void>();
   private resizeObserver: ResizeObserver;
 
@@ -178,11 +180,13 @@ export class Engine {
     if (this.dynamicResolution) this.adapt(dt);
 
     const r = this.renderer;
+    this.probe?.begin();
     r.setRenderTarget(this.hdr);
     r.setClearColor(0x000000, 1);
     r.clear(true, true, false);
     this.onFrame?.({ dt, time: this.time, frame: this.frame });
     this.post.render(this.hdr, this.time);
+    this.probe?.end();
   }
 
   /** Dynamic resolution with hysteresis: drop quickly under 45 fps, recover slowly above 57. */

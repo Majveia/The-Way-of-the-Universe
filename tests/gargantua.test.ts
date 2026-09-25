@@ -34,7 +34,15 @@ import {
   type Vec4,
 } from '../src/worlds/blackhole/kerr';
 import { PlungeTrajectory, schwarzschildRainRadius, schwarzschildRainTime } from '../src/worlds/blackhole/plunge';
-import { innerHorizonRadius, shadowAngularWidth } from '../src/worlds/blackhole/kerr';
+import {
+  STEP_LAW,
+  axisymmetricPoseKey,
+  impactStepScale,
+  innerHorizonRadius,
+  shadowAngularWidth,
+  stepLength,
+} from '../src/worlds/blackhole/kerr';
+import { traceFrag } from '../src/worlds/blackhole/shaders';
 import { exposureFactor, fovForDistance, MASS_PRESETS } from '../src/experiences/gargantua/presets';
 
 /** Static camera on the +x axis (optionally lifted to latitude `elev`) looking at the hole. */
@@ -394,5 +402,189 @@ describe('camera helpers', () => {
     expect(MASS_PRESETS.sgra.mass).toBeCloseTo(4.3e6, -4);
     expect(MASS_PRESETS.m87.mass).toBeGreaterThan(1e9);
     expect(MASS_PRESETS.cygx1.mass).toBeLessThan(100);
+  });
+});
+
+// ————————————————————————————————————————————————————————————— review: lens tail, step law, conventions
+
+/** Static camera at distance r, elevation `elev` (rad) above the disk plane, looking at the hole. */
+function viewCam(a: number, r: number, elev: number) {
+  return camera(a, r, elev);
+}
+
+/** Unit direction of a camera-frame pixel ray (right, up, back components). */
+function pixelDir(tanX: number, tanY: number, nx: number, ny: number): Vec3 {
+  const d: Vec3 = [nx * tanX, ny * tanY, -1];
+  const n = Math.hypot(d[0], d[1], d[2]);
+  return [d[0] / n, d[1] / n, d[2] / n];
+}
+
+const angleBetween = (u: Vec3, v: Vec3) => Math.acos(Math.min(1, Math.max(-1, u[0] * v[0] + u[1] * v[1] + u[2] * v[2])));
+
+describe('weak-field tail (hand-over from the numerical integration)', () => {
+  it('the sky direction does not depend on where the integration hands over (Kerr–Schild → isotropic chart)', () => {
+    // The old tail applied Einstein's (2M/b)(1 − cos ψ) to the Kerr–Schild (areal-radius) direction;
+    // stopping the same ray at r = 60 or r = 3000 then disagreed by ≈ M b / r² ≈ 4e-3 rad.
+    for (const a of [0, 0.9]) {
+      const cam = viewCam(a, 40, 0.063);
+      for (const [nx, ny] of [
+        [0.7, 0.8],
+        [-0.9, 0.2],
+        [0.3, -0.6],
+      ]) {
+        const k = rayMomentum(cam.tetrad, pixelDir(0.52, 0.29, nx, ny));
+        const far = traceRay(a, cam.pos, k, { eps: 0.01, rEscape: 3000 });
+        expect(far.fate).toBe('escaped');
+        for (const R of [45, 60, 120]) {
+          const near = traceRay(a, cam.pos, k, { eps: 0.01, rEscape: R });
+          expect(angleBetween(near.direction, far.direction)).toBeLessThan(R >= 60 ? 1e-4 : 3e-4);
+        }
+      }
+    }
+  });
+
+  it('reproduces the exact Schwarzschild deflection at b = 10 M (strong field)', () => {
+    // α(b) = 2∫₀^{u₀} du / √(1/b² − u² + 2u³) − π, u₀ the periapsis root; u = u₀(1 − t²) removes the
+    // endpoint singularity, then composite Simpson in t.
+    const b = 10;
+    const G = (u: number) => 1 / (b * b) - u * u + 2 * u * u * u;
+    let lo = 0, hi = 1 / 3; // G(0) > 0; the periapsis root lies below the photon sphere's u = 1/3
+    for (let i = 0; i < 200; i++) {
+      const m = 0.5 * (lo + hi);
+      if (G(m) > 0) lo = m;
+      else hi = m;
+    }
+    const u0 = lo;
+    const f = (t: number) => {
+      if (t < 1e-9) {
+        const dG = -2 * u0 + 6 * u0 * u0; // G'(u₀)
+        return (2 * u0) / Math.sqrt(-dG * u0);
+      }
+      return (2 * u0 * t) / Math.sqrt(Math.max(G(u0 * (1 - t * t)), 1e-300));
+    };
+    const n = 20000;
+    let sum = f(0) + f(1);
+    for (let i = 1; i < n; i++) sum += (i % 2 ? 4 : 2) * f(i / n);
+    const exact = 2 * ((sum / n) / 3) - Math.PI;
+    expect(exact).toBeGreaterThan(0.5); // ≈ 4/b + 15π/(4b²) + … : far beyond the weak field
+    const r = 1e4;
+    const cam = viewCam(0, r, 0);
+    const psi = Math.asin((b * Math.sqrt(1 - 2 / r)) / r);
+    const res = traceRay(0, cam.pos, rayMomentum(cam.tetrad, [Math.sin(psi), 0, -Math.cos(psi)]), { eps: 0.01, rEscape: 60 });
+    expect(res.fate).toBe('escaped');
+    const inDir: Vec3 = [-Math.cos(psi), Math.sin(psi), 0];
+    expect(angleBetween(inDir, res.direction) / exact).toBeCloseTo(1, 4);
+  });
+});
+
+describe('observer conventions', () => {
+  it('a static camera sees starlight blueshifted by 1/√(1 − 2Mr/Σ) in every direction', () => {
+    for (const a of [0, 0.9]) {
+      const r = 12, elev = 0.4;
+      const cam = viewCam(a, r, elev);
+      const cosT = cam.pos[2] / ksRadius(a, ...cam.pos);
+      const expected = staticTimeDilation(a, ksRadius(a, ...cam.pos), cosT);
+      for (const d of [
+        [0, 0, -1],
+        [0.6, 0, -0.8],
+        [0, -0.8, 0.6],
+        [0.36, 0.48, 0.8],
+      ] as Vec3[]) {
+        // E = −p_t of the photon in units of the camera's frequency: g_sky = 1/E.
+        expect(rayMomentum(cam.tetrad, d)[0]).toBeCloseTo(expected, 10);
+      }
+    }
+  });
+
+  it('the approaching half of a prograde disk is blueshifted and lies on the flattened side of the shadow', () => {
+    // Camera on +x, up = spin axis, camera-right = +y. The disk turns with the hole (+φ), so gas at
+    // camera-left moves toward the camera. Prograde photons (L_z > 0) pass on the left, where the
+    // Kerr shadow is flattened (see the Bardeen test above).
+    const a = 0.9;
+    const cam = viewCam(a, 40, 0.063);
+    const redshiftAt = (side: number) => {
+      const res = traceRay(a, cam.pos, rayMomentum(cam.tetrad, pixelDir(0.52, 0.29, side * 0.35, -0.06)), { eps: 0.02 });
+      const c = res.crossings[0];
+      expect(c).toBeDefined();
+      const o = circularOrbit(a, c.r)!;
+      return { g: 1 / (o.ut * (res.energy - o.omega * res.lz)), lz: res.lz, r: c.r };
+    };
+    const left = redshiftAt(-1);
+    const right = redshiftAt(1);
+    expect(left.r).toBeGreaterThan(iscoRadius(a));
+    expect(right.r).toBeGreaterThan(iscoRadius(a));
+    expect(left.lz).toBeGreaterThan(0);
+    expect(right.lz).toBeLessThan(0);
+    expect(left.g).toBeGreaterThan(1.05);
+    expect(right.g).toBeLessThan(0.9);
+  });
+});
+
+describe('GPU step law (shared with the CPU tracer)', () => {
+  it('the trace shader is generated from STEP_LAW', () => {
+    const src = traceFrag(280, 14);
+    expect(src).toContain(`* ${1 / STEP_LAW.bRef}, 1.0, ${STEP_LAW.kMax})`);
+    expect(src).toContain(`smoothstep(${STEP_LAW.growR0}.0, ${STEP_LAW.growR1}.0, r)`);
+    expect(src).toContain(`min(grow * kb, ${STEP_LAW.cap})`);
+    expect(stepLength(0.1, 10, 1)).toBeCloseTo(1, 12);
+    expect(stepLength(0.1, 200, 1)).toBeCloseTo(0.1 * 200 * STEP_LAW.cap, 12); // grow 3 capped
+    expect(impactStepScale(4)).toBe(1);
+    expect(impactStepScale(1e6)).toBe(STEP_LAW.kMax);
+  });
+
+  // Default view (40 r_g, 3.6° above the disk, 32° vertical field): trace a grid with each tier's
+  // step and with 1/16 of it; errors in 1080p pixels (sky: asymptotic direction, disk: first
+  // equatorial crossing seen from the camera).
+  const tiers: Array<[string, number, number, number]> = [
+    ['high', 0.1, 0.35, 1.5],
+    ['medium', 0.13, 0.8, 2.5],
+    ['low', 0.16, 1.6, 4],
+  ];
+  for (const [name, eps, skyTol, diskTol] of tiers) {
+    it(`${name} tier (eps = ${eps}) keeps the lensed sky and the disk within budget`, () => {
+      const a = 0.9;
+      const cam = viewCam(a, 40, (3.6 * Math.PI) / 180);
+      const tanY = Math.tan((32.2 * Math.PI) / 360), tanX = (tanY * 16) / 9;
+      const pix = (2 * tanY) / 1080;
+      const sky: number[] = [], disk: number[] = [];
+      for (let j = 0; j < 9; j++)
+        for (let i = 0; i < 16; i++) {
+          const k = rayMomentum(cam.tetrad, pixelDir(tanX, tanY, ((i + 0.5) / 16) * 2 - 1, ((j + 0.5) / 9) * 2 - 1));
+          const g = traceRay(a, cam.pos, k, { eps, maxSteps: 600 });
+          const ref = traceRay(a, cam.pos, k, { eps: eps / 16, maxSteps: 20000 });
+          if (g.fate !== ref.fate) continue; // a ray on the shadow's edge
+          if (g.fate === 'escaped') sky.push(angleBetween(g.direction, ref.direction) / pix);
+          if (g.crossings.length && ref.crossings.length) {
+            const p = g.crossings[0].pos, q = ref.crossings[0].pos;
+            disk.push(Math.hypot(p[0] - q[0], p[1] - q[1]) / (40 * pix));
+          }
+        }
+      const p99 = (v: number[]) => v.sort((x, y) => x - y)[Math.floor(0.99 * (v.length - 1))];
+      expect(sky.length).toBeGreaterThan(80);
+      expect(disk.length).toBeGreaterThan(30);
+      expect(p99(sky)).toBeLessThan(skyTol);
+      expect(p99(disk)).toBeLessThan(diskTol);
+    });
+  }
+});
+
+describe('lens cache key', () => {
+  it('is invariant under rotations about the spin axis and sensitive to anything else', () => {
+    const rot = (v: Vec3, t: number): Vec3 => [v[0] * Math.cos(t) - v[1] * Math.sin(t), v[0] * Math.sin(t) + v[1] * Math.cos(t), v[2]];
+    const pos: Vec3 = [30, 12, 4];
+    const back: Vec3 = [0.9, 0.36, 0.12];
+    const bn = Math.hypot(...back);
+    const b: Vec3 = [back[0] / bn, back[1] / bn, back[2] / bn];
+    const right: Vec3 = [-b[1], b[0], 0].map((x) => x / Math.hypot(b[0], b[1])) as Vec3;
+    const up: Vec3 = [b[1] * right[2] - b[2] * right[1], b[2] * right[0] - b[0] * right[2], b[0] * right[1] - b[1] * right[0]];
+    const k0 = axisymmetricPoseKey(pos, right, up, b, new Float64Array(11));
+    const k1 = axisymmetricPoseKey(rot(pos, 1.234), rot(right, 1.234), rot(up, 1.234), rot(b, 1.234), new Float64Array(11));
+    for (let i = 0; i < 11; i++) expect(k1[i]).toBeCloseTo(k0[i], 12);
+    // A tilt of the camera (not about the spin axis) changes the key.
+    const tilt = (v: Vec3): Vec3 => [v[0], v[1] * Math.cos(0.01) - v[2] * Math.sin(0.01), v[1] * Math.sin(0.01) + v[2] * Math.cos(0.01)];
+    const k2 = axisymmetricPoseKey(tilt(pos), tilt(right), tilt(up), tilt(b), new Float64Array(11));
+    let diff = 0;
+    for (let i = 0; i < 11; i++) diff = Math.max(diff, Math.abs(k2[i] - k0[i]));
+    expect(diff).toBeGreaterThan(1e-3);
   });
 });

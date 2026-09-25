@@ -41,6 +41,45 @@ export function balmerColor(): THREE.Color {
   return new THREE.Color(r, g, b);
 }
 
+/**
+ * CPU twin of the shader's ray–jet interval (for tests): the parameter range [t0, t1] (t ≥ 0) where the
+ * ray ro + t·rd lies inside the cone r ≤ R0 + k·z with 0 ≤ z ≤ zMax, or null. The interior of one
+ * nappe of a cone is convex, so the answer is a single interval; the quadratic
+ * Q(t) = A t² + 2B t + C ≤ 0 describes both nappes and the slab removes the far one (its apex sits at
+ * z = −R0/k < 0).
+ */
+export function plumeConeInterval(ro: THREE.Vector3, rd: THREE.Vector3, R0: number, k: number, zMax: number): [number, number] | null {
+  const w0 = R0 + k * ro.z;
+  const A = rd.x * rd.x + rd.y * rd.y - k * k * rd.z * rd.z;
+  const B = ro.x * rd.x + ro.y * rd.y - k * w0 * rd.z;
+  const C = ro.x * ro.x + ro.y * ro.y - w0 * w0;
+  const disc = B * B - A * C;
+  let t0 = 0, t1 = 1e9;
+  if (Math.abs(A) < 1e-7) {
+    if (Math.abs(B) < 1e-9) {
+      if (C > 0) return null;
+    } else if (B > 0) t1 = -C / (2 * B);
+    else t0 = -C / (2 * B);
+  } else if (A > 0) {
+    if (disc < 0) return null;
+    const h = Math.sqrt(disc);
+    t0 = (-B - h) / A;
+    t1 = (-B + h) / A;
+  } else {
+    const h = Math.sqrt(Math.max(disc, 0));
+    const tLo = (-B + h) / A, tHi = (-B - h) / A;
+    if (rd.z > 0) t0 = tHi;
+    else t1 = tLo;
+  }
+  if (Math.abs(rd.z) > 1e-9) {
+    const z0 = -ro.z / rd.z, z1 = (zMax - ro.z) / rd.z;
+    t0 = Math.max(t0, Math.min(z0, z1));
+    t1 = Math.min(t1, Math.max(z0, z1));
+  } else if (ro.z < 0 || ro.z > zMax) return null;
+  t0 = Math.max(t0, 0);
+  return t1 > t0 ? [t0, t1] : null;
+}
+
 const VERT = /* glsl */ `
 out vec3 vPosL;
 void main() {
@@ -65,7 +104,9 @@ uniform float uExposure;
 uniform vec3 uBalmer;
 uniform float uSteps;
 uniform float uGain;
-// Plume axis: +Z from z = 0 (throat exit). Bounding cylinder radius:
+uniform float uOctaves;
+uniform vec3 uMesh;      // bounding mesh: radius at z = 0, radius at z = length, length
+// Plume axis: +Z from z = 0 (throat exit). Jet radius (a cone of half-angle atan(uDiv)):
 float width(float z) { return uR0 + uDiv * max(z, 0.0); }
 
 vec3 emissivity(vec3 p) {
@@ -80,8 +121,10 @@ vec3 emissivity(vec3 p) {
   // Recombining envelope: Balmer glow, broader and longer.
   float we = 0.27 * w;
   float env = exp(-r2 / (2.0 * we * we)) * exp(-zn * 4.5) * (1.0 / (we * we));
-  // Gentle turbulence advected downstream (instabilities in the expanding jet).
-  float n = snoise(vec3(p.xy * 1.3 / w, z * 0.18 - uTime * 6.0)) * 0.5 + snoise(vec3(p.xy * 3.1 / w, z * 0.5 - uTime * 11.0)) * 0.25;
+  // Gentle turbulence advected downstream (instabilities in the expanding jet); the finer octave
+  // only on the high tier.
+  float n = snoise(vec3(p.xy * 1.3 / w, z * 0.18 - uTime * 6.0)) * 0.5;
+  if (uOctaves > 1.5) n += snoise(vec3(p.xy * 3.1 / w, z * 0.5 - uTime * 11.0)) * 0.25;
   env *= 0.75 + 0.45 * n;
   env *= 1.0 - smoothstep(0.6 * w, w, sqrt(r2)); // nothing at the bounding surface — no visible edge
   core *= 0.9 + 0.15 * n;
@@ -98,30 +141,47 @@ void main() {
   // Ray from the camera through this fragment, in plume-local space.
   vec3 ro = uCamL;
   vec3 rd = normalize(vPosL - uCamL);
-  // Intersect the bounding cylinder r < width(uLen), 0 < z < uLen.
-  float R = width(uLen);
-  float a = dot(rd.xy, rd.xy);
-  float b = dot(ro.xy, rd.xy);
-  float c = dot(ro.xy, ro.xy) - R * R;
+  // Only one of the bounding mesh's two faces contributes: the front face, or the back face when the
+  // camera is inside the (closed, convex) mesh.
+  float meshR = uMesh.x + (uMesh.y - uMesh.x) * clamp(ro.z / uMesh.z, 0.0, 1.0);
+  bool inside = dot(ro.xy, ro.xy) < meshR * meshR && ro.z > 0.0 && ro.z < uMesh.z;
+  if (gl_FrontFacing == inside) discard;
+  // Exact interval inside the jet cone r ≤ R0 + k z (the emission vanishes outside it), clipped to
+  // 0 < z < uLen. The cone's interior on the nappe z > −R0/k is convex, so this is one interval.
+  // Quadratic Q(t) = A t² + 2B t + C ≤ 0.
+  float k = uDiv;
+  float w0 = uR0 + k * ro.z;
+  float A = dot(rd.xy, rd.xy) - k * k * rd.z * rd.z;
+  float B = dot(ro.xy, rd.xy) - k * w0 * rd.z;
+  float C = dot(ro.xy, ro.xy) - w0 * w0;
+  float disc = B * B - A * C;
   float t0 = 0.0, t1 = 1e9;
-  if (a > 1e-9) {
-    float h = b * b - a * c;
-    if (h < 0.0) discard;
-    h = sqrt(h);
-    t0 = (-b - h) / a;
-    t1 = (-b + h) / a;
-  } else if (c > 0.0) discard;
+  if (abs(A) < 1e-7) {
+    if (abs(B) < 1e-9) { if (C > 0.0) discard; }
+    else if (B > 0.0) t1 = -C / (2.0 * B);
+    else t0 = -C / (2.0 * B);
+  } else if (A > 0.0) {
+    if (disc < 0.0) discard;
+    float h = sqrt(disc);
+    t0 = (-B - h) / A;
+    t1 = (-B + h) / A;
+  } else {
+    // Steeper than the cone: inside for t ≤ tLo or t ≥ tHi; the half toward +z is our nappe.
+    float h = sqrt(max(disc, 0.0));
+    float tLo = (-B + h) / A, tHi = (-B - h) / A;
+    if (rd.z > 0.0) t0 = tHi; else t1 = tLo;
+  }
   if (abs(rd.z) > 1e-9) {
     float z0 = (0.0 - ro.z) / rd.z, z1 = (uLen - ro.z) / rd.z;
     t0 = max(t0, min(z0, z1));
     t1 = min(t1, max(z0, z1));
-  }
+  } else if (ro.z < 0.0 || ro.z > uLen) discard;
   t0 = max(t0, 0.0);
   if (t1 <= t0) discard;
-  // Only one of the two faces (front, or back if the camera is inside) contributes.
-  bool inside = c < 0.0 && ro.z > 0.0 && ro.z < uLen;
-  if (gl_FrontFacing == inside) discard;
-  float steps = uSteps;
+  // Steps: about four per local jet width along the chord (a Gaussian profile of σ ≈ 0.27 w needs
+  // no more), capped by the tier's budget.
+  float zMid = ro.z + rd.z * 0.5 * (t0 + t1);
+  float steps = clamp(ceil((t1 - t0) / (0.25 * width(zMid))), 6.0, uSteps);
   float dt = (t1 - t0) / steps;
   float j = ign(gl_FragCoord.xy + fract(uTime * 7.1) * 97.0);
   vec3 acc = vec3(0.0);
@@ -172,6 +232,8 @@ export class EnginePlume {
         uBalmer: { value: this.color },
         uSteps: { value: steps },
         uGain: { value: 0.032 },
+        uOctaves: { value: 2 },
+        uMesh: { value: new THREE.Vector3(R * 1.3, Rmax * 1.05, this.maxLen) },
       },
       side: THREE.DoubleSide,
       blending: THREE.AdditiveBlending,
@@ -200,8 +262,14 @@ export class EnginePlume {
     this.mat.uniforms.uGain.value = g;
   }
 
+  /** Maximum ray-march samples per pixel (the march takes ~4 per jet width along the ray, at least 6). */
   set steps(n: number) {
     this.mat.uniforms.uSteps.value = n;
+  }
+
+  /** Turbulence octaves (1 or 2): the finer octave doubles the noise cost per sample. */
+  set octaves(n: number) {
+    this.mat.uniforms.uOctaves.value = n;
   }
 
   private beforeRender(camera: THREE.Camera): void {

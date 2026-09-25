@@ -122,14 +122,26 @@ export interface KeyframeStats {
   voids: Float32Array;
 }
 
+/** Keyframe positions as stored: a whole frame, or int8 deltas (+ exceptions) from the previous one. */
+export interface EncodedPositions {
+  full: Uint16Array | null;
+  delta: Int8Array | null;
+  excIdx: Uint32Array | null;
+  excVal: Uint16Array | null;
+}
+
 export interface Keyframe {
   index: number;
   step: number;
   t: number;
   a: number;
   D: number;
-  /** 16-bit box fractions, xyz interleaved (particle order = Lagrangian lattice order). */
-  positions: Uint16Array;
+  /**
+   * 16-bit box fractions, xyz interleaved (particle order = Lagrangian lattice order). The worker
+   * sends `enc` instead (encoded off the main thread); decoded positions come from SnapshotStore.
+   */
+  positions: Uint16Array | null;
+  enc?: EncodedPositions | null;
   halos: HaloCatalog;
   galaxies: GalaxyCatalog;
   pk: PowerSpectrumSample | null;
@@ -174,7 +186,9 @@ export type WorkerMessage =
 
 /** Transferable buffers of a keyframe (for postMessage). */
 export function keyframeTransferables(k: Keyframe): ArrayBuffer[] {
-  const out: ArrayBuffer[] = [k.positions.buffer as ArrayBuffer];
+  const out: ArrayBuffer[] = [];
+  if (k.positions) out.push(k.positions.buffer as ArrayBuffer);
+  if (k.enc) for (const a of [k.enc.full, k.enc.delta, k.enc.excIdx, k.enc.excVal]) if (a) out.push(a.buffer as ArrayBuffer);
   const h = k.halos, g = k.galaxies;
   for (const a of [h.host, h.mass, h.r200, h.sigma, h.npart, h.center, h.ngal, h.vel, g.id, g.host, g.mstar, g.blue, g.sat, g.halo, g.born])
     out.push(a.buffer as ArrayBuffer);

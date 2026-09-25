@@ -63,6 +63,14 @@ vec2 irrUV(float r, float muS) {
   return vec2(0.5 / IRR_W + x * (1.0 - 1.0 / IRR_W), 0.5 / IRR_H + y * (1.0 - 1.0 / IRR_H));
 }
 
+// LUT storage. Half-float targets store values as they are; where half-float targets are not
+// renderable (no EXT_color_buffer_float/half_float) the tables fall back to RGBA8 holding
+// sqrt(value / scale) — see luts.ts. uLutScale: transmittance, multiple scattering, irradiance.
+uniform float uLutEnc;
+uniform vec3 uLutScale;
+vec3 lutEncode(vec3 v, float scale) { return uLutEnc > 0.5 ? sqrt(clamp(v / scale, 0.0, 1.0)) : v; }
+vec3 lutDecode(vec3 raw, float scale) { return uLutEnc > 0.5 ? raw * raw * scale : raw; }
+
 // Fraction of the stellar disk above the local horizon (soft terminator from the star's size).
 float sunVisibility(float r, float muS) {
   float muH = -sqrt(max(0.0, 1.0 - 1.0 / (r * r)));
@@ -76,10 +84,10 @@ uniform sampler2D uTransLUT;
 uniform sampler2D uMSLUT;
 uniform sampler2D uIrrLUT;
 
-vec3 transmittanceToTop(float r, float mu) { return texture(uTransLUT, transmittanceUV(r, mu)).rgb; }
+vec3 transmittanceToTop(float r, float mu) { return lutDecode(texture(uTransLUT, transmittanceUV(r, mu)).rgb, uLutScale.x); }
 vec3 sunTransmittance(float r, float muS) { return transmittanceToTop(r, muS) * sunVisibility(r, muS); }
-vec3 msLookup(float r, float muS) { return texture(uMSLUT, msUV(r, muS)).rgb; }
-vec3 skyIrradiance(float r, float muS) { return texture(uIrrLUT, irrUV(r, muS)).rgb; }
+vec3 msLookup(float r, float muS) { return lutDecode(texture(uMSLUT, msUV(r, muS)).rgb, uLutScale.y); }
+vec3 skyIrradiance(float r, float muS) { return lutDecode(texture(uIrrLUT, irrUV(r, muS)).rgb, uLutScale.z); }
 `;
 
 /**
@@ -148,6 +156,11 @@ AtmoSeg integrateAtmo(vec3 ro, vec3 rd, float t0, float t1, int n, float jitter)
  * midnight ~23° from the pole, noon ~15°), brightest near midnight. Vertical profiles follow the
  * emission physics: O 557.7 nm peaks ~110 km; O 630.0 nm dominates above ~200 km; N₂⁺ 427.8 nm at
  * the lower border. Airglow: thin O 557.7/Na layer near 95 km.
+ *
+ * Both are integrated over their own emitting shells (88–420 km, 77–113 km), independent of the
+ * scattering atmosphere's top (100 km on Earth), with samples spread uniformly in altitude (see
+ * shellPath) so the thin layers are resolved at the limb and seen from above alike. They carry the
+ * night-vision gain of the city lights, so they are drawn only against a dark background.
  */
 export const AURORA_GLSL = /* glsl */ `
 uniform float uAurora;       // 0..1 intensity
@@ -158,17 +171,60 @@ uniform vec3 uAuroraRed;
 uniform vec3 uAuroraBlue;
 uniform vec3 uAirglowColor;
 uniform float uAuroraTime;
+uniform ivec3 uGlowSteps;    // samples: aurora below 200 km, aurora above 200 km, airglow
 
 // Radii of the emitting shells (set per planet, ground = 1).
 uniform vec4 uAuroraShell;   // x: bottom r, y: top r, z: km→radius factor, w: unused
 
-float auroraCurtain(vec3 p, out float r) {
+// ——— A ray inside a spherical shell ———
+// The part of the ray [ts, te] with rIn < |p| < rOut is at most two segments. A ray that crosses rIn
+// has a near segment ending there and a far one starting where it re-emerges; altitude then varies
+// ~linearly along each, so samples are uniform. A ray that stays above rIn is one path with its lowest
+// point (closest approach) inside; altitude grows quadratically away from it, so samples are spread
+// quadratically toward it — uniformly in altitude, where thin emitting layers need them.
+struct ShellPath { float a; float lo1; float lo2; float b; bool tangent; };
+bool shellPath(vec3 ro, vec3 rd, float ts, float te, float rIn, float rOut, out ShellPath sp) {
+  vec2 o = raySphere(ro, rd, vec3(0.0), rOut);
+  sp.a = max(ts, o.x);
+  sp.b = min(te, o.y);
+  sp.lo1 = sp.a;
+  sp.lo2 = sp.b;
+  sp.tangent = true;
+  if (sp.b <= sp.a) return false;
+  float tm = clamp(-dot(ro, rd), sp.a, sp.b);
+  sp.lo1 = tm;
+  sp.lo2 = tm;
+  vec2 i = raySphere(ro, rd, vec3(0.0), rIn);
+  if (i.x < i.y) {
+    sp.lo1 = clamp(i.x, sp.a, sp.b);
+    sp.lo2 = clamp(i.y, sp.a, sp.b);
+    sp.tangent = false;
+  }
+  return (sp.lo1 - sp.a) + (sp.b - sp.lo2) > 0.0;
+}
+// Sample u ∈ (0, 1) of n: (position t, weight dt). The weights of n midpoint samples sum to the length.
+vec2 shellSample(ShellPath sp, float u, float n) {
+  float L1 = sp.lo1 - sp.a;
+  float L2 = sp.b - sp.lo2;
+  float L = L1 + L2;
+  float f1 = L1 / L;
+  if (!sp.tangent) {
+    return u < f1 ? vec2(sp.a + L * u, L / n) : vec2(sp.lo2 + L * (u - f1), L / n);
+  }
+  if (u < f1) {
+    float v = 1.0 - u / f1;
+    return vec2(sp.lo1 - L1 * v * v, 2.0 * v * L / n);
+  }
+  float v = (u - f1) / max(1.0 - f1, 1e-6);
+  return vec2(sp.lo2 + L2 * v * v, 2.0 * v * L / n);
+}
+
+// Auroral curtain strength at p (spin frame); noon/dusk span the magnetic-local-time frame.
+float auroraCurtain(vec3 p, vec3 noon, vec3 dusk, out float r) {
   r = length(p);
   vec3 d = p / r;
   float sm = dot(d, uMagAxis);                       // sin(magnetic latitude)
   float colat = acos(clamp(abs(sm), 0.0, 1.0));      // from the nearer magnetic pole
-  vec3 noon = normalize(uSunDir - uMagAxis * dot(uSunDir, uMagAxis) + vec3(1e-5));
-  vec3 dusk = cross(uMagAxis, noon);
   vec3 dh = d - uMagAxis * sm;
   float phi = atan(dot(dh, dusk), dot(dh, noon));    // 0 = magnetic noon, ±π = midnight
   float midnight = 0.5 - 0.5 * cos(phi);
@@ -189,67 +245,75 @@ float auroraCurtain(vec3 p, out float r) {
   return band * max(rays, 0.0) * (0.25 + 0.75 * midnight);
 }
 
-vec3 auroraEmission(vec3 ro, vec3 rd, float t0, float t1, float jitter) {
+// Darkness of the background at the lowest point of a ray (1 = night; cos of the solar zenith angle
+// from 'lit' down to 'dark'): the night-vision gain of the glows applies only there; on the day side
+// they are drowned by sunlit air and ground. (Written with ordered smoothstep edges: GLSL leaves
+// edge0 ≥ edge1 undefined.)
+float glowNight(vec3 p, float lit, float dark) {
+  return 1.0 - smoothstep(dark, lit, dot(normalize(p), uSunDir));
+}
+
+vec3 auroraEmission(vec3 ro, vec3 rd, float ts, float te, float jitter) {
   vec3 E = vec3(0.0);
   if (uAurora <= 0.0) return E;
-  vec2 hs = raySphere(ro, rd, vec3(0.0), uAuroraShell.y);
-  float a = max(t0, hs.x);
-  float b = min(t1, hs.y);
-  if (b <= a) return E;
-  // Reject rays that never come near an auroral oval (colatitude ~10°–32°).
-  float lo = 10.0, hi = 0.0;
+  ShellPath sp;
+  if (!shellPath(ro, rd, ts, te, uAuroraShell.x, uAuroraShell.y, sp)) return E;
+  float night = glowNight(ro + rd * sp.lo1, 0.12, -0.12);
+  if (night <= 0.0) return E;
+  // Reject rays that never come near an auroral oval (colatitude ~8°–32°).
+  float lo = 10.0;
   for (int k = 0; k < 5; k++) {
-    vec3 pk = normalize(ro + rd * mix(a, b, float(k) * 0.25));
+    vec3 pk = normalize(ro + rd * mix(sp.a, sp.b, float(k) * 0.25));
     float cl = degrees(acos(clamp(abs(dot(pk, uMagAxis)), 0.0, 1.0)));
     lo = min(lo, abs(cl - 20.0));
   }
   if (lo > 12.0) return E;
-  const int N = 16;
-  float dt = (b - a) / float(N);
+  vec3 noon = normalize(uSunDir - uMagAxis * dot(uSunDir, uMagAxis) + vec3(1e-5));
+  vec3 dusk = cross(uMagAxis, noon);
   float km = uAuroraShell.z;   // radii per km
-  for (int i = 0; i < N; i++) {
-    vec3 p = ro + rd * (a + (float(i) + jitter) * dt);
-    float r;
-    float c = auroraCurtain(p, r);
-    if (c < 0.003) continue;
-    float hkm = (r - 1.0) / km;
-    // Vertical emission profiles (per line), sharp lower border ~95 km.
-    float lower = smoothstep(88.0, 102.0, hkm);
-    float green = lower * exp(-max(hkm - 112.0, 0.0) / 38.0) * exp(-max(108.0 - hkm, 0.0) / 6.0);
-    float red = smoothstep(150.0, 230.0, hkm) * exp(-max(hkm - 260.0, 0.0) / 90.0) * 0.32;
-    float blue = lower * exp(-abs(hkm - 100.0) / 9.0) * 0.45;
-    E += c * (uAuroraGreen * green + uAuroraRed * red + uAuroraBlue * blue) * dt;
+  float rMid = 1.0 + 200.0 * km;
+  // Two altitude bands, so the thin green/violet layer (95–200 km) gets its own samples.
+  for (int layer = 0; layer < 2; layer++) {
+    ShellPath lp;
+    if (!shellPath(ro, rd, ts, te, layer == 0 ? uAuroraShell.x : rMid, layer == 0 ? rMid : uAuroraShell.y, lp)) continue;
+    int n = layer == 0 ? uGlowSteps.x : uGlowSteps.y;
+    // A ray crossing the band (seen from above) traverses it quickly and uniformly: fewer samples.
+    if (!lp.tangent) n = max(layer == 0 ? 4 : 2, (2 * n) / 3);
+    for (int i = 0; i < 32; i++) {
+      if (i >= n) break;
+      vec2 s = shellSample(lp, (float(i) + jitter) / float(n), float(n));
+      float r;
+      float c = auroraCurtain(ro + rd * s.x, noon, dusk, r);
+      if (c < 0.003) continue;
+      float hkm = (r - 1.0) / km;
+      // Vertical emission profiles (per line), sharp lower border ~95 km.
+      float lower = smoothstep(88.0, 102.0, hkm);
+      float green = lower * exp(-max(hkm - 112.0, 0.0) / 38.0) * exp(-max(108.0 - hkm, 0.0) / 6.0);
+      float red = smoothstep(150.0, 230.0, hkm) * exp(-max(hkm - 260.0, 0.0) / 90.0);
+      float blue = lower * exp(-abs(hkm - 100.0) / 9.0);
+      E += c * (uAuroraGreen * green + uAuroraRed * red + uAuroraBlue * blue) * s.y;
+    }
   }
-  return E * uAurora;
+  return E * uAurora * night;
 }
 
-vec3 airglowEmission(vec3 ro, vec3 rd, float t0, float t1, float jitter) {
+vec3 airglowEmission(vec3 ro, vec3 rd, float ts, float te, float jitter) {
   if (uAirglow <= 0.0) return vec3(0.0);
   float km = uAuroraShell.z;
   float rc = 1.0 + 95.0 * km;
   float s = 6.0 * km;
-  vec2 o = raySphere(ro, rd, vec3(0.0), rc + 3.0 * s);
-  float a = max(t0, o.x);
-  float b = min(t1, o.y);
-  if (b <= a) return vec3(0.0);
-  vec2 inner = raySphere(ro, rd, vec3(0.0), rc - 3.0 * s);
-  float sum = 0.0;
-  const int N = 12;
-  // March only the part outside the inner sphere (two segments for rays that cross it).
-  float tm = clamp(-dot(ro, rd), a, b);
-  for (int i = 0; i < N; i++) {
-    float u = (float(i) + jitter) / float(N);
-    // Quadratic sampling toward the tangent point on both sides.
-    float ta = tm - (tm - a) * u * u;
-    float tb = tm + (b - tm) * u * u;
-    float wa = (tm - a) * 2.0 * u / float(N);
-    float wb = (b - tm) * 2.0 * u / float(N);
-    float ra = length(ro + rd * ta), rb = length(ro + rd * tb);
-    sum += exp(-sqr((ra - rc) / s)) * wa + exp(-sqr((rb - rc) / s)) * wb;
-  }
+  ShellPath sp;
+  if (!shellPath(ro, rd, ts, te, rc - 3.0 * s, rc + 3.0 * s, sp)) return vec3(0.0);
   // Night side only (drowned by daylight elsewhere).
-  vec3 pm = normalize(ro + rd * tm);
-  float night = smoothstep(0.05, -0.2, dot(pm, uSunDir));
+  float night = glowNight(ro + rd * sp.lo1, 0.05, -0.2);
+  if (night <= 0.0) return vec3(0.0);
+  float sum = 0.0;
+  int n = uGlowSteps.z;
+  for (int i = 0; i < 32; i++) {
+    if (i >= n) break;
+    vec2 q = shellSample(sp, (float(i) + jitter) / float(n), float(n));
+    sum += exp(-sqr((length(ro + rd * q.x) - rc) / s)) * q.y;
+  }
   return uAirglowColor * sum * night * uAirglow;
 }
 `;

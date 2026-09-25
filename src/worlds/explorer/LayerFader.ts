@@ -61,8 +61,12 @@ export class LayerFader {
     }
     if (!this.rt || this.rt.width !== target.width || this.rt.height !== target.height) {
       this.rt?.dispose();
+      // Match the scene target's precision: half float where it is renderable (always paired with
+      // the engine's HDR target), 8-bit otherwise — never an incomplete (black) framebuffer.
+      const ext = r.extensions;
+      const half = ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float');
       this.rt = new THREE.WebGLRenderTarget(target.width, target.height, {
-        type: THREE.HalfFloatType,
+        type: half ? THREE.HalfFloatType : THREE.UnsignedByteType,
         format: THREE.RGBAFormat,
         minFilter: THREE.LinearFilter,
         magFilter: THREE.LinearFilter,

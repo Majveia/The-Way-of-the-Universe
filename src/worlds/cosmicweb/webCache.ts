@@ -40,7 +40,8 @@ export function projectHalos(
 export interface CachedWeb {
   config: SimConfig;
   info: SimInfo;
-  today: Keyframe;
+  /** Today's keyframe with its decoded positions (always present here). */
+  today: Keyframe & { positions: Uint16Array };
   /** Box side in Mpc. */
   boxMpc: number;
   halos: CosmicHalo[];
@@ -90,12 +91,12 @@ export function loadWebToday(r: WebRequest = {}): Promise<CachedWeb> {
   const p = new Promise<CachedWeb>((resolve, reject) => {
     const client = new SimClient();
     let info: SimInfo | null = null;
-    let last: Keyframe | null = null;
+    let last: (Keyframe & { positions: Uint16Array }) | null = null;
     client.start(cfg, {
       info: (i) => (info = i),
       keyframe: (k) => {
         // Keep a private copy of the final positions: the store owns (and may delta-encode) the rest.
-        last = { ...k, positions: client.store!.positions(client.store!.length - 1).slice() };
+        last = { ...k, enc: null, positions: client.store!.positions(client.store!.length - 1).slice() };
       },
       done: () => {
         client.stop();

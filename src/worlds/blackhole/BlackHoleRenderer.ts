@@ -1,19 +1,21 @@
 import * as THREE from 'three';
 import { FullscreenQuad, FULLSCREEN_VERT } from '../../core/post/FullscreenQuad';
 import {
-  buildTetrad,
+  axisymmetricPoseKey,
+  buildTetradInto,
   captureRadius,
+  createTetrad,
   diskProfile,
   horizonRadius,
   iscoRadius,
   ksRadius,
-  orbitingObserver,
+  orbitingObserverInto,
   photonOrbitRadius,
-  rainObserver,
+  rainObserverInto,
   rayMomentum,
-  staticObserver,
+  staticObserverInto,
   traceRay,
-  zamoObserver,
+  zamoObserverInto,
   type RayResult,
   type Tetrad,
   type Vec3,
@@ -27,7 +29,7 @@ import {
   planckLuminance,
   populationColor,
 } from './spectrum';
-import { ACCUM_FRAG, COMPOSITE_FRAG, DISK_TEXTURE_FRAG, METER_FRAG, traceFrag } from './shaders';
+import { ACCUM_FRAG, COMPOSITE_FRAG, DISK_NOISE_FRAG, DISK_TEXTURE_FRAG, METER_FRAG, traceFrag } from './shaders';
 
 export type ObserverKind = 'static' | 'zamo' | 'orbiting' | 'rain';
 export type BlackHoleQuality = 'low' | 'medium' | 'high' | 'ultra';
@@ -99,27 +101,65 @@ export const defaultBlackHoleParams = (): BlackHoleParams => ({
   orientation: new THREE.Quaternion(),
 });
 
+/** Parameters that only affect the final composite (no re-trace, no history reset). */
+const COMPOSITE_ONLY = new Set<keyof BlackHoleParams>(['envGain', 'starGain', 'stars']);
+/** Parameters that change the disk's light but not where any ray goes (the lens cache survives). */
+const SHADING_ONLY = new Set<keyof BlackHoleParams>([
+  'peakTemperature',
+  'diskBrightness',
+  'opacity',
+  'turbulence',
+  'doppler',
+  'gravitationalRedshift',
+  'hotSpot',
+  'hotSpotRadius',
+  'seed',
+]);
+
 export interface BlackHoleRendererOptions {
   quality?: BlackHoleQuality;
   /** Override the trace resolution relative to the output target. */
   traceScale?: number;
+  /** Override the cap on traced pixels per frame. */
+  tracePixels?: number;
 }
 
 interface QualitySettings {
+  /** Trace resolution relative to the output target (upper bound). */
   traceScale: number;
+  /**
+   * Cap on traced pixels per frame, whatever the output size: the geodesic march costs ~15–20k
+   * ALU operations per pixel, so the trace is sized to a GPU budget, not to the screen (a 2560 × 1600
+   * DPR-2 laptop would otherwise trace 4× the pixels of 1080p).
+   */
+  tracePixels: number;
   maxSteps: number;
+  /** Step length as a fraction of r (RK4). */
   eps: number;
   diskSamples: number;
   diskTex: [number, number];
-  /** Turbulence octaves in the disk texture. */
+  /** Turbulence octaves in the (baked) disk noise. */
   diskOct: number;
+  /** Anisotropic filtering of the disk texture (grazing views). */
+  aniso: number;
+  /** Analytic star layers drawn in the composite (the faintest is dropped on low). */
+  starLayers: number;
 }
 
+/**
+ * Tiers, sized with a GPU cost model (ALU slots; ~1.25e12/s on a 2.5-TFLOPS laptop GPU):
+ *  - trace: pixels × (RK4 steps × ~500 + disk samples × ~190). Measured at the default view
+ *    (warp-max over 8 × 4 tiles): 37 / 29 / 23 steps and 3.7 / 4.0 / 4.1 samples per pixel for
+ *    high / medium / low → ≈ 19k / 15k / 12k slots. While the camera only orbits the spin axis
+ *    (the idle view) the lens cache traces ~30 % of those pixels again.
+ *  - disk texture: texels × ~250 (the noise is baked once); composite: output pixels × ~900.
+ * High at 1080p: trace 500k px ≈ 10 ms when everything moves, ≈ 3 ms idle; + ~2 ms composite.
+ */
 const QUALITY: Record<BlackHoleQuality, QualitySettings> = {
-  low: { traceScale: 0.5, maxSteps: 150, eps: 0.14, diskSamples: 8, diskTex: [1024, 256], diskOct: 3 },
-  medium: { traceScale: 0.6, maxSteps: 220, eps: 0.11, diskSamples: 12, diskTex: [1536, 384], diskOct: 4 },
-  high: { traceScale: 0.72, maxSteps: 300, eps: 0.09, diskSamples: 16, diskTex: [2048, 512], diskOct: 5 },
-  ultra: { traceScale: 1, maxSteps: 420, eps: 0.07, diskSamples: 24, diskTex: [3072, 768], diskOct: 6 },
+  low: { traceScale: 0.5, tracePixels: 150e3, maxSteps: 170, eps: 0.16, diskSamples: 8, diskTex: [1024, 256], diskOct: 3, aniso: 4, starLayers: 2 },
+  medium: { traceScale: 0.6, tracePixels: 300e3, maxSteps: 220, eps: 0.13, diskSamples: 12, diskTex: [1536, 384], diskOct: 4, aniso: 8, starLayers: 3 },
+  high: { traceScale: 0.72, tracePixels: 500e3, maxSteps: 280, eps: 0.1, diskSamples: 14, diskTex: [2048, 512], diskOct: 5, aniso: 16, starLayers: 3 },
+  ultra: { traceScale: 1, tracePixels: 1.6e6, maxSteps: 400, eps: 0.08, diskSamples: 20, diskTex: [3072, 768], diskOct: 6, aniso: 16, starLayers: 3 },
 };
 
 /** Star layers: cells per cube-face edge and magnitude ranges (dN/dm ∝ 10^{0.35 m}). */
@@ -134,6 +174,9 @@ const KS_TO_BH = new THREE.Matrix3().set(1, 0, 0, 0, 0, 1, 0, -1, 0);
 
 const METER_W = 16;
 const METER_H = 9;
+
+/** Length of the camera-invariant geometry key (see lensKey). */
+const KEY_N = 26;
 
 const halton = (i: number, b: number): number => {
   let f = 1, r = 0;
@@ -155,6 +198,30 @@ export interface CameraState {
   inside: boolean;
 }
 
+/** Floating-point render-target support, probed once per renderer. */
+interface FloatSupport {
+  /** RGBA16F color attachments (EXT_color_buffer_half_float or EXT_color_buffer_float). */
+  half: boolean;
+  /** RGBA32F color attachments (EXT_color_buffer_float). */
+  full: boolean;
+}
+
+function floatSupport(r: THREE.WebGLRenderer): FloatSupport {
+  const e = r.extensions;
+  const full = e.has('EXT_color_buffer_float');
+  return { full, half: full || e.has('EXT_color_buffer_half_float') };
+}
+
+/** Is `rt` a complete framebuffer on this device? (Restores the bound target.) */
+function isComplete(r: THREE.WebGLRenderer, rt: THREE.WebGLRenderTarget): boolean {
+  const prev = r.getRenderTarget();
+  r.setRenderTarget(rt);
+  const gl = r.getContext();
+  const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+  r.setRenderTarget(prev);
+  return ok;
+}
+
 /**
  * Real-time general-relativistic renderer of a Kerr black hole with a thin accretion disk,
  * lensed background and point stars. Draws a full-screen view into a linear-HDR target.
@@ -166,20 +233,32 @@ export interface CameraState {
  *
  * The camera is carried by a physical observer (static by default; see `observer` and
  * `setObserverVelocity`), whose motion aberrates and Doppler-shifts everything it sees.
+ *
+ * Needs renderable half-float targets (EXT_color_buffer_half_float or EXT_color_buffer_float —
+ * every current WebGL2 GPU); the constructor throws a readable error otherwise. 32-bit float
+ * targets (EXT_color_buffer_float) sharpen the lensed star field and are used where available.
+ * Nothing samples a 32-bit float texture with linear filtering (OES_texture_float_linear) and
+ * nothing blends into a float target (EXT_float_blend).
  */
 export class BlackHoleRenderer {
   readonly params: BlackHoleParams = defaultBlackHoleParams();
   readonly quality: QualitySettings;
   private renderer: THREE.WebGLRenderer;
+  private float: FloatSupport;
   private quad = new FullscreenQuad();
+  /** MRT: [0] disk light + transmittance, [1] lens map (camera-frame deflection, g). */
   private traceRT: THREE.WebGLRenderTarget | null = null;
+  /** Disk light of frames that reuse the cached lens map. */
+  private lightRT: THREE.WebGLRenderTarget | null = null;
   private accum: THREE.WebGLRenderTarget[] = [];
   private accumIndex = 0;
   private diskRT: THREE.WebGLRenderTarget;
+  private noiseRT: THREE.WebGLRenderTarget;
   private profileTex: THREE.DataTexture;
   private planckTex: THREE.DataTexture;
   private ctTex: THREE.DataTexture;
   private ctRange: { qMin: number; qMax: number };
+  private noiseMat: THREE.ShaderMaterial;
   private diskMat: THREE.ShaderMaterial;
   private traceMat: THREE.ShaderMaterial;
   private accumMat: THREE.ShaderMaterial;
@@ -189,6 +268,17 @@ export class BlackHoleRenderer {
   private meterBuf = new Uint8Array(METER_W * METER_H * 4);
   private meterBusy = false;
   private meterSorted = new Float64Array(METER_W * METER_H);
+  private readonly onMeter = (): void => {
+    const n = METER_W * METER_H;
+    for (let i = 0; i < n; i++) this.meterSorted[i] = this.meterBuf[i * 4];
+    this.meterSorted.sort();
+    const code = this.meterSorted[Math.floor(n * 0.95)];
+    this.highlightLuminance = Math.pow(2, (code / 255) * 24 - 16);
+    this.meterBusy = false;
+  };
+  private readonly onMeterFail = (): void => {
+    this.meterBusy = false;
+  };
   /**
    * Scene brightness from the last metering: the 95th-percentile linear luminance of the disk
    * light (a camera exposing for its highlights). 0 until the first measurement arrives.
@@ -200,31 +290,57 @@ export class BlackHoleRenderer {
   private historyValid = false;
   private dirty = true;
   private profileKey = '';
+  private noiseKey = '';
+  private framesSinceBake = 0;
   private diskNormKey = -1;
   private diskNorm = 1;
   private lastFwd = new THREE.Vector3();
   private lastPos = new THREE.Vector3();
   private traceScale: number;
+  private tracePixels: number;
   /** Increments whenever a parameter other than `time` changes (lets callers detect a new image). */
   version = 0;
+  /** Bumps when anything that bends or clips rays changes (invalidates the lens cache). */
+  private geomVersion = 0;
   /** Camera state of the most recent frame (for picking and readouts). */
   camera: CameraState | null = null;
+  /** Lens cache: key of the frame whose lens map is in traceRT, and its jitter. */
+  private cacheKey = new Float64Array(KEY_N);
+  private curKey = new Float64Array(KEY_N);
+  private cacheValid = false;
+  private cacheJitter = new THREE.Vector2();
+  /** Frames traced with the cache (diagnostics / benchmarks). */
+  cachedFrames = 0;
+  /** Set false to always trace every pixel (debug / A–B comparison). */
+  lensCache = true;
   private tanX = 1;
   private tanY = 1;
   private readonly tmpQ = new THREE.Quaternion();
   private readonly tmpV = new THREE.Vector3();
   private readonly camToSky = new THREE.Matrix3();
   private readonly toSky = new THREE.Matrix3();
+  private readonly ksToCam = new THREE.Matrix3();
   private readonly bhRot = new THREE.Matrix3();
   private readonly tmpM = new THREE.Matrix4();
   private readonly tmpQ2 = new THREE.Quaternion();
   private readonly tmpV2 = new THREE.Vector3();
   private readonly jitter = new THREE.Vector2();
+  // Per-frame scratch (no allocations in render()).
+  private readonly camState: CameraState = { pos: [0, 0, 0], r: 0, u: [1, 0, 0, 0], tetrad: createTetrad(), inside: false };
+  private readonly kRight: Vec3 = [0, 0, 0];
+  private readonly kUp: Vec3 = [0, 0, 0];
+  private readonly kBack: Vec3 = [0, 0, 0];
+  private readonly uObs: Vec4 = [1, 0, 0, 0];
+  private readonly kAxes: [Vec3, Vec3, Vec3] = [this.kRight, this.kUp, this.kBack];
 
   constructor(renderer: THREE.WebGLRenderer, opts: BlackHoleRendererOptions = {}) {
     this.renderer = renderer;
+    this.float = floatSupport(renderer);
+    if (!this.float.half)
+      throw new Error('This device cannot render to floating-point targets (WebGL2 EXT_color_buffer_half_float), which the black-hole ray tracer needs.');
     this.quality = { ...QUALITY[opts.quality ?? 'high'] };
     this.traceScale = opts.traceScale ?? this.quality.traceScale;
+    this.tracePixels = opts.tracePixels ?? this.quality.tracePixels;
     this.planckTex = createPlanckTexture();
     const ct = createColorTemperatureTexture();
     this.ctTex = ct.texture;
@@ -245,12 +361,30 @@ export class BlackHoleRenderer {
       depthBuffer: false,
       stencilBuffer: false,
     });
-    this.diskRT.texture.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
+    this.diskRT.texture.anisotropy = Math.min(this.quality.aniso, renderer.capabilities.getMaxAnisotropy());
+    this.noiseRT = new THREE.WebGLRenderTarget(dw, dh, {
+      type: THREE.HalfFloatType,
+      format: THREE.RGBAFormat,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      wrapS: THREE.RepeatWrapping,
+      wrapT: THREE.ClampToEdgeWrapping,
+      generateMipmaps: false,
+      depthBuffer: false,
+      stencilBuffer: false,
+    });
+    if (!isComplete(renderer, this.diskRT) || !isComplete(renderer, this.noiseRT))
+      throw new Error('This device cannot render to half-float textures, which the black-hole ray tracer needs.');
 
     const common = { vertexShader: FULLSCREEN_VERT, glslVersion: THREE.GLSL3, depthTest: false, depthWrite: false };
+    this.noiseMat = new THREE.ShaderMaterial({
+      ...common,
+      fragmentShader: `#define DISK_OCT ${this.quality.diskOct}\n${DISK_NOISE_FRAG}`,
+      uniforms: { uLnR0: { value: 0 }, uLnSpan: { value: 1 }, uSeed: { value: 7 } },
+    });
     this.diskMat = new THREE.ShaderMaterial({
       ...common,
-      fragmentShader: `#define DISK_OCT ${this.quality.diskOct}\n${DISK_TEXTURE_FRAG}`,
+      fragmentShader: DISK_TEXTURE_FRAG,
       uniforms: {
         uA: { value: 0.9 },
         uTime: { value: 0 },
@@ -262,6 +396,7 @@ export class BlackHoleRenderer {
         uTurb: { value: 0.7 },
         uSeed: { value: 7 },
         uProfile: { value: this.profileTex },
+        uNoise: { value: this.noiseRT.texture },
         uHot: { value: new THREE.Vector4() },
       },
     });
@@ -284,9 +419,10 @@ export class BlackHoleRenderer {
         uInside: { value: 0 },
         uEscR: { value: 60 },
         uEps: { value: this.quality.eps },
-        uToSky: { value: new THREE.Matrix3() },
-        uCamToSky: { value: new THREE.Matrix3() },
+        uKsToCam: { value: new THREE.Matrix3() },
         uFrame: { value: 0 },
+        uCached: { value: 0 },
+        uSkyCache: { value: null },
         uDiskOn: { value: 1 },
         uDisk: { value: this.diskRT.texture },
         uDiskMap: { value: new THREE.Vector2(0, 1) },
@@ -331,7 +467,7 @@ export class BlackHoleRenderer {
     const avg = populationColor([3400, 4500, 5700, 6900, 9000, 15000], [0.1, 0.26, 0.22, 0.2, 0.15, 0.07]);
     this.compMat = new THREE.ShaderMaterial({
       ...common,
-      fragmentShader: COMPOSITE_FRAG,
+      fragmentShader: `#define STAR_LAYERS ${this.quality.starLayers}\n${COMPOSITE_FRAG}`,
       uniforms: {
         uAccum: { value: null },
         uSky: { value: null },
@@ -358,6 +494,7 @@ export class BlackHoleRenderer {
         uCTMap: { value: new THREE.Vector2(this.ctRange.qMin, 1 / (this.ctRange.qMax - this.ctRange.qMin)) },
         uSkyShift: { value: 1 },
         uDbg: { value: 0 },
+        uUpsample: { value: 1 },
       },
     });
   }
@@ -369,24 +506,37 @@ export class BlackHoleRenderer {
     this.historyValid = false;
   }
 
-  /** Merge parameters. Anything that changes the image invalidates the temporal history. */
+  /** Merge parameters. Anything that changes the traced image invalidates the temporal history. */
   setParams(p: Partial<BlackHoleParams>): void {
     let changed = false;
-    for (const key of Object.keys(p) as Array<keyof BlackHoleParams>) {
-      const v = p[key];
+    let traced = false;
+    let geometry = false;
+    for (const key in p) {
+      const k = key as keyof BlackHoleParams;
+      const v = p[k];
       if (v === undefined) continue;
-      if (key === 'orientation') {
-        this.params.orientation.copy(v as THREE.Quaternion);
-        changed = true;
-      } else if (this.params[key] !== v) {
-        (this.params as unknown as Record<string, unknown>)[key] = v;
-        if (key !== 'time') changed = true;
+      if (k === 'orientation') {
+        if (!this.params.orientation.equals(v as THREE.Quaternion)) {
+          this.params.orientation.copy(v as THREE.Quaternion);
+          changed = traced = geometry = true;
+        }
+      } else if (this.params[k] !== v) {
+        (this.params as unknown as Record<string, unknown>)[k] = v;
+        if (k !== 'time') {
+          changed = true;
+          if (!COMPOSITE_ONLY.has(k)) traced = true;
+          if (!COMPOSITE_ONLY.has(k) && !SHADING_ONLY.has(k)) geometry = true;
+        }
       }
     }
-    if (changed) {
-      this.dirty = true;
-      this.version++;
-    }
+    if (changed) this.version++;
+    if (traced) this.dirty = true;
+    if (geometry) this.geomVersion++;
+  }
+
+  /** Advance the disk's clock (coordinate time, M) without any bookkeeping — call every frame. */
+  setTime(t: number): void {
+    this.params.time = t;
   }
 
   /** Carry the camera with an arbitrary 4-velocity (Kerr–Schild contravariant), e.g. a plunge. */
@@ -394,16 +544,18 @@ export class BlackHoleRenderer {
     this.customU = u;
   }
 
-  /** Debug visualisation in the trace pass (0 off, 1 T/T_peak, 2 g/2, 3 LOD/10, 4 τ/100). */
+  /** Debug visualisation in the trace pass (0 off, 1 T/T_peak, 2 g/2, 3 LOD/10, 4 τ/100, 15 cost). */
   set debugMode(m: number) {
     this.traceMat.uniforms.uDebug.value = m;
     this.historyValid = false;
+    this.cacheValid = false;
   }
 
-  /** Drop the temporal history (call after a cut). */
+  /** Drop the temporal history and the lens cache (call after a cut). */
   resetHistory(): void {
     this.version++;
     this.historyValid = false;
+    this.cacheValid = false;
   }
 
   /** Effective inner disk radius. */
@@ -412,11 +564,17 @@ export class BlackHoleRenderer {
     return p.diskInner > 0 ? p.diskInner : iscoRadius(p.spin);
   }
 
+  /** Trace-target size for an output of w × h: traceScale × output, capped at tracePixels. */
+  traceSize(w: number, h: number): [number, number] {
+    const s = Math.min(this.traceScale, Math.sqrt(this.tracePixels / Math.max(1, w * h)));
+    return [Math.max(2, Math.round(w * s)), Math.max(2, Math.round(h * s))];
+  }
+
   private ensureTargets(w: number, h: number): void {
-    const tw = Math.max(2, Math.round(w * this.traceScale));
-    const th = Math.max(2, Math.round(h * this.traceScale));
+    const [tw, th] = this.traceSize(w, h);
     if (this.traceRT && this.traceRT.width === tw && this.traceRT.height === th) return;
     this.traceRT?.dispose();
+    this.lightRT?.dispose();
     for (const a of this.accum) a.dispose();
     const opts = {
       type: THREE.HalfFloatType,
@@ -429,16 +587,31 @@ export class BlackHoleRenderer {
       stencilBuffer: false,
       generateMipmaps: false,
     } as const;
-    // 32-bit floats where renderable: the sky target stores the deflection Δ, whose finite
-    // differences give the lens Jacobian — half-float rounding (~1e-4 at Δ ≈ 0.1) is comparable to a
-    // pixel's angle and would smear the analytically lensed stars into streaks.
-    const full = this.renderer.extensions.has('EXT_color_buffer_float');
-    this.traceRT = new THREE.WebGLRenderTarget(tw, th, { ...opts, type: full ? THREE.FloatType : THREE.HalfFloatType, count: 2 });
-    // Both are read at texel centres (accumulation) or with texelFetch (composite): nearest
-    // filtering keeps float32 targets valid without OES_texture_float_linear.
-    for (const t of this.traceRT.textures) t.minFilter = t.magFilter = THREE.NearestFilter;
+    // 32-bit floats where renderable: the lens map's finite differences give the lens Jacobian —
+    // half-float rounding (~1e-4 at Δ ≈ 0.1) is comparable to a pixel's angle and would smear the
+    // analytically lensed stars into streaks. Both attachments are read with texelFetch or at texel
+    // centres (nearest), so float32 needs no OES_texture_float_linear.
+    const make = (type: THREE.TextureDataType) => {
+      const rt = new THREE.WebGLRenderTarget(tw, th, { ...opts, type, count: 2 });
+      for (const t of rt.textures) t.minFilter = t.magFilter = THREE.NearestFilter;
+      return rt;
+    };
+    let rt = this.float.full ? make(THREE.FloatType) : null;
+    if (rt && !isComplete(this.renderer, rt)) {
+      // Some tile-based GPUs refuse 2 × RGBA32F attachments (bits per pixel) despite the extension.
+      rt.dispose();
+      rt = null;
+    }
+    rt ??= make(THREE.HalfFloatType);
+    if (!isComplete(this.renderer, rt)) {
+      rt.dispose();
+      throw new Error('This GPU cannot render the black hole’s two half-float targets at once (multiple render targets).');
+    }
+    this.traceRT = rt;
+    this.lightRT = new THREE.WebGLRenderTarget(tw, th, { ...opts, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
     this.accum = [new THREE.WebGLRenderTarget(tw, th, opts), new THREE.WebGLRenderTarget(tw, th, opts)];
     this.historyValid = false;
+    this.cacheValid = false;
   }
 
   private updateProfile(): void {
@@ -465,26 +638,103 @@ export class BlackHoleRenderer {
     (this.traceMat.uniforms.uDiskMap.value as THREE.Vector2).set(lnR0, 1 / span);
   }
 
-  /** Observer 4-velocity at a Kerr–Schild position (falls back gracefully where it cannot exist). */
-  observerVelocity(pos: Vec3): Vec4 {
-    if (this.customU) return this.customU;
+  /**
+   * Bake the disk's turbulence noise on its (φ, ln r) grid — only when that grid or the seed changes,
+   * and at most every few frames while a slider sweeps the disk's edges or the spin (a bake is
+   * ~4 ms on a mid laptop at 2048 × 512; a few frames of slightly stretched noise are invisible).
+   */
+  private updateNoise(): void {
+    const du = this.diskMat.uniforms;
+    const key = `${du.uLnR0.value}|${du.uLnSpan.value}|${this.params.seed}`;
+    this.framesSinceBake++;
+    if (key === this.noiseKey || (this.noiseKey !== '' && this.framesSinceBake < 10)) return;
+    this.noiseKey = key;
+    this.framesSinceBake = 0;
+    const nu = this.noiseMat.uniforms;
+    nu.uLnR0.value = du.uLnR0.value;
+    nu.uLnSpan.value = du.uLnSpan.value;
+    nu.uSeed.value = this.params.seed;
+    this.quad.material = this.noiseMat;
+    this.quad.render(this.renderer, this.noiseRT);
+  }
+
+  /** Observer 4-velocity at a Kerr–Schild position, into `out` (falls back where it cannot exist). */
+  private observerVelocityInto(pos: Vec3, out: Vec4): Vec4 {
+    if (this.customU) {
+      for (let i = 0; i < 4; i++) out[i] = this.customU[i];
+      return out;
+    }
     const a = this.params.spin;
-    const [x, y, z] = pos;
-    let u: Vec4 | null = null;
+    const x = pos[0], y = pos[1], z = pos[2];
+    let ok = false;
     switch (this.params.observer) {
       case 'static':
-        u = staticObserver(a, x, y, z);
+        ok = staticObserverInto(a, x, y, z, out);
         break;
       case 'orbiting':
-        u = orbitingObserver(a, x, y, z);
+        ok = orbitingObserverInto(a, x, y, z, out);
         break;
       case 'rain':
-        u = rainObserver(a, x, y, z);
+        rainObserverInto(a, x, y, z, out);
+        ok = true;
         break;
       default:
-        u = null;
+        ok = false;
     }
-    return u ?? zamoObserver(a, x, y, z) ?? rainObserver(a, x, y, z);
+    if (!ok && !zamoObserverInto(a, x, y, z, out)) rainObserverInto(a, x, y, z, out);
+    return out;
+  }
+
+  /** Observer 4-velocity at a Kerr–Schild position (falls back gracefully where it cannot exist). */
+  observerVelocity(pos: Vec3): Vec4 {
+    return this.observerVelocityInto(pos, [0, 0, 0, 0]);
+  }
+
+  /** A camera axis (unit vector along x, y, z of the camera) in Kerr–Schild components. */
+  private axisToKS(out: Vec3, q: THREE.Quaternion, x: number, y: number, z: number): void {
+    const v = this.tmpV.set(x, y, z).applyQuaternion(q);
+    out[0] = v.x;
+    out[1] = -v.z;
+    out[2] = v.y;
+  }
+
+  /**
+   * Geometry key of this frame, invariant under rotations about the spin axis: the camera's
+   * cylindrical radius and height, its axes in the local (ϖ̂, φ̂, ẑ) frame, the lens and trace
+   * settings, and the geometry parameters. Equal keys ⇒ identical rays in the camera frame.
+   */
+  private lensKey(pos: Vec3, tw: number, th: number, escR: number): Float64Array {
+    const k = this.curKey;
+    axisymmetricPoseKey(pos, this.kRight, this.kUp, this.kBack, k);
+    k[11] = tw;
+    k[12] = th;
+    k[13] = this.tanX;
+    k[14] = this.tanY;
+    k[15] = escR;
+    k[16] = this.geomVersion;
+    k[17] = this.customU ? NaN : 0; // a custom (plunge) velocity is never cached
+    k[18] = this.params.showIsco || this.params.showPhotonOrbits ? NaN : 0;
+    k[19] = Math.hypot(pos[0], pos[1]) > 1e-6 ? 0 : NaN; // on the axis the local frame is undefined
+    k[20] = this.traceMat.uniforms.uDebug.value;
+    for (let i = 21; i < KEY_N; i++) k[i] = 0;
+    return k;
+  }
+
+  /**
+   * Same geometry as the cached frame? Poses may differ by 2e-5 (relative position, axis
+   * components): rays then move by ≲ 1/50 of a trace pixel, and a camera easing into place (rig
+   * damping, look-around smoothing) reuses the cache instead of re-tracing for seconds.
+   */
+  private keyMatches(): boolean {
+    const a = this.cacheKey, b = this.curKey;
+    const scale = Math.max(1, Math.abs(b[0]), Math.abs(b[1]));
+    for (let i = 0; i < KEY_N; i++) {
+      // 0–1 position, 2–10 axes, 11–12 trace size (exact), 13–15 field of view and escape radius
+      // (relative), 16+ flags and versions (exact).
+      const tol = i < 2 ? 2e-5 * scale : i < 11 ? 2e-5 : i === 11 || i === 12 || i > 15 ? 0 : 2e-5 * Math.abs(b[i]);
+      if (!(Math.abs(a[i] - b[i]) <= tol)) return false;
+    }
+    return true;
   }
 
   /**
@@ -503,35 +753,52 @@ export class BlackHoleRenderer {
       return;
     }
     this.updateProfile();
+    this.updateNoise();
     this.frame++;
 
-    // ——— camera → Kerr–Schild frame
+    // ——— camera → Kerr–Schild frame (spin +z): (x, y, z)_BH → (x, −z, y)
     this.bhRot.setFromMatrix4(this.tmpM.makeRotationFromQuaternion(p.orientation));
     const invOrient = this.tmpQ.copy(p.orientation).invert();
     const qCam = this.tmpQ2.copy(invOrient).multiply(camera.quaternion);
-    const toKS = (v: THREE.Vector3): Vec3 => [v.x, -v.z, v.y];
-    const pos = toKS(camPosInRg);
-    const right = toKS(this.tmpV.set(1, 0, 0).applyQuaternion(qCam));
-    const up = toKS(this.tmpV.set(0, 1, 0).applyQuaternion(qCam));
-    const back = toKS(this.tmpV.set(0, 0, 1).applyQuaternion(qCam));
+    const cs = this.camState;
+    const pos = cs.pos;
+    pos[0] = camPosInRg.x;
+    pos[1] = -camPosInRg.z;
+    pos[2] = camPosInRg.y;
+    this.axisToKS(this.kRight, qCam, 1, 0, 0);
+    this.axisToKS(this.kUp, qCam, 0, 1, 0);
+    this.axisToKS(this.kBack, qCam, 0, 0, 1);
     const a = p.spin;
     const rCam = ksRadius(a, pos[0], pos[1], pos[2]);
     const rh = horizonRadius(a);
     const lensing = p.lensing;
-    let u: Vec4;
-    let tetrad: Tetrad;
+    const tet = cs.tetrad;
     if (lensing) {
-      u = this.observerVelocity(pos);
-      tetrad = buildTetrad(a, pos, u, right, up, back);
+      this.observerVelocityInto(pos, this.uObs);
+      buildTetradInto(a, pos, this.uObs, this.kRight, this.kUp, this.kBack, tet);
+      for (let i = 0; i < 4; i++) cs.u[i] = this.uObs[i];
     } else {
       // Flat space: a static observer with the coordinate axes.
-      u = [1, 0, 0, 0];
-      tetrad = {
-        e: [u, [0, ...right], [0, ...up], [0, ...back]] as Tetrad['e'],
-        E: [[-1, 0, 0, 0], [0, ...right], [0, ...up], [0, ...back]] as Tetrad['E'],
-      };
+      cs.u[0] = 1;
+      cs.u[1] = cs.u[2] = cs.u[3] = 0;
+      const axes = this.kAxes;
+      for (let k = 0; k < 4; k++) {
+        const e = tet.e[k], E = tet.E[k];
+        if (k === 0) {
+          e[0] = 1;
+          e[1] = e[2] = e[3] = 0;
+          E[0] = -1;
+          E[1] = E[2] = E[3] = 0;
+        } else {
+          const v = axes[k - 1];
+          e[0] = E[0] = 0;
+          for (let i = 0; i < 3; i++) e[i + 1] = E[i + 1] = v[i];
+        }
+      }
     }
-    this.camera = { pos, r: rCam, u, tetrad, inside: rCam < rh };
+    cs.r = rCam;
+    cs.inside = rCam < rh;
+    this.camera = cs;
 
     // ——— temporal accumulation weight from camera motion
     const fwd = this.tmpV2.set(0, 0, -1).applyQuaternion(camera.quaternion);
@@ -577,6 +844,12 @@ export class BlackHoleRenderer {
     const jy = halton((this.frame % 16) + 1, 3) - 0.5;
     this.toSky.copy(this.bhRot).multiply(KS_TO_BH);
     this.camToSky.setFromMatrix4(this.tmpM.makeRotationFromQuaternion(camera.quaternion));
+    this.ksToCam.copy(this.camToSky).transpose().multiply(this.toSky);
+    const escR = Math.max(rCam * 1.05, 60, p.diskOuter * 1.5);
+    // Lens cache: identical geometry up to a turn about the spin axis (the idle orbit) → only the
+    // rays that met the disk (or border the shadow) are traced again.
+    this.lensKey(pos, tr.width, tr.height, escR);
+    const cached = this.lensCache && this.cacheValid && this.historyValid && this.keyMatches();
     const t = this.traceMat.uniforms;
     t.uA.value = a;
     t.uLensing.value = lensing ? 1 : 0;
@@ -584,7 +857,7 @@ export class BlackHoleRenderer {
     (t.uJitter.value as THREE.Vector2).set(jx, jy);
     (t.uTan.value as THREE.Vector2).set(this.tanX, this.tanY);
     (t.uCamPos.value as THREE.Vector3).set(pos[0], pos[1], pos[2]);
-    const E = tetrad.E;
+    const E = tet.E;
     (t.uE0.value as THREE.Vector4).set(E[0][1], E[0][2], E[0][3], E[0][0]);
     (t.uE1.value as THREE.Vector4).set(E[1][1], E[1][2], E[1][3], E[1][0]);
     (t.uE2.value as THREE.Vector4).set(E[2][1], E[2][2], E[2][3], E[2][0]);
@@ -592,11 +865,12 @@ export class BlackHoleRenderer {
     t.uCapR.value = lensing ? captureRadius(a) : rh;
     t.uHorizon.value = rh;
     t.uInside.value = rCam < rh && lensing ? 1 : 0;
-    t.uEscR.value = Math.max(rCam * 1.05, 60, p.diskOuter * 1.5);
+    t.uEscR.value = escR;
     t.uEps.value = this.quality.eps;
-    (t.uToSky.value as THREE.Matrix3).copy(this.toSky);
-    (t.uCamToSky.value as THREE.Matrix3).copy(this.camToSky);
+    (t.uKsToCam.value as THREE.Matrix3).copy(this.ksToCam);
     t.uFrame.value = this.frame % 64;
+    t.uCached.value = cached ? 1 : 0;
+    t.uSkyCache.value = cached ? tr.textures[1] : null;
     t.uDiskOn.value = p.disk ? 1 : 0;
     (t.uDiskR.value as THREE.Vector2).set(rIn, p.diskOuter);
     t.uH.value = p.thickness;
@@ -611,21 +885,45 @@ export class BlackHoleRenderer {
       0,
     );
     this.quad.material = this.traceMat;
-    this.quad.render(r, tr);
+    if (cached) {
+      // Disk light only (the lens map stays the cached one, and so does its jitter).
+      this.quad.render(r, this.lightRT!);
+      this.cachedFrames++;
+    } else {
+      this.quad.render(r, tr);
+      this.cacheKey.set(this.curKey);
+      this.cacheValid = true;
+      this.cacheJitter.set(jx, jy);
+    }
 
     // ——— accumulate
     const hist = this.accum[this.accumIndex];
     const next = this.accum[1 - this.accumIndex];
     const am = this.accumMat.uniforms;
-    am.uCurrent.value = tr.textures[0];
+    am.uCurrent.value = cached ? this.lightRT!.texture : tr.textures[0];
     am.uHistory.value = hist.texture;
     am.uAlpha.value = alpha;
     this.quad.material = this.accumMat;
     this.quad.render(r, next);
     this.accumIndex = 1 - this.accumIndex;
     this.historyValid = true;
-    this.jitter.set(jx, jy);
+    this.jitter.copy(this.cacheJitter);
     this.composite(target);
+    if (!this.checkedPrograms) this.checkPrograms();
+  }
+
+  private checkedPrograms = false;
+  /**
+   * A shader the driver refuses to link draws nothing: the view would stay black with only a
+   * console message. Turn that into an error the app shows (checked once, after the first frame).
+   */
+  private checkPrograms(): void {
+    this.checkedPrograms = true;
+    for (const m of [this.noiseMat, this.diskMat, this.traceMat, this.accumMat, this.compMat]) {
+      const prog = (this.renderer.properties.get(m) as { currentProgram?: { diagnostics?: { runnable: boolean } } }).currentProgram;
+      if (prog?.diagnostics && !prog.diagnostics.runnable)
+        throw new Error('The black-hole ray tracer’s shaders failed to compile on this GPU (details in the console).');
+    }
   }
 
   /**
@@ -639,18 +937,7 @@ export class BlackHoleRenderer {
     this.quad.material = this.meterMat;
     this.quad.render(r, this.meterRT);
     this.meterBusy = true;
-    r.readRenderTargetPixelsAsync(this.meterRT, 0, 0, METER_W, METER_H, this.meterBuf)
-      .then(() => {
-        const n = METER_W * METER_H;
-        for (let i = 0; i < n; i++) this.meterSorted[i] = this.meterBuf[i * 4];
-        this.meterSorted.sort();
-        const code = this.meterSorted[Math.floor(n * 0.95)];
-        this.highlightLuminance = Math.pow(2, (code / 255) * 24 - 16);
-      })
-      .catch(() => undefined)
-      .finally(() => {
-        this.meterBusy = false;
-      });
+    r.readRenderTargetPixelsAsync(this.meterRT, 0, 0, METER_W, METER_H, this.meterBuf).then(this.onMeter, this.onMeterFail);
   }
 
   /** Final pass: upsampled disk light over the lensed sky, into the HDR target. */
@@ -688,7 +975,7 @@ export class BlackHoleRenderer {
   }
 
   private syncBuf = new Uint16Array(4);
-  /** Block until the GPU has finished this frame (headless/CPU WebGL: stops frames piling up). */
+  /** Block until the GPU has finished this frame (headless/CPU WebGL only: stops frames piling up). */
   syncGPU(): void {
     const t = this.accum[this.accumIndex];
     if (t) this.renderer.readRenderTargetPixels(t, 0, 0, 1, 1, this.syncBuf);
@@ -710,11 +997,14 @@ export class BlackHoleRenderer {
 
   dispose(): void {
     this.traceRT?.dispose();
+    this.lightRT?.dispose();
     for (const a of this.accum) a.dispose();
     this.diskRT.dispose();
+    this.noiseRT.dispose();
     this.profileTex.dispose();
     this.planckTex.dispose();
     this.ctTex.dispose();
+    this.noiseMat.dispose();
     this.diskMat.dispose();
     this.traceMat.dispose();
     this.accumMat.dispose();

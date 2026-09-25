@@ -11,8 +11,9 @@ import { StarshipFlight, describeWarp, TIME } from '../../worlds/ship/flight';
 import { C_PC_PER_YEAR, gammaOf } from '../../physics/voyage-relativity';
 import { formatNumber, formatDuration, formatScientific, formatDistance, formatParsecs } from '../../physics/units';
 import { YEAR } from '../../physics/constants';
-import { Frame, UNIT, convertPoint, makeNav, rebase, rootQuatToFrame, settleFrame, translateMetres, type NavState } from '../../worlds/explorer/frames';
+import { Frame, UNIT, commonAncestor, convertPoint, makeNav, rebase, rootQuatToFrame, settleFrame, translateMetres, type NavState } from '../../worlds/explorer/frames';
 import { Trip, autoSpeed, lookQuat, niceScaleBar, SPEED_OF_LIGHT } from '../../worlds/explorer/navigation';
+import { procHostHint } from '../../worlds/explorer/hosts';
 import { DESTINATIONS, type Destination } from './targets';
 import { Hud, type LabelItem } from './hud';
 import { WarpField } from './warp';
@@ -22,7 +23,7 @@ import { SolRegime } from './sol';
 import { ProcSystem } from './systems';
 import { SgrARegime, SGRA } from './sgra';
 import { NebulaRegime } from './nebula';
-import { R_EARTH_KM, type BodyEntry } from '../../worlds/systems';
+import { R_EARTH_KM, type BodyEntry, type StarHint } from '../../worlds/systems';
 import type { SolarBody } from '../../worlds/solar/SolarSystemModel';
 import { J2000_JD } from '../../physics/constants';
 
@@ -161,6 +162,36 @@ class Voyage implements Experience {
   }> = {};
   private viewButtons!: { setActive(i: number): void };
   private warpManual = 1 / (365.25 * 1440);
+  private pushLight = (dir: THREE.Vector3, illum: number, T: number): void => {
+    const L = this.lights;
+    const slot = this.lightPool[L.length] ?? (this.lightPool[L.length] = { dir: new THREE.Vector3(), illum: 0, temperature: 0 });
+    slot.dir.copy(dir);
+    slot.illum = illum;
+    slot.temperature = T;
+    L.push(slot);
+  };
+  /** Real seconds of the current frame (render-side smoothing must not assume 60 fps). */
+  private frameDt = 1 / 60;
+  private audioTimer = 0;
+  /** Probe draw callback (one closure for the experience's lifetime, not one per frame). */
+  private drawProbeSky = (c: THREE.Camera): void => this.local.sky.render(this.ctx.renderer, c, 0.5);
+  /** Galaxies drawn this frame, sorted far → near (reused). */
+  private galaxyOrder: GalaxyEntry[] = [];
+  private fartherFirst = (a: GalaxyEntry, b: GalaxyEntry): number => this.navRoot.distanceToSquared(b.frame.origin) - this.navRoot.distanceToSquared(a.frame.origin);
+  /** Last values written to the flight widget's DOM (write only on change). */
+  private hudCache: { bar: string; scale: string; crumbFrame: Frame | null; crumbHome: boolean; noScale: boolean } = { bar: '', scale: '', crumbFrame: null, crumbHome: false, noScale: false };
+  /** HUD labels in use this frame (pool index). */
+  private labelCount = 0;
+  private addLabel = (dirRoot: THREE.Vector3, text: string, sub: string, pri: number, cool = false): void => {
+    if (this.labelCount >= this.labelPool.length) return;
+    const it = this.labelPool[this.labelCount++];
+    it.dir.copy(dirRoot);
+    it.text = text;
+    it.sub = sub;
+    it.priority = pri;
+    it.cool = cool;
+    this.labelItems.push(it);
+  };
   /** Default framing: Sun azimuth/elevation from the nose (deg), chase camera offsets (rad). */
   departureSun = { az: 100, el: 20, camYaw: 0.4, camPitch: 0 };
 
@@ -178,7 +209,9 @@ class Voyage implements Experience {
     this.neb = new NebulaRegime(ctx);
     this.sol = new SolRegime(ctx, this.cosmos.local, (id) => this.selectBody(id), (p, c) => this.cosmos.addChild(p, c), JD0);
     this.ship = new Ship({ detail: Math.max(0.55, Math.min(1.3, q.detail)), shadowSize: q.detail >= 1 ? 2048 : 1024 });
-    this.ship.plume.steps = q.detail >= 1 ? 32 : q.detail >= 0.7 ? 24 : 20;
+    // Plume ray-march budget (max samples/pixel; the march adapts to ~4 samples per jet width).
+    this.ship.plume.steps = q.detail >= 1 ? 24 : q.detail >= 0.7 ? 14 : 10;
+    this.ship.plume.octaves = q.detail >= 1 ? 2 : 1;
     this.probe = new SkyProbe(q.detail >= 1 ? 128 : 64, ctx.engine.halfFloat);
     this.ship.setEnvironment(this.probe, 1);
     this.shipScene.add(this.ship.group);
@@ -269,7 +302,7 @@ class Voyage implements Experience {
         group: 'Galaxies',
         facts: [
           ['Mass', '4.3 × 10⁶ M☉ (stellar orbits, GRAVITY 2022)'],
-          ['Horizon', '≈ 12 million km across (0.08 AU)'],
+          ['Horizon', '≈ 18 million km across (0.12 AU) at the spin drawn, a/M = 0.9'],
           ['Distance', '8.2 kpc (26 700 ly) from the Sun'],
           ['Disk', 'drawn bright to show the lensing — the real flow is faint'],
         ],
@@ -419,7 +452,7 @@ class Voyage implements Experience {
         group: 'Solar System',
         facts: [
           ['Extent', 'Neptune at 30 AU; the Kuiper belt to ≈ 50 AU'],
-          ['Light-time', '7 hours across Neptune’s orbit'],
+          ['Light-time', '4.2 hours from the Sun to Neptune'],
           ['Scale', 'true — planets are points of light'],
         ],
         body: 'At true scale the planets are specks: their orbits trace the system’s plan, the Kuiper belt a faint ring of ice beyond Neptune.',
@@ -589,7 +622,7 @@ class Voyage implements Experience {
   private static readonly TOUR: ReadonlyArray<{ id: string; title: string; text: string; dwell: number }> = [
     { id: 'earth', title: 'Earth', text: 'Home: a rocky world 12 742 km across under a hundred kilometres of air. Everything we know happened here.', dwell: 6 },
     { id: 'sun', title: 'The Sun', text: 'A sphere of plasma 1.4 million km across, 5 772 K at the surface. An ordinary star — one of two hundred billion.', dwell: 6 },
-    { id: 'milky-way', title: 'The Milky Way', text: 'Our galaxy, 100 000 light-years across. The Sun circles its centre once every 230 million years.', dwell: 7 },
+    { id: 'milky-way', title: 'The Milky Way', text: 'Our galaxy, 100 000 light-years across. The Sun circles its centre once every 220 million years.', dwell: 7 },
     { id: 'cosmic-web', title: 'The cosmic web', text: 'Every point of light is a galaxy. The glow is dark matter — gathered by gravity into filaments over 13.8 billion years.', dwell: 7 },
     { id: 'andromeda', title: 'Andromeda', text: 'The light arriving here left 2.5 million years ago. In some 4.5 billion years Andromeda and the Milky Way will merge.', dwell: 7 },
     { id: 'random-star', title: '', text: '', dwell: 4 },
@@ -704,7 +737,10 @@ class Voyage implements Experience {
       this.faceDirection(toAcen);
       this.setView('chase');
       this.shipCam.distance = 34;
-      this.shipCam.yawBias = this.departureSun.camYaw;
+      // Portrait screens see only ~27° across: a smaller three-quarter angle keeps the target (straight
+      // ahead of the nose) in view.
+      const portrait = this.ctx.engine.cssWidth < this.ctx.engine.cssHeight;
+      this.shipCam.yawBias = this.departureSun.camYaw * (portrait ? 0.35 : 1);
       this.shipCam.pitchBias = this.departureSun.camPitch;
       this.autoEngage = 2.2;
     } else if (name === 'relativistic' || name === '0.9c') {
@@ -942,6 +978,7 @@ class Voyage implements Experience {
     this.caption = { el: cap, title: cap.querySelector('.vy-cap-t') as HTMLElement, text: cap.querySelector('.vy-cap-x') as HTMLElement, t: 0 };
     const q = (s: string) => el.querySelector(s) as HTMLElement;
     this.flightParts = { crumb: q('.vy-fl-crumb'), name: q('.vy-fl-name'), phase: q('.vy-fl-phase'), bar: q('.vy-fl-bar i'), eta: q('.vy-fl-eta'), tag: q('.vy-fl-tag'), scale: q('.vy-fl-scale span'), scaleBar: q('.vy-fl-scale i') };
+    this.flightParts.bar.style.width = '100%';
 
     const s1 = ui.section('Destination');
     const groups: Array<ExplorerDest['group']> = ['Solar System', 'Stars', 'Galaxies', 'Universe'];
@@ -1219,6 +1256,7 @@ class Voyage implements Experience {
 
   update(f: FrameInfo): void {
     this.time = f.time;
+    this.frameDt = f.dt;
     this.step(f.dt);
   }
 
@@ -1359,7 +1397,10 @@ class Voyage implements Experience {
       }
       if (want < 0 && destStar > 0 && L.starPos(destStar, _v1).distanceTo(this.navLocal) < 0.02) want = destStar;
     }
-    if (want > 0 && L.cat.absMag[want] < 0.5) want = -1; // giants and supergiants: no planets modelled
+    // Hosts the generator cannot model faithfully (giants, white dwarfs) get no planets; the rest are
+    // generated as main-sequence stars of the catalogue T_eff (see explorer/hosts.ts).
+    const hint = want > 0 ? this.hostHint(want) : null;
+    if (!hint) want = -1;
     if (this.proc && want !== this.procStar) {
       const d = L.starPos(this.procStar, _v1).distanceTo(this.navLocal);
       if (want >= 0 || d > 0.08) {
@@ -1369,10 +1410,8 @@ class Voyage implements Experience {
         this.procStar = -1;
       }
     }
-    if (!this.proc && want > 0) {
-      const info = L.starInfo(want);
+    if (!this.proc && want > 0 && hint) {
       const inf = L.cat.info(want);
-      const lum = Math.pow(10, -0.4 * (L.cat.absMag[want] - 4.83)) * bolometric(info.temperature);
       this.proc = new ProcSystem(
         this.ctx,
         {
@@ -1381,10 +1420,7 @@ class Voyage implements Experience {
           parent: this.cosmos.local,
           position: L.starPos(want, new THREE.Vector3()),
           seed: (want * 7919 + 13) >>> 0,
-          hint: { teff: info.temperature, binary: false },
-          lum,
-          radius: info.radius,
-          teff: info.temperature,
+          hint,
         },
         (p, c) => this.cosmos.addChild(p, c),
         (p, c) => this.cosmos.removeChild(p, c),
@@ -1399,6 +1435,14 @@ class Voyage implements Experience {
       this.proc.setTime(this.flight.t * 365.25 + (this.procStar % 97) * 3.1);
     }
   }
+
+  /** Generator hint for catalogue star i (memoised; null = no planets modelled). */
+  private hostHint(i: number): StarHint | null {
+    let h = this.hostHints.get(i);
+    if (h === undefined) this.hostHints.set(i, (h = procHostHint(this.local.cat.absMag[i], this.local.starInfo(i).temperature)));
+    return h;
+  }
+  private hostHints = new Map<number, StarHint | null>();
 
   private updateDerived(): void {
     const cz = this.cosmos;
@@ -1441,7 +1485,7 @@ class Voyage implements Experience {
       const inside = Number.isFinite(sky) && sky > 0 ? THREE.MathUtils.clamp(INSIDE_LEVEL / (sky * 0.1 * g.params.look.exposure), 0.02, 1.5) : outside;
       target = THREE.MathUtils.lerp(outside, inside, THREE.MathUtils.smoothstep(m.lit, 0.85, 0.99));
     }
-    const k = 1 - Math.exp(-(1 / 60) / (this.ctx.engine.shotMode ? 0.15 : 1.1));
+    const k = 1 - Math.exp(-this.frameDt / (this.ctx.engine.shotMode ? 0.15 : 1.1));
     g.adapt = Math.exp(Math.log(g.adapt) + (Math.log(target) - Math.log(g.adapt)) * k);
   }
 
@@ -1485,14 +1529,8 @@ class Voyage implements Experience {
   private updateLightsAndExposure(dt: number): void {
     const L = this.lights;
     L.length = 0;
-    this.local.collectLights((dir, illum, T) => {
-      const slot = this.lightPool[L.length] ?? (this.lightPool[L.length] = { dir: new THREE.Vector3(), illum: 0, temperature: 0 });
-      slot.dir.copy(dir);
-      slot.illum = illum;
-      slot.temperature = T;
-      L.push(slot);
-    });
-    L.sort((a, b) => b.illum - a.illum);
+    this.local.collectLights(this.pushLight);
+    L.sort(byIllum);
     let total = 0;
     for (const l of L) total += l.illum;
     const E_REF = 1.5;
@@ -1540,7 +1578,9 @@ class Voyage implements Experience {
 
   private updateAudio(): void {
     const b = this.flight.beta;
-    if ((this.time * 4) % 1 < 0.02) {
+    this.audioTimer -= this.frameDt;
+    if (this.audioTimer <= 0) {
+      this.audioTimer = 0.25;
       this.ctx.audio.setMood('voyage', { intensity: 0.25 + 0.6 * b + (this.trip ? 0.3 : 0), speed: b, gamma: this.flight.gamma, imagination: !!this.trip || this.speed > SPEED_OF_LIGHT });
     }
   }
@@ -1576,7 +1616,7 @@ class Voyage implements Experience {
       cam.updateMatrixWorld();
       cam.updateProjectionMatrix();
     } else {
-      this.shipCam.update(1 / 60, nav.quaternion, travelDir, this.ship.geometry.cockpit, aspect);
+      this.shipCam.update(this.frameDt, nav.quaternion, travelDir, this.ship.geometry.cockpit, aspect);
       cam = this.shipCam.camera;
       this.skyCam.fov = cam.fov;
       this.skyCam.aspect = aspect;
@@ -1586,8 +1626,14 @@ class Voyage implements Experience {
       this.skyCam.updateProjectionMatrix();
     }
     const e = this.exposure;
-    // Environment probe: the local sky as the ship sees it.
-    if (this.view !== 'sky' && this.local.fade > 0.01) this.probe.update(r, (c) => this.local.sky.render(r, c, 0.5), this.time < 0.2 ? 6 : 1);
+    // Off-screen passes first — the environment probe (the local sky as the ship sees it) and the
+    // ship's shadow map — so the (multisampled) scene target is bound once and never has to be
+    // stored and reloaded mid-frame (a full MSAA store + load per switch on tile-based GPUs).
+    if (this.view !== 'sky' && this.local.fade > 0.01) this.probe.update(r, this.drawProbeSky, this.time < 0.2 ? 6 : 1);
+    if (this.view !== 'sky') {
+      this.ship.pixelRatio = eng.pixelRatio;
+      this.ship.updateShadow(r);
+    }
     r.setRenderTarget(target);
     // 1. The real sky of the solar neighbourhood (writes the background).
     this.local.renderSky(r, this.skyCam, eng.pixelRatio, eng.cssHeight);
@@ -1606,7 +1652,10 @@ class Voyage implements Experience {
       pixelRatio: eng.pixelRatio,
     });
     // 3. Galaxies in full, farthest first (their dust extinguishes what lies behind).
-    const order = cz.galaxies.filter((g) => g.weight > 0.001 && g.layer && !bhFull).sort((a, b) => this.navRoot.distanceToSquared(b.frame.origin) - this.navRoot.distanceToSquared(a.frame.origin));
+    const order = this.galaxyOrder;
+    order.length = 0;
+    if (!bhFull) for (const g of cz.galaxies) if (g.weight > 0.001 && g.layer) order.push(g);
+    if (order.length > 1) order.sort(this.fartherFirst);
     for (const g of order) {
       const lc = this.layerCam;
       convertPoint(nav.position, nav.frame, g.frame, _v2);
@@ -1641,7 +1690,7 @@ class Voyage implements Experience {
     if (this.sol.layer) {
       const camSol = convertPoint(nav.position, nav.frame, this.sol.frame, _v4);
       const focus = nav.frame.kind === 'planet' && (nav.frame.data as SolarBody | undefined)?.def ? (nav.frame.data as SolarBody) : null;
-      this.sol.update(camSol, this.skyCam.quaternion, this.skyCam.fov, this.time, 1 / 60, this.labelsOn, focus);
+      this.sol.update(camSol, this.skyCam.quaternion, this.skyCam.fov, this.time, this.frameDt, this.labelsOn, focus);
       this.sol.render(target);
     }
     // 5b. A procedural planetary system around another star.
@@ -1658,16 +1707,15 @@ class Voyage implements Experience {
       this.sgra.render(target, _q2, this.skyCam.fov, camRg, this.postE, this.ctx.engine.frame);
       r.setRenderTarget(target);
     }
-    // 6. The ship.
+    // 6. The ship (its shadow map was drawn before the scene target was bound).
     if (this.view !== 'sky') {
-      r.clearDepth();
-      this.ship.pixelRatio = eng.pixelRatio;
-      this.ship.updateShadow(r);
       r.setRenderTarget(target);
+      r.clearDepth();
       const warpDir = travelDir ?? fl.forward(_v3);
       const imag = this.trip ? 0.42 * THREE.MathUtils.clamp(Math.log10(Math.max(this.speed / SPEED_OF_LIGHT, 1)) / 4, 0, 1) : this.speed > SPEED_OF_LIGHT ? 0.25 : 0;
-      this.warpStrength += (imag - this.warpStrength) * 0.08;
-      this.warp.update(1 / 60, warpDir, this.warpStrength, Math.max(e, 0.5));
+      // (0.08 per frame at 60 fps, as a time constant: τ = 0.2 s at any frame rate)
+      this.warpStrength += (imag - this.warpStrength) * (1 - Math.exp(-this.frameDt / 0.2));
+      this.warp.update(this.frameDt, warpDir, this.warpStrength, Math.max(e, 0.5));
       r.render(this.shipScene, cam);
     }
     this.updateHud(this.view === 'sky' ? this.skyCam : cam);
@@ -1708,14 +1756,21 @@ class Voyage implements Experience {
       const b = convertPoint(tgtPos, tgtFrame, lca, _v7);
       distM = a.distanceTo(b) * lca.metres;
       const fd = distM < 0.1 * UNIT.LY || distM > 3e5 * UNIT.PC ? (distM > 3e5 * UNIT.PC ? formatParsecs(distM, 3) : formatDistance(distM, 3)) : formatDistance(distM, 3);
-      this.ro.dist.set(fd.value, fd.unit);
+      if (distM < 1) this.ro.dist.set('—', '');
+      else this.ro.dist.set(fd.value, fd.unit);
     }
 
     // Flight status widget.
     const p = this.flightParts;
-    const crumb = this.breadcrumb();
-    if (p.crumb.textContent !== crumb) p.crumb.textContent = crumb;
-    p.name.textContent = (this.trip && this.tripDest ? this.tripDest : d).name;
+    const nearHome = this.navRoot.length() < 2;
+    if (this.hudCache.crumbFrame !== this.nav.frame || this.hudCache.crumbHome !== nearHome) {
+      this.hudCache.crumbFrame = this.nav.frame;
+      this.hudCache.crumbHome = nearHome;
+      const crumb = this.breadcrumb();
+      if (p.crumb.textContent !== crumb) p.crumb.textContent = crumb;
+    }
+    const nm = (this.trip && this.tripDest ? this.tripDest : d).name;
+    if (p.name.textContent !== nm) p.name.textContent = nm;
     let phase = '', eta = '';
     let progress = 0;
     if (this.trip) {
@@ -1723,14 +1778,13 @@ class Voyage implements Experience {
       progress = this.trip.progress;
       eta = this.speed > SPEED_OF_LIGHT ? 'faster than light — not physics' : '';
     } else if (fl.autopilot && this.sublightActive) {
-      const names: Record<string, string> = {
-        align: 'Turning to the destination',
-        accelerate: `Accelerating · ${fl.accelG.toFixed(fl.accelG < 1 ? 2 : 1)} g`,
-        coast: `Coasting at ${fl.beta.toFixed(4)} c`,
-        flip: 'Flip — turning to brake',
-        brake: 'Braking',
-      };
-      phase = names[fl.phase] ?? fl.phase;
+      phase =
+        fl.phase === 'align' ? 'Turning to the destination'
+        : fl.phase === 'accelerate' ? `Accelerating · ${fl.accelG.toFixed(fl.accelG < 1 ? 2 : 1)} g`
+        : fl.phase === 'coast' ? `Coasting at ${fl.beta.toFixed(4)} c`
+        : fl.phase === 'flip' ? 'Flip — turning to brake'
+        : fl.phase === 'brake' ? 'Braking'
+        : fl.phase;
       progress = fl.progress;
       const tl = formatDuration(fl.estimateRemainingTau() * YEAR, 2);
       eta = `${tl.value} ${tl.unit} ship time to go\ntime warp ${describeWarp(fl.warp)}`;
@@ -1745,37 +1799,34 @@ class Voyage implements Experience {
       phase = this.speed > 1 ? (this.drive === 'imagination' ? `Throttle ${Math.round(this.throttle * 100)} %` : 'Manual flight') : 'Holding position';
       eta = `Enter to set course`;
     }
-    p.tag.textContent = this.drive === 'imagination' ? 'Imagination drive' : this.relOn ? '' : 'Relativity off';
+    const tag = this.drive === 'imagination' ? 'Imagination drive' : this.relOn ? '' : 'Relativity off';
+    if (p.tag.textContent !== tag) p.tag.textContent = tag;
     if (p.phase.textContent !== phase) p.phase.textContent = phase;
     if (p.eta.textContent !== eta) p.eta.textContent = eta;
-    p.bar.style.width = '100%';
-    p.bar.style.transform = `scaleX(${THREE.MathUtils.clamp(progress, 0, 1).toFixed(3)})`;
+    const barT = `scaleX(${THREE.MathUtils.clamp(progress, 0, 1).toFixed(3)})`;
+    if (barT !== this.hudCache.bar) p.bar.style.transform = this.hudCache.bar = barT;
     // Scale bar: a round length spanning at most 90 CSS px at the distance of the nearest body.
     const pxAngle = (2 * Math.tan(THREE.MathUtils.degToRad(this.skyCam.fov) / 2)) / eng.cssHeight;
     const ref = Math.max(this.dNearest, 1);
     const raw = ref * pxAngle * 90;
-    const unit = SCALE_UNITS.reduce((u, x) => (raw >= x[1] ? x : u), SCALE_UNITS[0]);
+    let unit = SCALE_UNITS[0];
+    for (const x of SCALE_UNITS) if (raw >= x[1]) unit = x;
     const n = niceScaleBar(raw / unit[1]);
     const px = (n * unit[1]) / (ref * pxAngle);
+    // (no scale bar in the planetarium view: it measures lengths at the nearest body)
+    const planetarium = this.view === 'sky';
+    if (planetarium !== this.hudCache.noScale) (p.scale.parentElement as HTMLElement).style.visibility = (this.hudCache.noScale = planetarium) ? 'hidden' : '';
     const st = `${formatNumber(n, 3)} ${unit[0]}`;
     if (p.scale.textContent !== st) p.scale.textContent = st;
-    p.scaleBar.style.width = `${px.toFixed(0)}px`;
+    const sw = `${px.toFixed(0)}px`;
+    if (sw !== this.hudCache.scale) p.scaleBar.style.width = this.hudCache.scale = sw;
 
     // Labels.
     const items = this.labelItems;
     items.length = 0;
     this.local.labels(this.labelPool, items, this.dSun > 1e-7 && this.sol.opacity < 0.5);
-    let k = items.length;
-    const add = (dirRoot: THREE.Vector3, text: string, sub: string, pri: number, cool = false) => {
-      if (k >= this.labelPool.length) return;
-      const it = this.labelPool[k++];
-      it.dir.copy(dirRoot);
-      it.text = text;
-      it.sub = sub;
-      it.priority = pri;
-      it.cool = cool;
-      items.push(it);
-    };
+    this.labelCount = items.length;
+    const add = this.addLabel;
     // Planets of a procedural system.
     const P = this.proc;
     if (P && P.opacity > 0.5) {
@@ -1791,7 +1842,8 @@ class Voyage implements Experience {
       }
     }
     // Galaxies and home (not while the lensed sky of Sgr A* fills the view).
-    for (const g of this.sgra.weight > 0.5 ? [] : this.cosmos.galaxies) {
+    for (const g of this.cosmos.galaxies) {
+      if (this.sgra.weight > 0.5) break;
       const gp = convertPoint(this.nav.position, this.nav.frame, g.frame, _v6);
       const r = gp.length();
       if (r < g.radius * 1.3 || (d.id === g.id || (d.id === 'milky-way' && g === this.cosmos.mwEntry) || (d.id === 'andromeda' && g === this.cosmos.m31Entry))) continue;
@@ -1939,12 +1991,9 @@ class Voyage implements Experience {
 
 // ——— helpers ———
 
+/** Lowest common frame of two frames (every frame hangs off the universe root). */
 function commonFrame(a: Frame, b: Frame): Frame {
-  const pa = a.path();
-  const pb = b.path();
-  let c = pa[0];
-  for (let i = 0; i < Math.min(pa.length, pb.length) && pa[i] === pb[i]; i++) c = pa[i];
-  return c;
+  return commonAncestor(a, b) ?? a.path()[0];
 }
 
 /** A viewpoint k radii from a body (frame km, centred on it): azimuth/elevation (deg) from the star direction. */
@@ -1954,13 +2003,6 @@ function placeAround(f: Frame, starDir: THREE.Vector3, radiusKm: number, k: numb
   const az = THREE.MathUtils.degToRad(azDeg), el = THREE.MathUtils.degToRad(elDeg);
   const dir = new THREE.Vector3().copy(starDir).multiplyScalar(Math.cos(az)).addScaledVector(side, Math.sin(az)).multiplyScalar(Math.cos(el)).addScaledVector(up, Math.sin(el)).normalize();
   return { frame: f, position: dir.multiplyScalar(radiusKm * k), lookAt: new THREE.Vector3(), scale: radiusKm * 1e3 * 1.5, up: up.applyQuaternion(f.rootRotation) };
-}
-
-/** Bolometric correction factor L_bol / L_V for a blackbody-ish star (≈ 1 for the Sun; larger for cool and hot stars). */
-function bolometric(T: number): number {
-  // Flower (1996)-like BC_V fit, approximated: BC ≈ −(T−5800)²/ (4.2e6) for 3000–10000 K (mag).
-  const bc = -Math.pow(T - 5800, 2) / 4.2e6 - (T < 4000 ? (4000 - T) / 700 : 0);
-  return Math.pow(10, -0.4 * bc);
 }
 
 /** Blackbody chromaticity (luminance 1) — CPU twin of BLACKBODY_GLSL. */
@@ -1987,6 +2029,7 @@ const SCALE_UNITS: Array<[string, number]> = [
   ['Gly', 1e9 * UNIT.LY],
 ];
 
+const byIllum = (a: Light, b: Light): number => b.illum - a.illum;
 const _zero = new THREE.Vector3();
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();

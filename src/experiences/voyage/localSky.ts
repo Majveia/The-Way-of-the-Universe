@@ -86,7 +86,8 @@ export class LocalSky {
     readonly cat: StarCatalog,
     detail: number,
   ) {
-    this.sky = new Sky({ catalog: cat, stars: Math.round(26000 * detail), milkyWay: 1, constellations: 0 });
+    // Milky Way bake resolution by tier (1024² faces ≈ 0.09°/texel ≈ 1.7 px at 1080p and 55°).
+    this.sky = new Sky({ catalog: cat, stars: Math.round(26000 * detail), milkyWay: 1, constellations: 0, bandResolution: detail >= 1 ? 1024 : detail >= 0.6 ? 768 : 512 });
     this.sky.minStarDistance = 1e-9;
     for (const [name, o] of Object.entries(STAR_OVERRIDES)) {
       const i = cat.find(name);
@@ -109,14 +110,32 @@ export class LocalSky {
 
   findStar(q: string): number {
     if (q.startsWith('#')) return Number(q.slice(1));
-    return this.cat.find(q);
+    // (the catalogue is static: memoise the name lookup, it runs several times per frame)
+    let i = this.findCache.get(q);
+    if (i === undefined) this.findCache.set(q, (i = this.cat.find(q)));
+    return i;
+  }
+  private findCache = new Map<string, number>();
+  private basisCache = new Map<number, { north: THREE.Vector3; east: THREE.Vector3; los: THREE.Vector3 }>();
+  private labelNames = new Map<number, string>();
+  private hideList: number[] = [];
+  /** Reused view records (nearViews is truncated every frame; the objects live on here). */
+  private viewPool: NearStarView[] = [];
+  private viewCount = 0;
+
+  /** Index of catalogue star i in the resolved list (−1 if not resolved). */
+  private nearIndexOf(i: number): number {
+    const l = this.nearList;
+    for (let k = 0; k < l.length; k++) if (l[k].index === i) return k;
+    return -1;
   }
 
   /** Secondary − primary offset (pc, local) of a destination's visual binary. */
   companionOffset(d: Destination, primary: number, out: THREE.Vector3): THREE.Vector3 {
     const o = d.companion!.orbit;
     const [n, e, r] = visualOrbitOffset(o, NOW_YEAR + this.yearsFromNow);
-    const b = tangentBasis(this.cat.ra[primary], this.cat.dec[primary], equatorialToGalacticThree);
+    let b = this.basisCache.get(primary);
+    if (!b) this.basisCache.set(primary, (b = tangentBasis(this.cat.ra[primary], this.cat.dec[primary], equatorialToGalacticThree)));
     return out.set(0, 0, 0).addScaledVector(b.north, n * AU_PC).addScaledVector(b.east, e * AU_PC).addScaledVector(b.los, r * AU_PC);
   }
 
@@ -184,8 +203,9 @@ export class LocalSky {
     for (const e of list) this.starPos(e.index, e.pos);
     for (const d of DESTINATIONS) {
       if (!d.companion) continue;
-      const pi = c.find(d.star), si = c.find(d.companion.star);
-      const P = list.find((x) => x.index === pi), S = list.find((x) => x.index === si);
+      const pi = this.findStar(d.star), si = this.findStar(d.companion.star);
+      const kp = this.nearIndexOf(pi), ks = this.nearIndexOf(si);
+      const P = kp >= 0 ? list[kp] : undefined, S = ks >= 0 ? list[ks] : undefined;
       if (!P && !S) continue;
       const rel = this.companionOffset(d, pi, this.relScratch);
       const bary = this.starPos(pi, this.baryScratch);
@@ -198,14 +218,31 @@ export class LocalSky {
     }
     const views = this.nearViews;
     views.length = 0;
-    const hide: number[] = [];
-    let k = 0;
-    const add = (pos: THREE.Vector3, absMag: number, temp: number, radiusRsun: number, seed: number, weight: number) => {
+    const hide = this.hideList;
+    hide.length = 0;
+    this.viewCount = 0;
+    for (const e of list) {
+      hide.push(e.index);
+      const w = e.index === 0 ? this.sunWeight : 1;
+      if (w > 0.001) this.addView(e.pos, e.absMag, e.temperature, e.radiusRsun, e.index * 0.137, w);
+    }
+    for (const x of this.extras) if (x.weight > 0.001 && this.viewCount < 8) this.addView(x.pos, x.absMag, x.temperature, x.radiusRsun, x.seed, x.weight);
+    views.length = this.viewCount;
+    this.sky.hideStars(hide);
+  }
+
+  /** Append a resolved star as seen by the (moving) observer. */
+  private addView(pos: THREE.Vector3, absMag: number, temp: number, radiusRsun: number, seed: number, weight: number): void {
+    const views = this.nearViews;
+    const o = this.observer;
+    const k = this.viewCount;
+    {
       const rel = _v3.copy(pos).sub(o);
       const d = Math.max(rel.length(), 1e-14);
       const restDir = rel.divideScalar(d);
       let delta = 1;
-      const view = views[k] ?? (views[k] = { dir: new THREE.Vector3(), angularRadius: 0, temperature: 0, mag: 0, seed: 0 });
+      const view = this.viewPool[k] ?? (this.viewPool[k] = { dir: new THREE.Vector3(), angularRadius: 0, temperature: 0, mag: 0, seed: 0 });
+      views[k] = view;
       if (this.beta.lengthSq() > 1e-14) {
         delta = aberrateDirection(restDir, this.beta, view.dir);
         if (!this.flags.aberration) view.dir.copy(restDir);
@@ -221,16 +258,8 @@ export class LocalSky {
       view.temperature = T;
       view.angularRadius = Math.asin(Math.min(1, (radiusRsun * R_SUN_PC) / d)) / delta;
       view.seed = seed;
-      k++;
-    };
-    for (const e of list) {
-      hide.push(e.index);
-      const w = e.index === 0 ? this.sunWeight : 1;
-      if (w > 0.001) add(e.pos, e.absMag, e.temperature, e.radiusRsun, e.index * 0.137, w);
+      this.viewCount++;
     }
-    for (const x of this.extras) if (x.weight > 0.001 && k < 8) add(x.pos, x.absMag, x.temperature, x.radiusRsun, x.seed, x.weight);
-    views.length = k;
-    this.sky.hideStars(hide);
   }
 
   /** Stars bright enough to light the ship (flux-calibrated illuminance, see Starflight). */
@@ -246,7 +275,7 @@ export class LocalSky {
     }
     for (const v of this.nearViews) push(v.dir, 3.17 * Math.pow(10, -0.4 * (v.mag - 1)) * P_REF * P_REF * f, v.temperature);
     for (let i = 0; i < 7; i++) {
-      if (this.nearList.some((e) => e.index === i)) continue;
+      if (this.nearIndexOf(i) >= 0) continue;
       if (this.sky.apparent(i, this.app) && this.app.distance > 1e-9 && this.app.mag < -3) push(this.app.dir, 3.17 * Math.pow(10, -0.4 * (this.app.mag - 1)) * P_REF * P_REF * f, this.app.temperature);
     }
   }
@@ -258,14 +287,18 @@ export class LocalSky {
     const add = (i: number, boost = 0) => {
       if (k >= pool.length) return;
       if (!this.sky.apparent(i, this.app)) return;
-      const nv = this.nearList.findIndex((e) => e.index === i);
+      const nv = this.nearIndexOf(i);
       const dir = nv >= 0 && this.nearViews[nv] ? this.nearViews[nv].dir : this.app.dir;
       const mag = nv >= 0 && this.nearViews[nv] ? this.nearViews[nv].mag : this.app.mag;
       if (mag > 3.2 && boost === 0) return;
       const it = pool[k++];
       it.dir.copy(dir);
-      const inf = this.cat.info(i);
-      it.text = i === 0 ? 'Sun' : inf.proper || inf.designation || inf.name;
+      let text = this.labelNames.get(i);
+      if (text === undefined) {
+        const inf = this.cat.info(i);
+        this.labelNames.set(i, (text = i === 0 ? 'Sun' : inf.proper || inf.designation || inf.name));
+      }
+      it.text = text;
       const dly = this.app.distance / LY_PC;
       it.sub = dly < 0.05 ? `${formatNumber(this.app.distance / AU_PC, 2)} AU` : `${formatNumber(dly, dly < 10 ? 2 : 3)} ly`;
       it.priority = -mag + boost;

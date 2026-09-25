@@ -139,6 +139,10 @@ if the worker fails to construct, and `terminate()` in `unmount()`.
 5. **Type-check your files:** `npx tsc --noEmit -p . 2>&1 | grep -E "<your paths>"` must be empty
    (others may be mid-edit — ignore their errors).
 6. **Tests:** pure logic/physics in `tests/<module>.test.ts`; `npx vitest run tests/<module>.test.ts`.
+   Run vitest only from the repo root on files under `tests/` — never with `--root /` or on files
+   outside the repo (vitest then crawls the whole filesystem and exhausts memory for everyone).
+7. **Shared machine:** 4 CPUs, 16 GB RAM, shared by every engineer. Close headless browsers you
+   start, run one screenshot at a time, and don't leave background processes running.
 
 ## Verifying visually
 

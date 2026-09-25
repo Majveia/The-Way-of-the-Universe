@@ -17,7 +17,7 @@ import {
   photonOrbitRadius,
   radiativeEfficiency,
   relativeGamma,
-  shadowAngularWidth,
+  shadowAngularWidthSteps,
   staticTimeDilation,
   tidalAcceleration,
   zamoLapse,
@@ -39,6 +39,11 @@ import {
 
 const DEG = Math.PI / 180;
 const PC_M = 3.0857e16;
+/** Idle orbit: rad/s, after this many seconds without input. */
+const IDLE_ORBIT = 0.012;
+const IDLE_DELAY = 10;
+/** CPU time per frame given to the shadow-size readout's geodesics (ms). */
+const SHADOW_BUDGET_MS = 1.5;
 /** 95th-percentile disk luminance at the default view — the auto-exposure reference. */
 const REF_HIGHLIGHT = 0.68;
 
@@ -73,7 +78,12 @@ class Gargantua implements Experience {
   private wasInside = false;
   private shadowWidth = NaN;
   private shadowKey = '';
-  private shadowTimer = 0;
+  /** Shadow-size measurement in progress (one CPU geodesic per step, spread over frames). */
+  private shadowJob: Generator<void, number, void> | null = null;
+  /** Seconds since the last user input (drives the slow idle orbit). */
+  private idleTime = 0;
+  /** Spin to restore when leaving a look that sets its own (Interstellar). */
+  private spinBeforeLook: number | null = null;
   private readoutTimer = 0;
   private moodTimer = 0;
   private fovDeg = 32;
@@ -129,8 +139,7 @@ class Gargantua implements Experience {
       maxDistance: 2000,
       minPitch: -89 * DEG,
       maxPitch: 89 * DEG,
-      autoRotate: 0.012,
-      idleDelay: 10,
+      autoRotate: 0, // the slow idle orbit is driven in update(): our own input handlers reset it
       enablePan: false,
       damping: 0.25,
     });
@@ -202,7 +211,10 @@ class Gargantua implements Experience {
       step: 0.001,
       value: this.bh.params.spin,
       format: (x) => x.toFixed(3),
-      onChange: (x) => this.setParams({ spin: x }),
+      onChange: (x) => {
+        this.spinBeforeLook = null;
+        this.setParams({ spin: x });
+      },
       help: 'Kerr spin. 0.998 is Thorne’s limit for a hole spun up by its own disk.',
     });
     this.massInfo = hole.readout('Horizon · ISCO');
@@ -361,9 +373,19 @@ class Gargantua implements Experience {
     (this.controls.thick as Control<number> | undefined)?.set(this.bh.params.thickness);
     (this.controls.turb as Control<number> | undefined)?.set(this.bh.params.turbulence);
     (this.controls.outer as Control<number> | undefined)?.set(this.bh.params.diskOuter);
+    // A look with its own spin (Interstellar's a = 0.6) remembers the spin it replaced, and the
+    // next look without one gives it back.
+    let spin: number | null = null;
     if (l.spin !== undefined) {
-      this.bh.setParams({ spin: l.spin });
-      (this.controls.spin as Control<number> | undefined)?.set(l.spin);
+      if (this.spinBeforeLook === null) this.spinBeforeLook = this.bh.params.spin;
+      spin = l.spin;
+    } else if (this.spinBeforeLook !== null) {
+      spin = this.spinBeforeLook;
+      this.spinBeforeLook = null;
+    }
+    if (spin !== null) {
+      this.bh.setParams({ spin });
+      (this.controls.spin as Control<number> | undefined)?.set(spin);
       this.shadowKey = '';
     }
     this.updateStaticInfo();
@@ -410,6 +432,7 @@ class Gargantua implements Experience {
     const v = VIEWS[id];
     if (!v) return;
     this.cancelPlunge();
+    this.idle();
     this.view = id;
     this.viewButtons?.setActive((Object.keys(VIEWS) as ViewId[]).indexOf(id));
     const instant = seconds <= 0 || this.ctx.engine.shotMode;
@@ -462,7 +485,7 @@ class Gargantua implements Experience {
   }
 
   private idle(): void {
-    this.rig.idleDelay = 10;
+    this.idleTime = 0;
   }
 
   private onKey(e: KeyboardEvent): void {
@@ -648,6 +671,10 @@ class Gargantua implements Experience {
     const dt = f.dt;
     if (this.plunge) this.updatePlunge(dt);
     else {
+      // Slow idle orbit about the spin axis (≈ 0.7°/s) after 10 s without input. A pure turn about
+      // the spin axis keeps the ray geometry, so the renderer reuses its lens map meanwhile.
+      this.idleTime += dt;
+      if (this.idleTime > IDLE_DELAY && !this.rig.animating) this.rig.goal.yaw += IDLE_ORBIT * dt;
       this.rig.update(dt);
       this.lookYaw += (this.lookYawGoal - this.lookYaw) * (1 - Math.exp(-dt / 0.5));
     }
@@ -661,13 +688,14 @@ class Gargantua implements Experience {
     const target = this.baseExposure * auto;
     this.exposure = this.exposure < 0 || this.ctx.engine.shotMode ? target : this.exposure + (target - this.exposure) * (1 - Math.exp(-dt / 0.35));
     this.ctx.post.exposure = this.exposure;
-    this.bh.setParams({ time: this.time });
+    this.bh.setTime(this.time);
 
     this.readoutTimer -= dt;
     if (this.readoutTimer <= 0) {
       this.readoutTimer = 0.2;
       this.updateReadouts();
     }
+    this.stepShadow();
     this.moodTimer -= dt;
     if (this.moodTimer <= 0) {
       this.moodTimer = 1.5;
@@ -675,6 +703,21 @@ class Gargantua implements Experience {
       this.ctx.audio.setMood('blackhole', { intensity: Math.min(1, 0.35 + 3 / Math.max(r, 3)), mass: MASS_PRESETS[this.mass].mass });
     }
     if (++this.readyFrames === 2) this.ctx.signalReady();
+  }
+
+  /** Advance the shadow-size measurement within a small per-frame CPU budget. */
+  private stepShadow(): void {
+    const job = this.shadowJob;
+    if (!job) return;
+    const t0 = performance.now();
+    do {
+      const r = job.next();
+      if (r.done) {
+        this.shadowJob = null;
+        this.shadowWidth = r.value;
+        return;
+      }
+    } while (performance.now() - t0 < SHADOW_BUDGET_MS);
   }
 
   private updateReadouts(): void {
@@ -703,16 +746,20 @@ class Gargantua implements Experience {
     else this.rDil.set(formatNumber(zamoLapse(a, r, cosT), 4), '× (ergosphere, ZAMO)');
     const v = circularOrbitSpeed(a, r);
     this.rOrb.set(Number.isFinite(v) ? formatNumber(v, 3) : 'none', Number.isFinite(v) ? 'c circular' : 'inside photon orbit');
-    // The shadow's angular width from exact geodesics (recomputed when the view changes).
+    // The shadow's angular width from exact geodesics, re-measured when the view changes (the
+    // bisection's ~30 CPU geodesics are spread over frames by stepShadow()).
     const key = `${a.toFixed(3)}|${r.toPrecision(3)}|${cosT.toFixed(2)}|${this.bh.params.lensing}`;
-    this.shadowTimer -= 0.2;
-    if (key !== this.shadowKey && this.shadowTimer <= 0) {
+    if (key !== this.shadowKey) {
       this.shadowKey = key;
-      this.shadowTimer = 0.6;
-      this.shadowWidth = this.bh.params.lensing ? shadowAngularWidth(a, pos, 16) : 2 * Math.asin(Math.min(1, horizonRadius(a) / r));
+      if (this.bh.params.lensing) this.shadowJob = shadowAngularWidthSteps(a, [pos[0], pos[1], pos[2]], 14);
+      else {
+        this.shadowJob = null;
+        this.shadowWidth = 2 * Math.asin(Math.min(1, horizonRadius(a) / r));
+      }
     }
     const w = this.shadowWidth / DEG;
-    this.rShadow.set(w >= 1 ? formatNumber(w, 3) : formatNumber(w * 60, 3), w >= 1 ? '° across' : '′ across');
+    if (Number.isFinite(w)) this.rShadow.set(w >= 1 ? formatNumber(w, 3) : formatNumber(w * 60, 3), w >= 1 ? '° across' : '′ across');
+    else this.rShadow.set('…', '');
   }
 
   render(target: THREE.WebGLRenderTarget): void {

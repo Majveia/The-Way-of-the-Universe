@@ -15,7 +15,8 @@ import { cosmicSFRD, r200c, stellarMass, v200 } from '../src/physics/cosmosGalax
 import { Cosmology } from '../src/physics/cosmology';
 import { Rng } from '../src/physics/random';
 import { Simulation, buildSchedule, makeExpansion } from '../src/worlds/cosmicweb/Simulation';
-import { SnapshotStore } from '../src/worlds/cosmicweb/SnapshotStore';
+import { KeyframeEncoder, SnapshotStore } from '../src/worlds/cosmicweb/SnapshotStore';
+import { accumScaleFor, accumSpec, atlasSpec, chooseFormats, fallbackAccum, fallbackAtlas, type AccumMode, type AtlasMode } from '../src/worlds/cosmicweb/formats';
 import { PLANCK_COSMO, type Keyframe, type SimConfig, type WorkerMessage } from '../src/worlds/cosmicweb/types';
 import { CosmicTimeline } from '../src/experiences/cosmos/timeline';
 import { projectHalos } from '../src/worlds/cosmicweb/webCache';
@@ -484,5 +485,318 @@ describe('Cosmic timeline', () => {
     expect(tl.tOfU(tl.uToday)).toBeCloseTo(e.tToday, 6);
     expect(tl.epochAt(e.timeOfA(1 / 1301)).id).toBe('plasma');
     expect(tl.epochAt(e.tToday).id).toBe('today');
+  });
+});
+
+// ————————————————————————————————————————————————————————————————————————————————
+// Review audit (second reviewer): analytic checks that pin signs, factors and conventions that
+// the statistical tests above cannot see (an overall sign flip of Ψ leaves every rms, P(k) and
+// growth test green while turning voids into clusters relative to the Lagrangian peaks).
+// ————————————————————————————————————————————————————————————————————————————————
+
+/** Two crossed plane waves δ(q) = A[cos(k qx) + cos(k qy)] on an n³ mesh (DFT convention of GaussianField). */
+function crossedWaves(n: number, box: number, A: number): GaussianField {
+  const field = new GaussianField({ n, box, seed: 1, power: () => 0 });
+  const nzc = field.nzc;
+  const at = (ix: number, iy: number) => (((ix + n) % n) * n + ((iy + n) % n)) * nzc;
+  const c = (A / 2) * n * n * n; // cos → (A/2)(e^{ikq} + e^{−ikq}), unnormalised forward DFT
+  for (const [ix, iy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) field.re[at(ix, iy)] = c;
+  return field;
+}
+
+describe('Review: Lagrangian perturbation theory against analytic solutions', () => {
+  it('Zel’dovich and 2LPT displacements of two crossed plane waves match the closed form (sign and size)', () => {
+    // Ψ1 = −∇φ1, ∇²φ1 = δ  →  Ψ1 = −(A/k)(sin k qx, sin k qy, 0): particles converge on the crests.
+    // ∇²φ2 = Σ_{i<j}(φ,ii φ,jj − φ,ij²) = A² cos(k qx) cos(k qy)  →  Ψ2 = ∇φ2 = (A²/2k)(sin kqx cos kqy, cos kqx sin kqy, 0)
+    // (Scoccimarro 1998; Crocce, Pueblas & Scoccimarro 2006, eqs. 3–5, used with D2 ≈ −3/7 D1²).
+    const n = 16, box = 100, A = 0.3;
+    const d = lptDisplacements(crossedWaves(n, box, A), n, { smoothing: 5 });
+    const k = (2 * Math.PI) / box, cell = box / n;
+    let e1 = 0, e2 = 0, m1 = 0, m2 = 0, eL = 0, mL = 0;
+    let p = 0;
+    for (let i = 0; i < n; i++)
+      for (let j = 0; j < n; j++)
+        for (let l = 0; l < n; l++, p++) {
+          const qx = (i + 0.5) * cell, qy = (j + 0.5) * cell;
+          const psi1 = [-(A / k) * Math.sin(k * qx), -(A / k) * Math.sin(k * qy), 0];
+          const psi2 = [((A * A) / (2 * k)) * Math.sin(k * qx) * Math.cos(k * qy), ((A * A) / (2 * k)) * Math.cos(k * qx) * Math.sin(k * qy), 0];
+          for (let c = 0; c < 3; c++) {
+            e1 = Math.max(e1, Math.abs(d.psi1[3 * p + c] - psi1[c]));
+            e2 = Math.max(e2, Math.abs(d.psi2[3 * p + c] - psi2[c]));
+            m1 = Math.max(m1, Math.abs(psi1[c]));
+            m2 = Math.max(m2, Math.abs(psi2[c]));
+          }
+          // The Lagrangian overdensity that lights the first galaxies is the same field, smoothed (not sign-flipped).
+          const dl = A * Math.exp(-0.5 * k * k * 25) * (Math.cos(k * qx) + Math.cos(k * qy));
+          eL = Math.max(eL, Math.abs(d.deltaL[p] - dl));
+          mL = Math.max(mL, Math.abs(dl));
+        }
+    expect(e1 / m1).toBeLessThan(1e-5);
+    expect(e2 / m2).toBeLessThan(1e-5);
+    expect(eL / mL).toBeLessThan(1e-5);
+  });
+
+  it('a 1D plane wave evolved by PM + FastPM follows the exact Zel’dovich solution x = q + D(a)Ψ to today', () => {
+    // Before shell crossing a single plane wave is solved exactly by the Zel'dovich approximation, so
+    // the whole chain — initial momenta p = a ȧ f D Ψ, CIC deposit, Poisson solve with the (3/2)Ωm/a
+    // force factor folded into the FastPM kick, KDK with leapfrog fusion — must reproduce D(a) growth.
+    const e = makeExpansion(PLANCK_COSMO);
+    const n = 32, N = n * n * n;
+    const kq = (2 * Math.PI) / n; // fundamental mode, cell units
+    const A = 0.45; // D·A = 0.45 today: well before shell crossing (D·A = 1)
+    const cfg = { aInit: 0.02, aFuture: 1.05, stepsEarly: 6, stepsMain: 24, stepsFuture: 1, stepsCollapse: 4, keyEvery: 1 } as SimConfig;
+    const s = buildSchedule(e, cfg);
+    const t0 = s.t[0];
+    const D0 = e.DAt(t0), p0 = e.aAt(t0) * e.adotAt(t0) * e.fAt(t0) * D0;
+    const pos = new Float32Array(3 * N), mom = new Float32Array(3 * N), psi = new Float32Array(N);
+    let p = 0;
+    for (let i = 0; i < n; i++)
+      for (let j = 0; j < n; j++)
+        for (let l = 0; l < n; l++, p++) {
+          const q = i + 0.5;
+          psi[p] = -(A / kq) * Math.sin(kq * q);
+          pos[3 * p] = q + D0 * psi[p];
+          pos[3 * p + 1] = j + 0.5;
+          pos[3 * p + 2] = l + 0.5;
+          mom[3 * p] = p0 * psi[p];
+        }
+    const pm = new ParticleMesh(n, { deconvolve: 2 });
+    pm.deposit(pos, N);
+    pm.solve();
+    let pending = 0;
+    for (let i = 0; i < s.today; i++) {
+      const ta = s.t[i], tb = s.t[i + 1], th = s.half[i];
+      pm.kick(pos, mom, N, pending + fastpmKick(e, ta, th, ta));
+      pm.drift(pos, mom, N, fastpmDrift(e, ta, tb, th));
+      pm.deposit(pos, N);
+      pm.solve();
+      pending = fastpmKick(e, th, tb, tb);
+    }
+    pm.kick(pos, mom, N, pending);
+    // Fit the measured displacement to D·Ψ at a = 1 (D = 1), and the momenta to G_p(today)·Ψ.
+    let num = 0, den = 0, pnum = 0;
+    for (let q = 0; q < N; q++) {
+      const i = Math.floor(q / (n * n));
+      let dx = pos[3 * q] - (i + 0.5);
+      dx -= n * Math.round(dx / n);
+      num += dx * psi[q];
+      pnum += mom[3 * q] * psi[q];
+      den += psi[q] * psi[q];
+    }
+    const growth = num / den;
+    expect(s.a[s.today]).toBeCloseTo(1, 10);
+    // Measured: 0.05 % and 0.07 % (32³, 30 steps).
+    expect(rel(growth, e.DAt(s.t[s.today]))).toBeLessThan(0.005);
+    expect(rel(pnum / den, e.Gp(s.t[s.today]))).toBeLessThan(0.005);
+  });
+
+  it('the Poisson force stays accurate at short wavelength with CIC deconvolution + gradient compensation', () => {
+    // λ = 8 cells: uncompensated CIC (sinc⁴) and the 4-point stencil would lose ≈ 11 % of the force.
+    const n = 32, N = n ** 3, A = 0.02, kx = (2 * Math.PI) / 8;
+    const pm = new ParticleMesh(n, { deconvolve: 2 });
+    const pos = new Float32Array(3 * N);
+    let p = 0;
+    for (let i = 0; i < n; i++)
+      for (let j = 0; j < n; j++)
+        for (let k = 0; k < n; k++, p++) {
+          const q = i + 0.5;
+          pos[3 * p] = q + A * Math.sin(kx * q);
+          pos[3 * p + 1] = j + 0.5;
+          pos[3 * p + 2] = k + 0.5;
+        }
+    pm.deposit(pos, N);
+    pm.solve();
+    const mom = new Float32Array(3 * N);
+    pm.kick(pos, mom, N, 1);
+    let dot = 0, nn = 0;
+    for (let q = 0; q < N; q++) {
+      const expected = A * Math.sin(kx * (Math.floor(q / (n * n)) + 0.5));
+      dot += mom[3 * q] * expected;
+      nn += expected * expected;
+    }
+    expect(rel(dot / nn, 1)).toBeLessThan(0.015); // measured 0.2 %
+  });
+});
+
+describe('Review: expansion history against closed forms', () => {
+  it('flat ΛCDM without radiation: age, onset of acceleration and the Heath growth integral', () => {
+    // t0 H0 = 2/(3√ΩΛ) asinh√(ΩΛ/Ωm);  ä = 0 at a = (Ωm/2ΩΛ)^{1/3};  D ∝ H ∫₀ᵃ da'/(a'H)³ (Heath 1977).
+    for (const Om of [0.1, 0.3, 0.6]) {
+      const Ol = 1 - Om;
+      const e = new Expansion({ H0: 70, Om0: Om, Ode0: Ol, Or0: 0 });
+      const age = (2 / (3 * Math.sqrt(Ol))) * Math.asinh(Math.sqrt(Ol / Om));
+      expect(rel(e.tToday, age)).toBeLessThan(1e-6);
+      const aAcc = Math.cbrt(Om / (2 * Ol));
+      expect(rel(e.aAt(e.tAccel), aAcc)).toBeLessThan(1e-4);
+      const H = (a: number) => Math.sqrt(Om / a ** 3 + Ol);
+      const heath = (a: number) => {
+        let s = 0;
+        const m = 20000;
+        for (let i = 1; i <= m; i++) {
+          const x = (a * (i - 0.5)) / m;
+          s += 1 / (x * H(x)) ** 3;
+        }
+        return (H(a) * s * a) / m;
+      };
+      for (const a of [0.1, 0.5, 2]) {
+        expect(rel(e.DAt(e.timeOfA(a)), heath(a) / heath(1))).toBeLessThan(1e-5);
+      }
+    }
+  });
+
+  it('radiation is included: matter–radiation equality at the Planck value', () => {
+    const e = makeExpansion(PLANCK_COSMO);
+    const zeq = e.Om0 / e.Or0 - 1;
+    // Planck 2018 (TT,TE,EE+lowE+lensing): z_eq = 3387 ± 21.
+    expect(zeq).toBeGreaterThan(3360);
+    expect(zeq).toBeLessThan(3410);
+  });
+});
+
+describe('Review: the smooth shape of the Eisenstein & Hu transfer function', () => {
+  it('the full fit oscillates about the independent no-wiggle fit and agrees with it off the BAO scales', () => {
+    // EH98 §4.2: the no-wiggle form reproduces the non-oscillatory part of the full fit. Errors in
+    // α_c, β_c, the Silk scale or the node shift show up as a tilt of the ratio, not only in the wiggles.
+    const eh = new EisensteinHu({ h: 0.6766, Om0: 0.30966, Ob0: 0.04897 });
+    const h = 0.6766;
+    for (const k of [0.002, 0.005, 0.01]) expect(Math.abs(eh.transfer(k * h) / eh.transferNoWiggle(k * h) - 1)).toBeLessThan(0.01);
+    for (const k of [1, 3, 10]) expect(Math.abs(eh.transfer(k * h) / eh.transferNoWiggle(k * h) - 1)).toBeLessThan(0.03);
+    // Mean over the BAO range stays within 2 %.
+    let s = 0, c = 0;
+    for (let lk = Math.log(0.03); lk < Math.log(0.4); lk += 0.01) {
+      s += eh.transfer(Math.exp(lk) * h) / eh.transferNoWiggle(Math.exp(lk) * h);
+      c++;
+    }
+    expect(Math.abs(s / c - 1)).toBeLessThan(0.02);
+    // Sound horizon: the full expression (eq. 6) and the fit (eq. 26) agree to ~1 %.
+    expect(rel(eh.s, (44.5 * Math.log(9.83 / eh.om)) / Math.sqrt(1 + 10 * eh.ob ** 0.75))).toBeLessThan(0.015);
+  });
+});
+
+describe('Review: portable render-target formats', () => {
+  const FLOAT = 1015, HALF = 1016, LINEAR = 1006;
+  const all = [true, false];
+  it('never needs float32 filtering or float32 blending that the device lacks', () => {
+    for (const colorBufferFloat of all)
+      for (const colorBufferHalfFloat of all)
+        for (const floatBlend of all) {
+          const f = chooseFormats({ colorBufferFloat, colorBufferHalfFloat, floatBlend });
+          // The accumulator is sampled with LINEAR filtering (upsampled): never float32 (OES_texture_float_linear
+          // is missing on iOS and many Android GPUs, where such a texture samples as black).
+          const a = accumSpec(f.accum);
+          expect(a.type).not.toBe(FLOAT);
+          if (a.filter === LINEAR) expect(a.type === HALF || a.type === 1009).toBe(true);
+          // Float32 atlas only where float32 blending exists; float formats only with a colour-buffer extension.
+          const t = atlasSpec(f.atlas);
+          if (t.type === FLOAT) expect(floatBlend && colorBufferFloat).toBe(true);
+          if (t.type === HALF || a.type === HALF) expect(colorBufferFloat || colorBufferHalfFloat).toBe(true);
+        }
+  });
+
+  it('fallback chains always end in a plain 8-bit target (never black)', () => {
+    for (const start of ['rg16f', 'rgba16f', 'rgba8'] as AccumMode[]) {
+      let m: AccumMode | null = start, last: AccumMode = start;
+      for (let i = 0; m && i < 5; i++) {
+        last = m;
+        m = fallbackAccum(m);
+      }
+      expect(last).toBe('rgba8');
+    }
+    for (const start of ['r32f', 'r16f', 'rgba16f', 'rgba8'] as AtlasMode[]) {
+      let m: AtlasMode | null = start, last: AtlasMode = start;
+      for (let i = 0; m && i < 6; i++) {
+        last = m;
+        m = fallbackAtlas(m);
+      }
+      expect(last).toBe('rgba8');
+    }
+    // 8-bit encodings keep sums inside [0, 1] for the ranges they document.
+    expect(accumSpec('rgba8').encode * 4).toBeCloseTo(1, 12);
+    expect(atlasSpec('rgba8').encode * 32).toBeCloseTo(1, 12);
+  });
+
+  it('the light accumulator stays at ≤ 1 pixel per CSS pixel, within a per-tier budget', () => {
+    expect(accumScaleFor(1, 1)).toBe(1);
+    expect(accumScaleFor(1, 2)).toBe(0.5);
+    expect(accumScaleFor(0.7, 1.5)).toBeCloseTo(0.85 / 1.5, 12);
+    expect(accumScaleFor(0.35, 1)).toBe(0.7);
+    // Dynamic resolution below one device pixel per CSS pixel is followed, not undone.
+    expect(accumScaleFor(1, 0.6)).toBe(1);
+    // Budgets: high ≤ 1.3 Mpx at 1080p; a DPR-2 2560×1600 laptop lands at one pixel per CSS pixel.
+    const s1080 = accumScaleFor(1, 1, 1920 * 1080);
+    expect(1920 * 1080 * s1080 * s1080).toBeLessThanOrEqual(1.3e6 + 1);
+    expect(accumScaleFor(1, 2, 2560 * 1600)).toBe(0.5);
+    // Low tier at 720p keeps its historical 0.7 scale; every tier costs less than the one above it.
+    expect(accumScaleFor(0.35, 1, 1280 * 720)).toBe(0.7);
+    const px = (d: number) => 1920 * 1080 * accumScaleFor(d, 1, 1920 * 1080) ** 2;
+    expect(px(0.35)).toBeLessThan(px(0.7));
+    expect(px(0.7)).toBeLessThan(px(1));
+    // Inside the box: half the linear resolution.
+    expect(accumScaleFor(1, 1, 1920 * 1080, true)).toBeCloseTo(0.5 * s1080, 12);
+  });
+});
+
+describe('Review: keyframes encoded off the main thread', () => {
+  const makeFrames = (count: number, frames: number, seed: number) => {
+    const rnd = mulberry32(seed);
+    const out: Uint16Array[] = [];
+    let cur = new Uint16Array(3 * count);
+    for (let i = 0; i < cur.length; i++) cur[i] = Math.floor(rnd() * 65536);
+    for (let f = 0; f < frames; f++) {
+      const next = new Uint16Array(cur.length);
+      for (let i = 0; i < cur.length; i++) {
+        const jump = rnd() < 0.01 ? 5000 : 300;
+        next[i] = (cur[i] + Math.round((rnd() - 0.5) * jump) + 65536) & 0xffff;
+      }
+      cur = next;
+      out.push(cur.slice());
+    }
+    return out;
+  };
+  const kf = (f: number, extra: Partial<Keyframe>): Keyframe =>
+    ({ index: f, step: f, t: f, a: 1, D: 1, positions: null, halos: null as never, galaxies: null as never, pk: null, stats: null as never, ...extra }) as Keyframe;
+
+  it('worker-encoded frames decode exactly like frames encoded by the store itself', () => {
+    const count = 400;
+    const truth = makeFrames(count, 19, 21);
+    const enc = new KeyframeEncoder();
+    const a = new SnapshotStore(count), b = new SnapshotStore(count);
+    truth.forEach((p, f) => {
+      a.add(kf(f, { enc: enc.encode(p.slice()) }));
+      b.add(kf(f, { positions: p.slice() }));
+    });
+    expect(a.bytes).toBe(b.bytes);
+    for (const f of [0, 5, 7, 8, 12, 18]) {
+      const da = a.positions(f), db = b.positions(f);
+      expect(Array.from(da)).toEqual(Array.from(db));
+      let err = 0;
+      for (let i = 0; i < da.length; i++) {
+        let e = Math.abs(da[i] - truth[f][i]);
+        e = Math.min(e, 65536 - e);
+        err = Math.max(err, e);
+      }
+      expect(err).toBeLessThanOrEqual(4);
+    }
+  });
+
+  it('prefetch decodes the next keyframe in slices, identical to a direct decode', () => {
+    const count = 300;
+    const truth = makeFrames(count, 12, 5);
+    const s = new SnapshotStore(count), ref = new SnapshotStore(count);
+    truth.forEach((p, f) => {
+      s.add(kf(f, { positions: p.slice() }));
+      ref.add(kf(f, { positions: p.slice() }));
+    });
+    // Without the previous frame decoded there is nothing to build on.
+    expect(s.prefetch(3, 100)).toBe(false);
+    s.positions(2);
+    let calls = 0;
+    while (!s.prefetch(3, 100)) calls++;
+    expect(calls).toBeGreaterThanOrEqual(8); // 900 values in slices of 100
+    expect(s.isDecoded(3)).toBe(true);
+    expect(Array.from(s.positions(3))).toEqual(Array.from(ref.positions(3)));
+    // I-frames (every 8th keyframe) are ready at once.
+    expect(s.prefetch(8, 1)).toBe(true);
+    expect(Array.from(s.positions(8))).toEqual(Array.from(ref.positions(8)));
   });
 });

@@ -5,6 +5,7 @@ import type { Experience, ExperienceContext, ExperienceDef } from '../core/types
 import { AudioBus } from '../audio/AudioBus';
 import { UI, type UIScope } from '../ui/UI';
 import { DEFAULT_EXPERIENCE, EXPERIENCES } from '../experiences';
+import { BenchOverlay, runBenchmark, saveReport, type BenchReport } from './Bench';
 
 interface Mounted {
   def: ExperienceDef;
@@ -23,6 +24,8 @@ interface DebugHandle {
   experience: Experience | null;
   errors: string[];
   app: App;
+  /** Last benchmark report (see Bench.ts). */
+  bench?: BenchReport;
 }
 
 declare global {
@@ -42,6 +45,7 @@ export class App {
   private nav = 0;
   private fade: { from: number; to: number; t: number; dur: number; done: () => void } | null = null;
   private debug: DebugHandle;
+  private benchRunning = false;
 
   constructor(canvas: HTMLCanvasElement, uiRoot: HTMLElement) {
     const shot = this.params.has('shot');
@@ -56,6 +60,10 @@ export class App {
       sound: this.audio,
       stats: () => ({ fps: this.engine.fps, tier: this.engine.quality.tier, scale: this.engine.renderScale, width: this.engine.width, height: this.engine.height }),
     });
+    this.ui.registerCommands([
+      { label: 'Benchmark this device', group: 'Tools', keywords: 'performance fps gpu speed test benchmark', run: () => void this.runBench() },
+    ]);
+    this.ui.addMenuAction('Benchmark this device', () => void this.runBench());
     if (this.params.has('noui')) uiRoot.style.display = 'none';
     if (shot) this.ui.neverIdle = true;
     this.debug = { frames: 0, framesSinceReady: 0, ready: false, fps: 0, experienceId: null, experience: null, errors: [], app: this };
@@ -84,9 +92,51 @@ export class App {
     const first = this.hashId();
     // First load with no hash: the title sequence plays over the prelude sky, then the menu.
     const intro = !location.hash.replace(/^#/, '') && !this.engine.shotMode ? this.ui.playIntro() : Promise.resolve(false);
+    const bench = location.hash === '#bench' || this.params.has('bench');
     void Promise.all([this.go(first), intro]).then(([, played]) => {
+      if (bench) {
+        const quick = this.params.get('bench') === 'quick';
+        void this.runBench(quick ? { warmupMs: 300, measureMs: 900 } : {});
+        return;
+      }
       if (first === DEFAULT_EXPERIENCE && !this.engine.shotMode && this.debug.experienceId === DEFAULT_EXPERIENCE) setTimeout(() => this.ui.openMenu(), played ? 200 : 1600);
     });
+  }
+
+  /** Visit every world, measure it, show and save the report. */
+  async runBench(o: { warmupMs?: number; measureMs?: number } = {}): Promise<BenchReport | null> {
+    if (this.benchRunning) return null;
+    this.benchRunning = true;
+    this.ui.closeMenu();
+    const overlay = new BenchOverlay(this.ui.root);
+    overlay.onRerun = () => {
+      overlay.close();
+      void this.runBench(o);
+    };
+    try {
+      const report = await runBenchmark(
+        {
+          engine: this.engine,
+          // Dev: ?benchWorlds=solar,gargantua restricts the run.
+          worlds: EXPERIENCES.filter((e) => !e.hidden && (!this.params.get('benchWorlds') || this.params.get('benchWorlds')!.split(',').includes(e.id))),
+          go: (id) => this.go(id),
+          isReady: () => this.debug.ready,
+          currentId: () => this.debug.experienceId,
+          errors: () => this.debug.errors,
+        },
+        { ...o, onProgress: (i, n, title) => overlay.progress(i, n, title) },
+      );
+      this.debug.bench = report;
+      const saved = await saveReport(report);
+      overlay.show(report, saved);
+      return report;
+    } catch (e) {
+      overlay.close();
+      this.ui.error('The benchmark stopped', e instanceof Error ? e.message : String(e));
+      return null;
+    } finally {
+      this.benchRunning = false;
+    }
   }
 
   private fadeTo(to: number, dur: number): Promise<void> {

@@ -3,7 +3,7 @@ import type { Experience, ExperienceContext, FrameInfo } from '../../core/types'
 import type { Control } from '../../ui/Panel';
 import type { Readout } from '../../ui/UI';
 import { Sky } from '../../worlds/sky/Sky';
-import { createPlanet, planetSpec, type PlanetRenderer } from '../../worlds/planet';
+import { createPlanet, planetSpec, type PlanetRenderer, type PlanetUpdate } from '../../worlds/planet';
 import { createStar, type StarRenderer } from '../../worlds/star';
 import { gmst, meanObliquity, solarElevation, moonState, msToJD, radecToVector, sunState, VOYAGER1_PALE_BLUE_DOT } from '../../physics/planets-ephemeris';
 import { astroToThree } from '../../physics/kepler';
@@ -11,7 +11,7 @@ import { formatDistance, formatNumber } from '../../physics/units';
 import { EarthCamera, meanMotion, type OrbitFraming } from './camera';
 import { GALLERY, phaseFor, type GalleryWorld, type Lighting } from './gallery';
 import { Sunbeam } from './sunbeam';
-import { AU_RE, R_EARTH_KM, fovForDistance, pbdProgress, smooth, voyagerGeocentricAU } from './math';
+import { AU_RE, R_EARTH_KM, fovForDistance, moonOrientation, pbdProgress, smooth, voyagerGeocentricAU } from './math';
 import { SunGlare } from './glare';
 
 /**
@@ -58,6 +58,14 @@ const NIGHT_REGIONS = [
   { name: 'South America', lat: -20, lon: -47, weight: 0.6 },
 ];
 const WARPS = [1, 10, 60, 600, 3600, 21600, 86400];
+
+interface DepthLayer {
+  scene: THREE.Scene;
+  centre: THREE.Vector3;
+  radius: number;
+  dist: number;
+}
+const farToNear = (a: DepthLayer, b: DepthLayer) => b.dist - a.dist;
 
 const fmt2 = (n: number) => String(n).padStart(2, '0');
 function utcString(ms: number): string {
@@ -142,19 +150,30 @@ class EarthExperience implements Experience {
   private gallerySection: HTMLElement | null = null;
   private lightButtons: { setActive(i: number): void } | null = null;
   private label: HTMLDivElement | null = null;
+  private readonly labelState = { on: false, x: NaN, y: NaN };
+  private readonly planetUpdate: PlanetUpdate = { time: 0, sunPosition: this.sunPos, camera: new THREE.PerspectiveCamera() };
+  private readonly galleryUpdate: PlanetUpdate = { time: 0, sunPosition: this.gSun, camera: new THREE.PerspectiveCamera() };
+  private readonly starUpdate: { time: number; camera: THREE.Camera } = { time: 0, camera: new THREE.PerspectiveCamera() };
   private uiClock = 0;
 
   // Scratch.
   private readonly tmp = new THREE.Vector3();
   private readonly tmp2 = new THREE.Vector3();
-  private readonly tmp3 = new THREE.Vector3();
   /** Lunar eclipses: sunlight refracted through the Earth's atmosphere reddens the umbra. */
   private readonly earthOccluders = [{ position: this.moonPos, radius: MOON_R }];
   private readonly noOccluders: Array<{ position: THREE.Vector3; radius: number }> = [];
   private readonly moonOccluders = [{ position: new THREE.Vector3(), radius: 1.012, umbraLight: new THREE.Color(0.012, 0.0035, 0.0009) }];
-  private readonly m4 = new THREE.Matrix4();
   private readonly astro = { x: 0, y: 0, z: 0 };
-  private readonly bodies: Array<{ scene: THREE.Scene; centre: THREE.Vector3; radius: number; dist: number }> = [];
+  private readonly bodies: DepthLayer[] = [];
+  /** Depth layers reused every frame: Sun, Moon, Earth (1.075 R⊕ encloses the aurora shell), gallery. */
+  private readonly layerSlots: [DepthLayer, DepthLayer, DepthLayer, DepthLayer] = [
+    { scene: this.sunScene, centre: this.sunPos, radius: SUN_R * 6.5, dist: 0 },
+    { scene: this.moonScene, centre: this.moonPos, radius: MOON_R * 1.01, dist: 0 },
+    { scene: this.earthScene, centre: this.origin, radius: 1.075, dist: 0 },
+    { scene: this.galleryScene, centre: this.origin, radius: 1.2, dist: 0 },
+  ];
+  /** UTC start of the simulated year (cached: recomputed only when the year changes). */
+  private yearStart = { year: -1, ms: 0 };
 
   // ——— Debug hooks (also used by the UI) ———
 
@@ -344,7 +363,9 @@ class EarthExperience implements Experience {
     const detail = ctx.quality.detail;
     this.computeEphemeris();
 
-    this.sky = new Sky({ frame: 'equatorial', stars: Math.round(20000 * detail), milkyWay: 0.35, brightness: 0.9 });
+    // The Milky Way stays faint: at the Earth's daylight exposure it would be invisible, and brighter it
+    // reads as a grey-brown haze on an OLED black (docs/VISION.md). Its cube bake scales with the tier.
+    this.sky = new Sky({ frame: 'equatorial', stars: Math.round(20000 * detail), milkyWay: 0.22, brightness: 0.9, bandResolution: detail >= 0.9 ? 1024 : 512 });
     this.earth = createPlanet(planetSpec('earth', 1, { detail }));
     this.moon = createPlanet(planetSpec('moon', MOON_R, { detail }));
     this.sun = createStar({ seed: 3, temperatureK: 5772, radius: SUN_R, intensity: SUN_INTENSITY, activity: 0.6, detail });
@@ -401,20 +422,14 @@ class EarthExperience implements Experience {
     this.computeEphemeris();
     const jd = msToJD(this.simMs);
     // Shader time: seconds since the start of the year (keeps float32 animation phases precise).
-    const yearStart = Date.UTC(new Date(this.simMs).getUTCFullYear(), 0, 1);
-    const tShader = (this.simMs - yearStart) / 1000;
+    const tShader = (this.simMs - this.yearStartMs()) / 1000;
 
     // Earth: sidereal rotation, seasonal imagery, the Moon's shadow.
     this.earth.setRotation(gmst(jd));
     this.earth.setDate(this.simMs);
     this.earth.setOccluders(this.layers.moon ? this.earthOccluders : this.noOccluders);
     // Moon: tidally locked (prime meridian toward the Earth), pole ≈ ecliptic north.
-    const eps = meanObliquity(jd);
-    const y = this.tmp.set(0, Math.cos(eps), Math.sin(eps));
-    const x = this.tmp2.copy(this.moonPos).negate().normalize();
-    x.addScaledVector(y, -x.dot(y)).normalize();
-    const z = this.tmp3.crossVectors(x, y);
-    this.moon.object.quaternion.setFromRotationMatrix(this.m4.makeBasis(x, y, z));
+    moonOrientation(this.moonPos, meanObliquity(jd), this.moon.object.quaternion);
     this.moon.object.position.copy(this.moonPos);
     this.moon.object.visible = this.layers.moon;
     // Lunar eclipses: sunlight refracted through the Earth's atmosphere reddens the umbra.
@@ -428,26 +443,33 @@ class EarthExperience implements Experience {
     this.cam.update(f.dt, this.world ? 0 : simDt);
     this.cam.apply(this.aspect);
     const camera = this.cam.camera;
-    const r = this.ctx.renderer;
-    this.earth.update({ time: tShader, sunPosition: this.sunPos, camera, sunAngularRadius: this.sunAng, renderer: r });
-    this.moon.update({ time: tShader, sunPosition: this.sunPos, camera, sunAngularRadius: this.sunAng, renderer: r });
-    this.sun.update({ time: tShader, camera });
+    // Reused update records (no per-frame garbage).
+    const pu = this.planetUpdate;
+    pu.time = tShader;
+    pu.camera = camera;
+    pu.sunAngularRadius = this.sunAng;
+    pu.renderer = this.ctx.renderer;
+    this.earth.update(pu);
+    this.moon.update(pu);
+    const su = this.starUpdate;
+    su.time = tShader;
+    su.camera = camera;
+    this.sun.update(su);
     if (this.gPlanet) {
       this.gPlanet.setRotation(this.gSpin);
-      this.gPlanet.update({ time: tShader, sunPosition: this.gSun, camera, renderer: r });
+      const gu = this.galleryUpdate;
+      gu.time = tShader;
+      gu.camera = camera;
+      gu.renderer = this.ctx.renderer;
+      this.gPlanet.update(gu);
     }
     if (this.gStar) {
       this.gStar.object.rotation.y = this.gSpin;
-      this.gStar.update({ time: tShader, camera });
+      this.gStar.update(su);
     }
 
-    // Pale Blue Dot: exposure and the lens flare follow the distance.
+    // Pale Blue Dot: exposure follows the distance (the glare and stray light are drawn in render()).
     if (!this.world) {
-      // Veiling glare of the Sun, hidden when the Earth (or Moon) covers the disk.
-      this.glareOcc[1].c.copy(this.moonPos);
-      this.glareOcc[1].r = this.layers.moon ? MOON_R : 0;
-      const vis = SunGlare.visibility(camera.position, this.sunPos, SUN_R, this.glareOcc, this.tmp);
-      this.glare.render(r, camera, this.sunPos, (vis * 2.5) / this.ctx.post.exposure);
       const t = pbdProgress(this.cam.altitudeRadius);
       const boost = Math.exp(Math.log(PBD_EXPOSURE) * smooth(0.45, 1, t));
       this.ctx.post.exposure = this.exposureBase * boost;
@@ -459,6 +481,18 @@ class EarthExperience implements Experience {
   }
 
   private aspect = 16 / 9;
+
+  /** UTC ms of 1 January of the simulated year (no Date allocation unless the year changed). */
+  private yearStartMs(): number {
+    const ys = this.yearStart;
+    // A year is 365–366 days: only re-derive the year near or past the cached bounds.
+    if (ys.year < 0 || this.simMs < ys.ms || this.simMs >= ys.ms + 365 * 86_400_000) {
+      const y = new Date(this.simMs).getUTCFullYear();
+      ys.year = y;
+      ys.ms = Date.UTC(y, 0, 1);
+    }
+    return ys.ms;
+  }
 
   resize(w: number, h: number): void {
     this.aspect = w / Math.max(1, h);
@@ -475,16 +509,23 @@ class EarthExperience implements Experience {
     camera.updateProjectionMatrix();
     this.sky.render(r, camera, this.ctx.engine.pixelRatio);
 
+    // Depth layers, far to near (entries preallocated: no per-frame garbage).
     const list = this.bodies;
     list.length = 0;
+    const [lSun, lMoon, lEarth, lGallery] = this.layerSlots;
     if (this.world) {
-      const ext = this.gPlanet?.spec.rings ? this.gPlanet.spec.rings.outer * 1.05 : this.gStar ? 6.5 : 1.2;
-      list.push({ scene: this.galleryScene, centre: this.origin, radius: ext, dist: 0 });
+      lGallery.radius = this.gPlanet?.spec.rings ? this.gPlanet.spec.rings.outer * 1.05 : this.gStar ? 6.5 : 1.2;
+      list.push(lGallery);
     } else {
-      list.push({ scene: this.sunScene, centre: this.sunPos, radius: SUN_R * 6.5, dist: camera.position.distanceTo(this.sunPos) });
-      if (this.layers.moon) list.push({ scene: this.moonScene, centre: this.moonPos, radius: MOON_R * 1.01, dist: camera.position.distanceTo(this.moonPos) });
-      list.push({ scene: this.earthScene, centre: this.origin, radius: 1.075, dist: camera.position.length() });
-      list.sort((a, b) => b.dist - a.dist);
+      lSun.dist = camera.position.distanceTo(this.sunPos);
+      list.push(lSun);
+      if (this.layers.moon) {
+        lMoon.dist = camera.position.distanceTo(this.moonPos);
+        list.push(lMoon);
+      }
+      lEarth.dist = camera.position.length();
+      list.push(lEarth);
+      list.sort(farToNear);
     }
     for (const b of list) {
       r.clearDepth();
@@ -518,7 +559,9 @@ class EarthExperience implements Experience {
   // ——— Views ———
 
   private fovFor(d: number): number {
-    return fovForDistance(d);
+    // The camera's field spans the narrow screen dimension (see EarthCamera.apply), in CSS pixels.
+    const e = this.ctx.engine;
+    return fovForDistance(d, Math.min(e.cssWidth, e.cssHeight));
   }
 
   private enterISS(tween: number): void {
@@ -758,15 +801,25 @@ class EarthExperience implements Experience {
   private updateUI(dt: number): void {
     // Pale Blue Dot marker follows the Earth's projected position.
     if (this.label) {
+      // Touch the DOM only on change, and size from the engine (reading clientWidth after a style
+      // write would force a synchronous layout every frame).
       const t = this.world ? 0 : pbdProgress(this.cam.altitudeRadius);
       const on = t > 0.97;
-      this.label.style.opacity = on ? '1' : '0';
+      const ls = this.labelState;
+      if (on !== ls.on) {
+        ls.on = on;
+        this.label.style.opacity = on ? '1' : '0';
+      }
       if (on) {
         const p = this.tmp.copy(this.origin).project(this.cam.camera);
-        const el = this.ctx.ui.overlay;
-        const w = el.clientWidth || window.innerWidth;
-        const h = el.clientHeight || window.innerHeight;
-        this.label.style.transform = `translate(${((p.x + 1) / 2) * w}px, ${((1 - p.y) / 2) * h}px)`;
+        const e = this.ctx.engine;
+        const x = Math.round(((p.x + 1) / 2) * e.cssWidth);
+        const y = Math.round(((1 - p.y) / 2) * e.cssHeight);
+        if (x !== ls.x || y !== ls.y) {
+          ls.x = x;
+          ls.y = y;
+          this.label.style.transform = `translate(${x}px, ${y}px)`;
+        }
       }
     }
     this.uiClock -= Math.max(dt, 1 / 60);

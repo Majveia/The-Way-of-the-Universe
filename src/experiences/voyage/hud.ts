@@ -22,11 +22,12 @@ const css = `
 .vy-label.cool b { color: var(--cool); }
 .vy-reticle { position:absolute; left:0; top:0; pointer-events:none; will-change:transform; transition: opacity .5s var(--ease); }
 .vy-reticle svg { display:block; overflow:visible; }
-.vy-reticle .vy-rt { position:absolute; left: 22px; top: -9px; white-space:nowrap; font: 400 11px/1.35 var(--font-ui); letter-spacing:.1em; color: var(--accent); text-shadow: 0 0 4px #000, 0 0 12px #000, 0 0 20px rgba(0,0,0,.8); }
+.vy-reticle .vy-rt { position:absolute; left: 22px; top: -9px; white-space:nowrap; font: 400 11px/1.35 var(--font-ui); letter-spacing:.1em; color: var(--accent); text-shadow: 0 0 2px #000, 0 0 5px #000, 0 0 10px #000, 0 0 18px #000, 0 0 30px rgba(0,0,0,.85); }
 .vy-reticle .vy-rt span { display:block; font-family: var(--font-mono); font-size:10px; letter-spacing:.02em; color: var(--ink-2); }
+.vy-reticle.flip .vy-rt { left: auto; right: 22px; text-align: right; }
 .vy-home { position:absolute; left:0; top:0; pointer-events:none; will-change:transform; transition: opacity .6s var(--ease); }
 .vy-home svg { display:block; overflow:visible; }
-.vy-home .vy-hm { position:absolute; left: 34px; top: -8px; white-space:nowrap; font: 400 10.5px/1.35 var(--font-ui); letter-spacing:.12em; color: var(--cool); text-shadow: 0 0 4px #000, 0 0 12px #000; }
+.vy-home .vy-hm { position:absolute; left: 34px; top: -8px; white-space:nowrap; font: 400 10.5px/1.35 var(--font-ui); letter-spacing:.12em; color: var(--cool); text-shadow: 0 0 2px #000, 0 0 5px #000, 0 0 10px #000, 0 0 18px #000, 0 0 30px rgba(0,0,0,.85); }
 .vy-home .vy-hm span { display:block; font-family: var(--font-mono); font-size:9.5px; letter-spacing:.02em; color: var(--ink-3); }
 .vy-caption { position:absolute; left:50%; bottom: 19%; transform: translate(-50%, 8px); width: min(540px, 62vw); text-align:center; pointer-events:none; opacity:0; transition: opacity 1.2s var(--ease), transform 1.2s var(--ease); text-shadow: 0 0 6px #000, 0 0 18px #000; }
 .vy-caption.on { opacity:1; transform: translate(-50%, 0); }
@@ -58,6 +59,12 @@ export class Hud {
   private style: HTMLStyleElement;
   private v = new THREE.Vector3();
   private boxes: Array<[number, number, number, number]> = [];
+  /** Reused label boxes and the text last written to each label element (no per-frame garbage). */
+  private boxPool: Array<[number, number, number, number]> = [];
+  private shownText: string[] = [];
+  private shownSub: string[] = [];
+  private shownCool: boolean[] = [];
+  private reticleFlip = false;
   private uiBoxes: Array<[number, number, number, number]> = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
   labelsOn = true;
 
@@ -93,7 +100,11 @@ export class Hud {
     this.root.appendChild(this.home);
   }
 
-  /** Project a world direction (camera at the origin) to CSS pixels; null if behind or off-screen. */
+  /**
+   * Project a world direction (camera at the origin) to CSS pixels; null if behind or off-screen.
+   * The returned pair is reused by the next call: consume it first.
+   */
+  private pp: [number, number] = [0, 0];
   private project(dir: THREE.Vector3, camera: THREE.Camera, w: number, h: number): [number, number] | null {
     const p = this.v.copy(dir).applyMatrix3(_rot.setFromMatrix4(camera.matrixWorldInverse));
     if (p.z >= -1e-6) return null;
@@ -102,7 +113,9 @@ export class Hud {
     const x = (p.x * 0.5 + 0.5) * w;
     const y = (-p.y * 0.5 + 0.5) * h;
     if (x < -40 || x > w + 40 || y < -40 || y > h + 40) return null;
-    return [x, y];
+    this.pp[0] = x;
+    this.pp[1] = y;
+    return this.pp;
   }
 
   update(items: readonly LabelItem[], target: LabelItem | null, camera: THREE.Camera, w: number, h: number, reserved?: readonly [number, number, number, number][], home: LabelItem | null = null): void {
@@ -123,10 +136,13 @@ export class Hud {
     if (rp) {
       this.reticle.style.opacity = '1';
       this.reticle.style.transform = `translate3d(${rp[0].toFixed(1)}px, ${rp[1].toFixed(1)}px, 0)`;
+      // Near the right edge the label goes to the left of the reticle (never clipped).
+      const flip = rp[0] > w - 200;
+      if (flip !== this.reticleFlip) this.reticle.classList.toggle('flip', (this.reticleFlip = flip));
       if (this.reticleText.textContent !== target!.text) this.reticleText.textContent = target!.text;
       const sub = target!.sub ?? '';
       if (this.reticleSub.textContent !== sub) this.reticleSub.textContent = sub;
-      this.boxes.push([rp[0] - 26, rp[1] - 26, rp[0] + 190, rp[1] + 30]);
+      this.boxes.push(flip ? [rp[0] - 190, rp[1] - 26, rp[0] + 26, rp[1] + 30] : [rp[0] - 26, rp[1] - 26, rp[0] + 190, rp[1] + 30]);
     } else this.reticle.style.opacity = '0';
     // "You are here" marker.
     const hp = home ? this.project(home.dir, camera, w, h) : null;
@@ -140,6 +156,7 @@ export class Hud {
     } else this.home.style.opacity = '0';
 
     let k = 0;
+    let nb = 0;
     if (this.labelsOn) {
       const sorted = (items as LabelItem[]).sort(byPriority);
       for (const it of sorted) {
@@ -147,18 +164,26 @@ export class Hud {
         const p = this.project(it.dir, camera, w, h);
         if (!p) continue;
         const bw = 7 * (it.text.length + (it.sub?.length ?? 0)) + 24;
-        const box: [number, number, number, number] = [p[0] + 6, p[1] - 8, p[0] + 6 + bw, p[1] + 8];
-        if (this.boxes.some((b) => !(box[2] < b[0] || box[0] > b[2] || box[3] < b[1] || box[1] > b[3]))) continue;
+        const x0 = p[0] + 6, y0 = p[1] - 8, x1 = p[0] + 6 + bw, y1 = p[1] + 8;
+        let hit = false;
+        for (const b of this.boxes) if (!(x1 < b[0] || x0 > b[2] || y1 < b[1] || y0 > b[3])) { hit = true; break; }
+        if (hit) continue;
+        const box = this.boxPool[nb] ?? (this.boxPool[nb] = [0, 0, 0, 0]);
+        nb++;
+        box[0] = x0; box[1] = y0; box[2] = x1; box[3] = y1;
         this.boxes.push(box);
-        const el = this.labels[k++];
-        const html = `<b>${it.text}</b>${it.sub ? `<i>${it.sub}</i>` : ''}`;
-        if (el.dataset.h !== html) {
-          el.innerHTML = html;
-          el.dataset.h = html;
+        const el = this.labels[k];
+        const sub = it.sub ?? '';
+        if (this.shownText[k] !== it.text || this.shownSub[k] !== sub) {
+          el.innerHTML = `<b>${it.text}</b>${sub ? `<i>${sub}</i>` : ''}`;
+          this.shownText[k] = it.text;
+          this.shownSub[k] = sub;
         }
-        el.classList.toggle('cool', !!it.cool);
+        const cool = !!it.cool;
+        if (this.shownCool[k] !== cool) el.classList.toggle('cool', (this.shownCool[k] = cool));
         el.style.opacity = '1';
         el.style.transform = `translate3d(${(p[0] + 8).toFixed(1)}px, ${(p[1] - 7).toFixed(1)}px, 0)`;
+        k++;
       }
     }
     for (; k < this.labels.length; k++) this.labels[k].style.opacity = '0';
