@@ -43,7 +43,6 @@ export class CosmicWebLayer {
   private disposed = false;
   private readonly opts: CosmicWebLayerOptions;
   private readonly cam = new THREE.PerspectiveCamera();
-  private readonly size = new THREE.Vector2();
   private readonly state: WebFrameState = {
     mix: 0,
     za: -1,
@@ -105,12 +104,8 @@ export class CosmicWebLayer {
   render(renderer: THREE.WebGLRenderer, camera: THREE.PerspectiveCamera): void {
     const web = this.web;
     if (!web || this.opacity <= 0 || !this.data) return;
+    // The renderer sizes its internal targets from the bound target (or the canvas) itself.
     const target = renderer.getRenderTarget();
-    if (target) this.size.set(target.width, target.height);
-    else renderer.getDrawingBufferSize(this.size);
-    const scale = web.opts.detail >= 1 ? 1 : web.opts.detail >= 0.6 ? 0.85 : 0.7;
-    const acc = web.accumSize;
-    if (Math.abs(acc.width - Math.round(this.size.x * scale)) > 1 || Math.abs(acc.height - Math.round(this.size.y * scale)) > 1) web.resize(this.size.x, this.size.y);
     // Camera relative to the box centre (keeps vertex coordinates small and precise).
     const c = this.cam;
     c.copy(camera);

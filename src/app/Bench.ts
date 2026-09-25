@@ -151,6 +151,11 @@ class FrameSampler {
     this.lastBegin = 0;
   }
 
+  /** Stop recording but keep the samples. */
+  stop(): void {
+    this.recording = false;
+  }
+
   begin(): void {
     const now = performance.now();
     if (this.recording && this.lastBegin) this.intervals.push(now - this.lastBegin);
@@ -262,7 +267,7 @@ export async function runBenchmark(host: BenchHost, o: BenchOptions = {}): Promi
     sampler.start(true);
     const m0 = performance.now();
     while ((performance.now() - m0 < measureMs || sampler.intervals.length < minFrames) && performance.now() - m0 < maxMeasureMs) await sleep(50);
-    sampler.start(false);
+    sampler.stop();
     // One more frame lets outstanding GPU timer queries resolve.
     await sleep(120);
     const errs = host.errors().slice(errBefore);
@@ -355,7 +360,7 @@ export async function saveReport(report: BenchReport): Promise<'saved' | 'unavai
 // ——— Results overlay ———
 
 const CSS = `
-.bench{position:absolute;inset:0;z-index:40;display:grid;place-items:center;padding:var(--gutter-top) var(--gutter) var(--gutter-bottom);background:rgba(0,0,0,.86);pointer-events:auto;overflow:auto}
+.bench{position:absolute;inset:0;z-index:40;display:grid;place-items:center;padding:var(--gutter-top) var(--gutter) var(--gutter-bottom);background:rgba(0,0,0,.95);pointer-events:auto;overflow:auto}
 .bench-card{width:min(860px,100%);display:flex;flex-direction:column;gap:14px}
 .bench-kicker{font-size:10px;letter-spacing:.26em;text-transform:uppercase;color:var(--ink-3)}
 .bench h2{margin:0;font-weight:300;font-size:clamp(24px,3vw,34px);letter-spacing:.01em}
@@ -449,8 +454,10 @@ export class BenchOverlay {
     for (const r of report.results) {
       const tr = document.createElement('tr');
       const v = verdict(r, report.refreshHz);
+      // Effective rate: the slower of presentation and GPU completion.
+      const eff = r.gpuMs ? Math.min(r.fps, 1000 / Math.max(r.gpuMs.median, 0.001)) : r.fps;
       const cells = r.ok
-        ? [r.fps.toFixed(0), r.frameMs.median.toFixed(1), r.frameMs.p95.toFixed(1), r.gpuMs ? r.gpuMs.median.toFixed(1) : '—', r.cpuMs.median.toFixed(1), String(r.drawCalls), (r.loadMs / 1000).toFixed(1)]
+        ? [eff >= 10 ? eff.toFixed(0) : eff.toFixed(1), r.frameMs.median.toFixed(1), r.frameMs.p95.toFixed(1), r.gpuMs ? r.gpuMs.median.toFixed(1) : '—', r.cpuMs.median.toFixed(1), String(r.drawCalls), (r.loadMs / 1000).toFixed(1)]
         : ['—', '—', '—', '—', '—', '—', (r.loadMs / 1000).toFixed(1)];
       const name = document.createElement('td');
       const dot = document.createElement('span');

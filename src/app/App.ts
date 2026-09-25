@@ -117,7 +117,8 @@ export class App {
       const report = await runBenchmark(
         {
           engine: this.engine,
-          worlds: EXPERIENCES.filter((e) => !e.hidden),
+          // Dev: ?benchWorlds=solar,gargantua restricts the run.
+          worlds: EXPERIENCES.filter((e) => !e.hidden && (!this.params.get('benchWorlds') || this.params.get('benchWorlds')!.split(',').includes(e.id))),
           go: (id) => this.go(id),
           isReady: () => this.debug.ready,
           currentId: () => this.debug.experienceId,

@@ -18,6 +18,9 @@ void main() {
 
 const HEADER = /* glsl */ `
 precision highp float;
+#ifndef DETAIL_LEVEL
+#define DETAIL_LEVEL 2
+#endif
 precision highp sampler2D;
 precision highp samplerCube;
 ${COMMON_GLSL}
@@ -42,7 +45,7 @@ uniform float uPixelRadius;
 uniform float uPixelAngle;
 uniform int uDepthMode;
 uniform float uLogDepthFC;
-uniform int uAtmoSteps;
+uniform ivec3 uSteps;        // atmosphere samples: above the cloud deck, below it, limb rays
 uniform float uAtmoIntensity;
 uniform vec3 uAtmoTint;
 uniform vec2 uCloudLayer;
@@ -116,12 +119,14 @@ float cloudCover(vec3 d, float footprint) {
   // The composite is a gamma-encoded image of cloud brightness: linearise to reflectance.
   float c = pow(mix(c1, c2, abs(2.0 * f1 - 1.0)), 2.2);
   // Sub-texel detail when close: erode/sharpen edges with fbm (real clouds are fractal).
+#if DETAIL_LEVEL >= 1
   float texel = PI / 2048.0;
   float detail = smoothstep(texel, texel * 0.1, footprint) * nyquist(900.0, footprint);
   if (detail > 0.0) {
-    float n = fbm3(d * 900.0 + vec3(uCloudTime * 0.3), 4);
+    float n = fbm3(d * 900.0 + vec3(uCloudTime * 0.3), DETAIL_LEVEL >= 2 ? 4 : 3);
     c = clamp(c + detail * (n * 0.35) * (1.0 - c) * c * 4.0, 0.0, 1.0);
   }
+#endif
   return c;
 #elif defined(TEX_MOON)
   return 0.0;
@@ -133,11 +138,13 @@ float cloudCover(vec3 d, float footprint) {
   float c1 = texture(uCubeC, rotY(d, w * (f1 - 0.5))).r;
   float c2 = texture(uCubeC, rotY(d, w * (f2 - 0.5))).r;
   float c = mix(c1, c2, abs(2.0 * f1 - 1.0));
+#if DETAIL_LEVEL >= 1
   float detail = smoothstep(uBakeTexel * 2.0, uBakeTexel * 0.2, footprint) * nyquist(260.0, footprint);
   if (detail > 0.0) {
-    float n = fbm3(d * 260.0 + uSeedOffRT, 4);
+    float n = fbm3(d * 260.0 + uSeedOffRT, DETAIL_LEVEL >= 2 ? 4 : 3);
     c = clamp(c + detail * n * 0.5 * c * (1.0 - c) * 4.0, 0.0, 1.0);
   }
+#endif
   return c;
 #endif
 }
@@ -173,28 +180,34 @@ vec3 cityGlow(vec3 d, float footprint) {
 
 // Crater relief (units of the cell size): a cellular field where each cell may hold one crater of
 // random radius, biased toward small ones (cumulative size distribution N(>D) ∝ D^-2 or so), with a
-// bowl of depth/diameter ≈ 0.2 and a raised rim.
-float craterBowl(vec3 p) {
+// bowl of depth/diameter ≈ 0.2 and a raised rim. Returns the height's gradient (xyz, per cell unit),
+// computed analytically from the radial profile h(r): ∇h = h'(r) (p − centre) / (|p − centre| R).
+vec3 craterBowlGrad(vec3 p) {
   vec3 id = floor(p);
   vec3 f = fract(p);
-  float h = 0.0;
+  vec3 g = vec3(0.0);
   for (int k = 0; k < 27; k++) {
     vec3 o = vec3(float(k % 3), float((k / 3) % 3), float(k / 9)) - 1.0;
     vec3 c = id + o;
     vec3 rnd = hash33(c);
     if (rnd.z > 0.55) continue;                          // ~55 % of cells cratered
     float R = 0.12 + 0.55 * pow(rnd.y, 3.0);              // mostly small, a few large
-    vec3 fp = o + 0.2 + 0.6 * rnd;
-    float r = length(fp - f) / R;
-    if (r > 1.4) continue;
-    float bowl = -0.4 * R * sqr(max(0.0, 1.0 - r * r));
-    float rim = 0.06 * R * exp(-sqr((r - 1.0) / 0.25));
-    h += bowl + rim;
+    vec3 v = f - (o + 0.2 + 0.6 * rnd);
+    float dist = length(v);
+    float r = dist / R;
+    if (r > 1.4 || dist < 1e-6) continue;
+    // bowl −0.4 R (1 − r²)² (r < 1) and rim 0.06 R exp(−((r − 1)/0.25)²): derivatives in r.
+    float dBowl = r < 1.0 ? 1.6 * R * r * (1.0 - r * r) : 0.0;
+    float dRim = -1.92 * R * (r - 1.0) * exp(-sqr((r - 1.0) / 0.25));
+    g += (dBowl + dRim) * v / (dist * R);
   }
-  return h;
+  return g;
 }
-float moonCraters(vec3 q, float g1, float g2) {
-  return (craterBowl(q * 260.0) / 260.0) * g1 + (craterBowl(q * 900.0 + 7.3) / 900.0) * g2 * 0.4;
+// Gradient (per radius) of the two-scale crater relief at q; g1, g2 fade each scale in.
+vec3 moonCraterGrad(vec3 q, float g1, float g2) {
+  vec3 grad = craterBowlGrad(q * 260.0) * g1;
+  if (g2 > 0.0) grad += craterBowlGrad(q * 900.0 + 7.3) * (g2 * 0.4);
+  return grad;
 }
 
 Surf surfaceAt(vec3 d, vec3 n, float footprint) {
@@ -260,17 +273,17 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
   // Sub-texel craters when close: bowls with raised rims from cellular noise at two scales (a 3D
   // Voronoi field sliced by the sphere gives circles of many sizes — a natural size distribution),
   // shaded through their slopes; each scale fades in only once it spans a few pixels.
+#if DETAIL_LEVEL >= 1
   float g1 = nyquist(260.0, footprint) * smoothstep(PI / 512.0, PI / 2048.0, footprint);
   if (g1 > 0.0) {
-    float g2 = nyquist(1800.0, footprint);
-    float e = 0.15 / 260.0;
+    float g2 = DETAIL_LEVEL >= 2 ? nyquist(1800.0, footprint) : 0.0;
     vec3 q = d + uSeedOffRT * 0.01;
-    float h0 = moonCraters(q, g1, g2);
-    float hx = moonCraters(normalize(q + east * e), g1, g2);
-    float hy = moonCraters(normalize(q + north * e), g1, g2);
-    N = normalize(N - (east * (hx - h0) + north * (hy - h0)) / e * 0.16);
-    s.albedo *= 1.0 + 0.12 * g1 * (fbm3(q * 700.0, 3) * nyquist(1400.0, footprint));
+    vec3 G = moonCraterGrad(q, g1, g2);
+    N = normalize(N - (east * dot(G, east) + north * dot(G, north)) * 0.16);
+    float fa = nyquist(1400.0, footprint);
+    if (fa > 0.0) s.albedo *= 1.0 + 0.12 * g1 * fa * fbm3(q * 700.0, 3);
   }
+#endif
   s.N = N;
   s.photometry = 1;
 #else
@@ -289,12 +302,14 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
   vec4 a2 = texture(uCubeA, rotY(d, jets * amp * (f2 - 0.5)));
   vec4 A = mix(a1, a2, abs(2.0 * f1 - 1.0));
   s.albedo = A.rgb * A.rgb;
+#if DETAIL_LEVEL >= 1
   float detail = smoothstep(uBakeTexel * 1.5, uBakeTexel * 0.2, footprint) * nyquist(700.0, footprint);
   if (detail > 0.0) {
     vec3 q = d + uSeedOffRT * 0.01;
-    float fil = fbm3(vec3(q.x * 90.0, q.y * 700.0, q.z * 90.0), 4);
+    float fil = fbm3(vec3(q.x * 90.0, q.y * 700.0, q.z * 90.0), DETAIL_LEVEL >= 2 ? 4 : 3);
     s.albedo *= 1.0 + detail * 0.12 * fil;
   }
+#endif
   s.photometry = 2;
 #else
   vec4 A = texture(uCubeA, dd);
@@ -305,16 +320,19 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
   // Keep the baked normal in this frame (the bake normal is in the same object space).
   s.N = normalize(mix(n, N, clamp(uRelief, 0.0, 3.0)));
   s.emission = B.a;
+#if DETAIL_LEVEL >= 1
   float detail = smoothstep(uBakeTexel * 1.5, uBakeTexel * 0.15, footprint) * nyquist(180.0, footprint);
   if (detail > 0.0 && s.spec < 0.5) {
+    const int OCT = DETAIL_LEVEL >= 2 ? 5 : 3;
     vec3 q = d * 180.0 + uSeedOffRT;
-    float e0 = fbm3(q, 5);
-    float ex = fbm3(q + east * 0.02, 5);
-    float ey = fbm3(q + north * 0.02, 5);
+    float e0 = fbm3(q, OCT);
+    float ex = fbm3(q + east * 0.02, OCT);
+    float ey = fbm3(q + north * 0.02, OCT);
     vec3 g = (east * (ex - e0) + north * (ey - e0)) / 0.02;
     s.N = normalize(s.N - detail * 0.004 * uRelief * g * 180.0 * 0.12);
     s.albedo *= 1.0 + detail * 0.2 * e0;
   }
+#endif
 #if defined(KIND_BARREN) || defined(KIND_ICE) || defined(KIND_LAVA)
   s.photometry = 1;
 #endif
@@ -383,11 +401,16 @@ void main() {
   float camDist = length(rv);
   vec3 rd = rv / camDist;
   float tCam = -camDist;
+  if (uPixelRadius < 1.0) discard;   // uniform: the sub-pixel point sprite takes over
   vec2 hit = raySphere(ro, rd, vec3(0.0), 1.0);
-  if (hit.x > hit.y || uPixelRadius < 1.0) discard;
   float tHit = hit.x >= tCam ? hit.x : hit.y;
-  if (tHit < tCam) discard;
+  // Rays that miss the planet (the proxy's rim) are shaded at the nearest point of the limb and
+  // discarded only at the end: discarding early leaves their 2×2-quad neighbours with undefined
+  // screen-space derivatives (dFdx, implicit-LOD fetches) — stray NaN/black pixels along the limb.
+  bool miss = hit.x > hit.y || tHit < tCam;
+  if (miss) tHit = -dot(ro, rd);
   vec3 p = ro + rd * tHit;
+  if (miss) p = normalize(p);
   vec3 n = normalize(p / S);
   vec3 d = normalize(p);
   float dist = tHit - tCam;
@@ -475,36 +498,44 @@ void main() {
   vec3 color;
   vec3 k = PI * uSunColor * uAtmoIntensity * uAtmoTint;
 #ifdef HAS_ATMO
-  int nSteps = uAtmoSteps;
 #ifdef HAS_CLOUDS
   vec2 co = raySphere(ro, rd, vec3(0.0), uCloudLayer.y);
   vec2 ci = raySphere(ro, rd, vec3(0.0), uCloudLayer.x);
   float ca = max(co.x, tCam);
   float cb = min(ci.x, tHit);
   if (uCloudOpacity > 0.0 && cb > ca && camDist > 0.0) {
-    AtmoSeg A1 = integrateAtmo(ro, rd, tEntry, ca, nSteps, jitter);
-    AtmoSeg A2 = integrateAtmo(ro, rd, cb, tHit, 3, jitter);
+    // The cloud deck acts at the middle of its slab. The air is integrated along the whole ray —
+    // above the deck, then from the deck to the ground — including the air inside the slab (which
+    // holds ~45 % of the Rayleigh column).
+    float cm = 0.5 * (ca + cb);
+    AtmoSeg A1 = integrateAtmo(ro, rd, tEntry, cm, uSteps.x, jitter);
+    AtmoSeg A2 = integrateAtmo(ro, rd, cm, tHit, uSteps.y, jitter);
     CloudHit c = cloudSlab(ro, rd, ca, cb, footprint, vec3(1.0));
     color = A1.L * k + A1.T * (c.L + c.T * (A2.L * k + A2.T * Lg));
   } else {
-    AtmoSeg A = integrateAtmo(ro, rd, tEntry, tHit, nSteps, jitter);
+    AtmoSeg A = integrateAtmo(ro, rd, tEntry, tHit, uSteps.x + uSteps.y, jitter);
     color = A.L * k + A.T * Lg;
   }
 #else
-  AtmoSeg A = integrateAtmo(ro, rd, tEntry, tHit, nSteps, jitter);
+  AtmoSeg A = integrateAtmo(ro, rd, tEntry, tHit, uSteps.x + uSteps.y, jitter);
   color = A.L * k + A.T * Lg;
 #endif
 #ifdef HAS_AURORA
-  color += auroraEmission(ro, rd, tEntry, tHit, jitter) + airglowEmission(ro, rd, tEntry, tHit, jitter);
+  color += auroraEmission(ro, rd, tCam, tHit, jitter) + airglowEmission(ro, rd, tCam, tHit, jitter);
 #endif
 #else
   color = Lg;
 #endif
+  if (miss) discard;
   outColor = vec4(max(color, vec3(0.0)), 1.0);
   gl_FragDepth = depthOf(pReal);
 }`;
 
-/** Sky/limb pass. TRANSMIT: per-channel transmittance (multiply blend); else in-scattered light (add). */
+/**
+ * Sky/limb pass. TRANSMIT: per-channel transmittance of the air (multiply blend); else in-scattered
+ * light (add), plus the aurora and airglow, whose shells may reach above the scattering atmosphere
+ * (the proxy then encloses them; rays that miss the air only carry the glows).
+ */
 export const ATMO_FRAG = /* glsl */ `${HEADER}
 void main() {
   vec3 S = uEllipsoid;
@@ -515,11 +546,6 @@ void main() {
   vec3 rd = rv / camDist;
   float tCam = -camDist;
   if (uPixelRadius < 1.0) discard;
-  vec2 top = raySphere(ro, rd, vec3(0.0), uTop);
-  if (top.x > top.y) discard;
-  float t0 = max(top.x, tCam);
-  float t1 = top.y;
-  if (t1 <= t0) discard;
   // The surface pass owns rays that hit the ground. Test with the closest approach, biased by a few
   // tens of metres toward "sky", so grazing rays are never dropped by both passes (float rounding of
   // the two proxies differs); a hair-thin overlap is invisible, a hole is a black pixel.
@@ -527,59 +553,74 @@ void main() {
   vec3 pca = ro + rd * tca;
   float b2 = dot(pca, pca);
   if (b2 < 1.0 - 1e-5 && tca + sqrt(max(0.0, 1.0 - b2)) > tCam) discard;
+  vec2 top = raySphere(ro, rd, vec3(0.0), uTop);
+  float t0 = max(top.x, tCam);
+  float t1 = top.y;
+  bool inAir = top.x < top.y && t1 > t0;
+#ifdef TRANSMIT
+  if (!inAir) discard;
+#endif
   float jitter = ign(gl_FragCoord.xy);
-  float footprint = (t0 - tCam) * uPixelAngle;
-  // Cloud segments along the limb ray (up to two: near and far side of the cloud shell).
-  vec2 segA = vec2(0.0), segB = vec2(0.0);
-  int nseg = 0;
+  vec3 L = vec3(0.0);
+  vec3 Ttot = vec3(1.0);
+  if (inAir) {
+    float footprint = (t0 - tCam) * uPixelAngle;
+    // Cloud segments along the limb ray (up to two: near and far side of the cloud shell).
+    vec2 segA = vec2(0.0), segB = vec2(0.0);
+    int nseg = 0;
 #ifdef HAS_CLOUDS
-  if (uCloudOpacity > 0.0) {
-    vec2 co = raySphere(ro, rd, vec3(0.0), uCloudLayer.y);
-    vec2 ci = raySphere(ro, rd, vec3(0.0), uCloudLayer.x);
-    if (co.x < co.y && co.y > t0) {
-      if (ci.x > ci.y) {
-        segA = vec2(max(co.x, t0), co.y);
-        nseg = 1;
-      } else {
-        segA = vec2(max(co.x, t0), ci.x);
-        segB = vec2(max(ci.y, t0), co.y);
-        nseg = segA.y > segA.x ? 2 : 1;
-        if (segA.y <= segA.x) segA = segB;
+    if (uCloudOpacity > 0.0) {
+      vec2 co = raySphere(ro, rd, vec3(0.0), uCloudLayer.y);
+      vec2 ci = raySphere(ro, rd, vec3(0.0), uCloudLayer.x);
+      if (co.x < co.y && co.y > t0) {
+        if (ci.x > ci.y) {
+          segA = vec2(max(co.x, t0), co.y);
+          nseg = 1;
+        } else {
+          segA = vec2(max(co.x, t0), ci.x);
+          segB = vec2(max(ci.y, t0), co.y);
+          nseg = segA.y > segA.x ? 2 : 1;
+          if (segA.y <= segA.x) segA = segB;
+        }
       }
     }
-  }
 #endif
 #ifdef TRANSMIT
-  float r0 = length(ro + rd * t0);
-  float mu0 = dot(ro + rd * t0, rd) / r0;
-  vec3 T = transmittanceToTop(r0, mu0);
+    Ttot = transmittanceToTop(length(ro + rd * t0), dot(ro + rd * t0, rd) / length(ro + rd * t0));
 #ifdef HAS_CLOUDS
-  if (nseg >= 1) T *= cloudSlab(ro, rd, segA.x, segA.y, footprint, vec3(0.0)).T;
-  if (nseg >= 2) T *= cloudSlab(ro, rd, segB.x, segB.y, footprint, vec3(0.0)).T;
+    if (nseg >= 1) Ttot *= cloudSlab(ro, rd, segA.x, segA.y, footprint, vec3(0.0)).T;
+    if (nseg >= 2) Ttot *= cloudSlab(ro, rd, segB.x, segB.y, footprint, vec3(0.0)).T;
 #endif
-  outColor = vec4(T, 1.0);
 #else
-  vec3 k = PI * uSunColor * uAtmoIntensity * uAtmoTint;
-  vec3 L = vec3(0.0), T = vec3(1.0);
-  float cur = t0;
-  int budget = uAtmoSteps + 4;
-  for (int i = 0; i < 2; i++) {
-    if (i >= nseg) break;
-    vec2 sg = i == 0 ? segA : segB;
-    int n = max(3, int(float(budget) * (sg.x - cur) / max(t1 - t0, 1e-6)));
-    AtmoSeg A = integrateAtmo(ro, rd, cur, sg.x, n, jitter);
-    L += T * A.L * k;
-    T *= A.T;
-    CloudHit c = cloudSlab(ro, rd, sg.x, sg.y, footprint, vec3(1.0));
-    L += T * c.L;
-    T *= c.T;
-    cur = sg.y;
-  }
-  AtmoSeg A = integrateAtmo(ro, rd, cur, t1, nseg > 0 ? max(4, budget / 2) : budget, jitter);
-  L += T * A.L * k;
-#ifdef HAS_AURORA
-  L += auroraEmission(ro, rd, t0, t1, jitter) + airglowEmission(ro, rd, t0, t1, jitter);
+    vec3 k = PI * uSunColor * uAtmoIntensity * uAtmoTint;
+    float cur = t0;
+    int budget = uSteps.z;
+    for (int i = 0; i < 2; i++) {
+      if (i >= nseg) break;
+      vec2 sg = i == 0 ? segA : segB;
+      // Air up to the middle of the cloud slab (where the deck acts), then the deck; the air inside the
+      // slab is integrated like the rest.
+      float sm = 0.5 * (sg.x + sg.y);
+      int n = max(3, int(float(budget) * (sm - cur) / max(t1 - t0, 1e-6)));
+      AtmoSeg A = integrateAtmo(ro, rd, cur, sm, n, jitter);
+      L += Ttot * A.L * k;
+      Ttot *= A.T;
+      CloudHit c = cloudSlab(ro, rd, sg.x, sg.y, footprint, vec3(1.0));
+      L += Ttot * c.L;
+      Ttot *= c.T;
+      cur = sm;
+    }
+    AtmoSeg A = integrateAtmo(ro, rd, cur, t1, nseg > 0 ? max(4, budget / 2) : budget, jitter);
+    L += Ttot * A.L * k;
 #endif
+  }
+#ifdef TRANSMIT
+  outColor = vec4(Ttot, 1.0);
+#else
+#ifdef HAS_AURORA
+  L += auroraEmission(ro, rd, tCam, 1e30, jitter) + airglowEmission(ro, rd, tCam, 1e30, jitter);
+#endif
+  if (!inAir && L.r + L.g + L.b <= 0.0) discard;
   outColor = vec4(max(L, vec3(0.0)), 1.0);
 #endif
 }`;

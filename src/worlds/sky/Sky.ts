@@ -689,6 +689,7 @@ export class Sky {
     this.group.matrix.copy(m).multiply(skyFrameMatrix(frame));
     this.group.matrixWorldNeedsUpdate = true;
     this.group.updateMatrixWorld(true);
+    this.frameDirty = true;
   }
 
   set brightness(v: number) {
@@ -732,6 +733,7 @@ export class Sky {
   /** Observer position relative to the Sun, parsecs, in the sky's world frame (default: the origin). */
   setObserver(pc: THREE.Vector3): void {
     this.observer.copy(pc);
+    this.frameDirty = true;
   }
   getObserver(out = new THREE.Vector3()): THREE.Vector3 {
     return out.copy(this.observer);
@@ -798,20 +800,22 @@ export class Sky {
    */
   apparent(index: number, out: ApparentStar): boolean {
     const c = this.cat;
-    if (!c || index < 0 || index >= c.count) return false;
+    const g = this.catalogPoints?.geometry;
+    if (!c || !g || index < 0 || index >= c.count) return false;
     const p = c.position, v = c.velocity;
     const t = this.epoch;
     const o = this.observerGal;
-    this.updateObserverGal();
+    // (called for every label and light each frame: no allocations, frame matrices cached)
+    if (this.frameDirty) this.updateObserverGal();
     const rx = p[index * 3] + v[index * 3] * t - o.x;
     const ry = p[index * 3 + 1] + v[index * 3 + 1] * t - o.y;
     const rz = p[index * 3 + 2] + v[index * 3 + 2] * t - o.z;
     const d = Math.hypot(rx, ry, rz);
     out.distance = d;
-    out.restDir.set(rx, ry, rz).applyMatrix4(this.rotOnly(this.group.matrix)).normalize();
-    const props = this.starProps(index);
-    let m = props.absMag + 5 * (Math.log10(Math.max(d, 1e-12)) - 1);
-    let T = props.temperature;
+    out.restDir.set(rx, ry, rz).applyMatrix4(this.tmpM4).normalize();
+    const absMag = (g.getAttribute('absMag') as THREE.BufferAttribute).array[index];
+    let m = absMag + 5 * (Math.log10(Math.max(d, 1e-12)) - 1);
+    let T = (g.getAttribute('temp') as THREE.BufferAttribute).array[index];
     let delta = 1;
     if (this.velocity.lengthSq() > 1e-14) {
       delta = aberrateDirection(out.restDir, this.velocity, out.dir);
@@ -829,9 +833,13 @@ export class Sky {
   private rotOnly(m: THREE.Matrix4): THREE.Matrix4 {
     return this.tmpM4.extractRotation(m);
   }
+  /** Observer and frame rotation in the galactic frame; recomputed when the observer or frame moved. */
+  private frameDirty = true;
   private updateObserverGal(): void {
     this.invRot.setFromMatrix4(this.group.matrix).transpose();
     this.observerGal.copy(this.observer).applyMatrix3(this.invRot);
+    this.rotOnly(this.group.matrix);
+    this.frameDirty = false;
   }
 
   /**

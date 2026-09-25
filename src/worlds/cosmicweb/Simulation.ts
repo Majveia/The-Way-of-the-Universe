@@ -10,6 +10,7 @@ import { ParticleMesh } from '../../physics/cosmosPM';
 import { friendsOfFriends, type FoFResult } from '../../physics/cosmosFoF';
 import { centralQuenchedFraction, mergingTime, r200c, satelliteQuenched, stellarMass } from '../../physics/cosmosGalaxies';
 import { hash01 } from '../../physics/random';
+import { KeyframeEncoder, encodedTransferables } from './SnapshotStore';
 import type { CosmoParams, GalaxyCatalog, HaloCatalog, Keyframe, SimConfig, SimInfo, WorkerMessage } from './types';
 
 export function makeExpansion(c: CosmoParams): Expansion {
@@ -120,6 +121,8 @@ export class Simulation {
   private cancelled = false;
   private readonly emit: Emit;
   private readonly runId: number;
+  /** Keyframes are delta-encoded here (in the worker), so the main thread only stores them. */
+  private readonly encoder = new KeyframeEncoder();
 
   constructor(cfg: SimConfig, emit: Emit, runId = 0) {
     this.cfg = cfg;
@@ -285,19 +288,21 @@ export class Simulation {
     // Deepest voids in the density smoothed on ~6 h⁻¹ Mpc.
     const voids = z < 3 ? this.findVoids(pm) : new Float32Array(0);
 
+    const enc = this.encoder.encode(positions);
     const kf: Keyframe = {
       index,
       step,
       t,
       a,
       D,
-      positions,
+      positions: null,
+      enc,
       halos,
       galaxies,
       pk,
       stats: { stepMs, fofMs, maxHaloMass: halos.count ? halos.mass[0] : 0, sigma8a: D * lp.sigma8(), voids },
     };
-    const transfer: ArrayBuffer[] = [positions.buffer as ArrayBuffer];
+    const transfer: ArrayBuffer[] = encodedTransferables(enc);
     for (const arr of [halos.host, halos.mass, halos.r200, halos.sigma, halos.npart, halos.center, halos.ngal, halos.vel,
       galaxies.id, galaxies.host, galaxies.mstar, galaxies.blue, galaxies.sat, galaxies.halo, galaxies.born, pk.k, pk.P, pk.Plin, voids])
       transfer.push(arr.buffer as ArrayBuffer);

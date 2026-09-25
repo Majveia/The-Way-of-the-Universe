@@ -53,12 +53,14 @@ uniform float uPixelAngle;
 uniform float uPixelRadius;
 uniform float uSeed;
 uniform int uDepthMode;
+uniform float uLogDepthFC;
 
 // Visible-band Planck ratio B555(T)/B555(T0).
 float planck555(float T, float T0) { return (exp(25925.0 / T0) - 1.0) / (exp(25925.0 / T) - 1.0); }
 
 float depthOf(vec3 pObj) {
   vec4 clip = projectionMatrix * modelViewMatrix * vec4(pObj, 1.0);
+  if (uDepthMode == 2) return log2(max(1e-6, 1.0 + clip.w)) * uLogDepthFC * 0.5;
   float z = clip.z / clip.w;
   return uDepthMode == 1 ? z : z * 0.5 + 0.5;
 }
@@ -238,6 +240,7 @@ export function createStar(spec: StarSpec): StarRenderer {
     uPixelRadius: { value: 1000 },
     uSeed: { value: rng.range(0, 100) },
     uDepthMode: { value: 0 },
+    uLogDepthFC: { value: 1 },
   };
   const mat = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: STAR_VERT, fragmentShader: STAR_FRAG, uniforms });
   const geo = new THREE.IcosahedronGeometry(1.0015, 16);
@@ -273,6 +276,7 @@ export function createStar(spec: StarSpec): StarRenderer {
 
   const tmpM = new THREE.Matrix4();
   const tmpP = new THREE.Vector3();
+  const tmpC = new THREE.Vector3();
   mesh.onBeforeRender = (renderer, _s, camera) => {
     tmpM.copy(mesh.matrixWorld).invert();
     uniforms.uCamPos.value.setFromMatrixPosition(camera.matrixWorld).applyMatrix4(tmpM);
@@ -282,9 +286,14 @@ export function createStar(spec: StarSpec): StarRenderer {
     uniforms.uPixelAngle.value = 2 / (p11 * h);
     mesh.getWorldPosition(tmpP);
     const worldR = spec.radius * (object.matrixWorld.getMaxScaleOnAxis() || 1);
-    uniforms.uPixelRadius.value = (worldR / Math.max(tmpP.distanceTo(camera.position), 1e-12)) * p11 * 0.5 * h;
-    const caps = renderer.capabilities as unknown as { reverseDepthBuffer?: boolean };
-    uniforms.uDepthMode.value = caps.reverseDepthBuffer ? 1 : 0;
+    // World-space camera position (the camera may be parented to a rig).
+    const camDist = tmpP.distanceTo(tmpC.setFromMatrixPosition(camera.matrixWorld));
+    uniforms.uPixelRadius.value = (worldR / Math.max(camDist, 1e-12)) * p11 * 0.5 * h;
+    const caps = renderer.capabilities as unknown as { reverseDepthBuffer?: boolean; logarithmicDepthBuffer?: boolean };
+    if (caps.logarithmicDepthBuffer) {
+      uniforms.uDepthMode.value = 2;
+      uniforms.uLogDepthFC.value = 2.0 / (Math.log(((camera as THREE.PerspectiveCamera).far ?? 1e9) + 1.0) / Math.LN2);
+    } else uniforms.uDepthMode.value = caps.reverseDepthBuffer ? 1 : 0;
   };
 
   // Starlight colour (luminance 1) from the blackbody at T_eff.

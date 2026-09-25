@@ -298,22 +298,36 @@ export function ksPoint(a: number, x: number, y: number, z: number): KSPoint {
   };
 }
 
+/** η ± f l l with l = (l0, lx, ly, lz), written without allocating (sign = +1: g_μν, −1: g^μν). */
+function kerrSchildInto(a: number, x: number, y: number, z: number, l0: number, sign: number, out: Float64Array): Float64Array {
+  const a2 = a * a;
+  const A = x * x + y * y + z * z - a2;
+  const r = Math.sqrt(0.5 * (A + Math.sqrt(A * A + 4 * a2 * z * z)));
+  const r2 = r * r;
+  const S = r2 + a2;
+  const f = (sign * 2 * r2 * r) / (r2 * r2 + a2 * z * z);
+  const l1 = (r * x + a * y) / S, l2 = (r * y - a * x) / S, l3 = z / r;
+  out[0] = -1 + f * l0 * l0;
+  out[1] = out[4] = f * l0 * l1;
+  out[2] = out[8] = f * l0 * l2;
+  out[3] = out[12] = f * l0 * l3;
+  out[5] = 1 + f * l1 * l1;
+  out[6] = out[9] = f * l1 * l2;
+  out[7] = out[13] = f * l1 * l3;
+  out[10] = 1 + f * l2 * l2;
+  out[11] = out[14] = f * l2 * l3;
+  out[15] = 1 + f * l3 * l3;
+  return out;
+}
+
 /** Covariant metric g_μν (row-major 4×4, order t,x,y,z) at a Kerr–Schild point. */
 export function ksMetric(a: number, x: number, y: number, z: number, out = new Float64Array(16)): Float64Array {
-  const p = ksPoint(a, x, y, z);
-  const l = [1, p.lx, p.ly, p.lz];
-  for (let i = 0; i < 4; i++)
-    for (let j = 0; j < 4; j++) out[i * 4 + j] = (i === j ? (i === 0 ? -1 : 1) : 0) + p.f * l[i] * l[j];
-  return out;
+  return kerrSchildInto(a, x, y, z, 1, 1, out);
 }
 
 /** Contravariant metric g^μν = η^μν − f l^μ l^ν with l^μ = (−1, l). */
 export function ksInverseMetric(a: number, x: number, y: number, z: number, out = new Float64Array(16)): Float64Array {
-  const p = ksPoint(a, x, y, z);
-  const l = [-1, p.lx, p.ly, p.lz];
-  for (let i = 0; i < 4; i++)
-    for (let j = 0; j < 4; j++) out[i * 4 + j] = (i === j ? (i === 0 ? -1 : 1) : 0) - p.f * l[i] * l[j];
-  return out;
+  return kerrSchildInto(a, x, y, z, -1, -1, out);
 }
 
 /** g(u, v) for contravariant vectors with a precomputed covariant metric. */
@@ -405,30 +419,47 @@ export function rk4Step(a: number, s: Float64Array, pt: number, h: number, work:
 
 // ———————————————————————————————————————————————————————————————— observers & tetrads
 
-/** Killing vector ∂_φ in Kerr–Schild Cartesian components: (0, −y, x, 0). */
-const axial = (x: number, y: number): Vec4 => [0, -y, x, 0];
+// Scratch for the allocation-free (…Into) versions used every frame by the renderer.
+const _g = new Float64Array(16);
+const _gi = new Float64Array(16);
+const _w: Vec4 = [0, 0, 0, 0];
 
-function normalizeTimelike(g: Float64Array, v: Vec4): Vec4 | null {
+/** Normalise a (future) timelike vector in place; false if it is not timelike. */
+function normalizeTimelikeInto(g: Float64Array, v: Vec4): boolean {
   const n = dot4(g, v, v);
-  if (!(n < 0)) return null;
+  if (!(n < 0)) return false;
   const s = 1 / Math.sqrt(-n);
-  return [v[0] * s, v[1] * s, v[2] * s, v[3] * s];
+  for (let i = 0; i < 4; i++) v[i] *= s;
+  return true;
 }
 
 /** Static observer u ∝ ∂_t (exists outside the ergosphere only). */
 export function staticObserver(a: number, x: number, y: number, z: number): Vec4 | null {
-  return normalizeTimelike(ksMetric(a, x, y, z), [1, 0, 0, 0]);
+  const u: Vec4 = [0, 0, 0, 0];
+  return staticObserverInto(a, x, y, z, u) ? u : null;
+}
+export function staticObserverInto(a: number, x: number, y: number, z: number, out: Vec4): boolean {
+  out[0] = 1;
+  out[1] = out[2] = out[3] = 0;
+  return normalizeTimelikeInto(ksMetric(a, x, y, z, _g), out);
 }
 
-/** Zero-angular-momentum observer u ∝ ∂_t + ω ∂_φ (exists everywhere outside r₊). */
+/** Zero-angular-momentum observer u ∝ ∂_t + ω ∂_φ, ∂_φ = (0, −y, x, 0) (exists everywhere outside r₊). */
 export function zamoObserver(a: number, x: number, y: number, z: number): Vec4 | null {
-  const g = ksMetric(a, x, y, z);
-  const t: Vec4 = [1, 0, 0, 0];
-  const ph = axial(x, y);
-  const gtp = dot4(g, t, ph);
-  const gpp = dot4(g, ph, ph);
+  const u: Vec4 = [0, 0, 0, 0];
+  return zamoObserverInto(a, x, y, z, u) ? u : null;
+}
+export function zamoObserverInto(a: number, x: number, y: number, z: number, out: Vec4): boolean {
+  const g = ksMetric(a, x, y, z, _g);
+  // g(∂_t, ∂_φ) and g(∂_φ, ∂_φ) with ∂_φ = (0, −y, x, 0).
+  const gtp = -y * g[1] + x * g[2];
+  const gpp = y * y * g[5] - 2 * x * y * g[6] + x * x * g[10];
   const w = gpp > 1e-12 ? -gtp / gpp : 0;
-  return normalizeTimelike(g, [1, w * ph[1], w * ph[2], 0]);
+  out[0] = 1;
+  out[1] = -w * y;
+  out[2] = w * x;
+  out[3] = 0;
+  return normalizeTimelikeInto(g, out);
 }
 
 /**
@@ -437,12 +468,19 @@ export function zamoObserver(a: number, x: number, y: number, z: number): Vec4 |
  * Falls back to the ZAMO inside the photon orbit.
  */
 export function orbitingObserver(a: number, x: number, y: number, z: number): Vec4 | null {
+  const u: Vec4 = [0, 0, 0, 0];
+  return orbitingObserverInto(a, x, y, z, u) ? u : null;
+}
+export function orbitingObserverInto(a: number, x: number, y: number, z: number, out: Vec4): boolean {
   const r = ksRadius(a, x, y, z);
-  const o = circularOrbit(a, r);
-  if (!o) return zamoObserver(a, x, y, z);
-  const g = ksMetric(a, x, y, z);
-  const ph = axial(x, y);
-  return normalizeTimelike(g, [1, o.omega * ph[1], o.omega * ph[2], 0]) ?? zamoObserver(a, x, y, z);
+  const sr = Math.sqrt(r);
+  if (r * sr - 3 * sr + 2 * a <= 0) return zamoObserverInto(a, x, y, z, out);
+  const om = 1 / (r * sr + a);
+  out[0] = 1;
+  out[1] = -om * y;
+  out[2] = om * x;
+  out[3] = 0;
+  return normalizeTimelikeInto(ksMetric(a, x, y, z, _g), out) || zamoObserverInto(a, x, y, z, out);
 }
 
 /**
@@ -451,6 +489,9 @@ export function orbitingObserver(a: number, x: number, y: number, z: number): Ve
  * BL: u_t = −1, u_r = −√(2r(r² + a²))/Δ; in Kerr–Schild u_r → u_r + 2r/Δ (regular at Δ = 0).
  */
 export function rainObserver(a: number, x: number, y: number, z: number): Vec4 {
+  return rainObserverInto(a, x, y, z, [0, 0, 0, 0]);
+}
+export function rainObserverInto(a: number, x: number, y: number, z: number, out: Vec4): Vec4 {
   const a2 = a * a;
   const A = x * x + y * y + z * z - a2;
   const D = Math.sqrt(A * A + 4 * a2 * z * z);
@@ -460,15 +501,17 @@ export function rainObserver(a: number, x: number, y: number, z: number): Vec4 {
   // the horizon (4r² − 2rS = −2rΔ):  u_r(KS) = −2r / (2r + √(2rS)).
   const urKS = (-2 * r) / (2 * r + Math.sqrt(2 * r * S));
   const rx = (r * x) / D, ry = (r * y) / D, rz = (z * S) / (r * D);
-  const uCov: Vec4 = [-1, urKS * rx, urKS * ry, urKS * rz];
-  const gi = ksInverseMetric(a, x, y, z);
-  const u: Vec4 = [0, 0, 0, 0];
+  _w[0] = -1;
+  _w[1] = urKS * rx;
+  _w[2] = urKS * ry;
+  _w[3] = urKS * rz;
+  const gi = ksInverseMetric(a, x, y, z, _gi);
   for (let i = 0; i < 4; i++) {
     let s = 0;
-    for (let j = 0; j < 4; j++) s += gi[i * 4 + j] * uCov[j];
-    u[i] = s;
+    for (let j = 0; j < 4; j++) s += gi[i * 4 + j] * _w[j];
+    out[i] = s;
   }
-  return u;
+  return out;
 }
 
 export interface Tetrad {
@@ -478,33 +521,49 @@ export interface Tetrad {
   E: [Vec4, Vec4, Vec4, Vec4];
 }
 
+/** A zeroed tetrad to fill with buildTetradInto. */
+export const createTetrad = (): Tetrad => ({
+  e: [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+  E: [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+});
+
 /**
  * Orthonormal frame of an observer with 4-velocity u, oriented by three spatial coordinate
  * directions (the camera's right/up/back axes in Kerr–Schild Cartesian components). Gram–Schmidt
  * in the order back → up → right keeps the optical axis exactly on the requested direction.
  */
 export function buildTetrad(a: number, pos: Vec3, u: Vec4, right: Vec3, up: Vec3, back: Vec3): Tetrad {
-  const g = ksMetric(a, pos[0], pos[1], pos[2]);
-  const proj = (v: Vec4, basis: Vec4[], signs: number[]): Vec4 => {
-    const w: Vec4 = [v[0], v[1], v[2], v[3]];
-    basis.forEach((b, k) => {
-      const c = dot4(g, w, b) * signs[k];
-      for (let i = 0; i < 4; i++) w[i] -= c * b[i];
-    });
-    return w;
+  return buildTetradInto(a, pos, u, right, up, back, createTetrad());
+}
+
+/** buildTetrad without allocations (for per-frame use); returns `out`. */
+export function buildTetradInto(a: number, pos: Vec3, u: Vec4, right: Vec3, up: Vec3, back: Vec3, out: Tetrad): Tetrad {
+  const g = ksMetric(a, pos[0], pos[1], pos[2], _g);
+  const e = out.e;
+  for (let i = 0; i < 4; i++) e[0][i] = u[i];
+  // e_k = normalise(v − Σ_b (v·b)/(b·b) b) over the vectors already built (b·b = −1 for u, +1 else).
+  const build = (k: number, v: Vec3) => {
+    const w = e[k];
+    w[0] = 0;
+    w[1] = v[0];
+    w[2] = v[1];
+    w[3] = v[2];
+    for (let j = 0; j < 4; j++) {
+      const idx = j === 0 ? 0 : 4 - j; // u, then e3 (back), e2 (up): only those already built
+      if (j > 0 && idx <= k) break;
+      const c = dot4(g, w, e[idx]) * (idx === 0 ? -1 : 1);
+      for (let i = 0; i < 4; i++) w[i] -= c * e[idx][i];
+    }
+    const n = Math.sqrt(Math.max(dot4(g, w, w), 1e-300));
+    for (let i = 0; i < 4; i++) w[i] /= n;
   };
-  const norm = (v: Vec4): Vec4 => {
-    const n = Math.sqrt(Math.max(dot4(g, v, v), 1e-300));
-    return [v[0] / n, v[1] / n, v[2] / n, v[3] / n];
-  };
-  // Projection: w − (w·b)/(b·b) b, with b·b = −1 for u and +1 for spatial vectors.
-  const e3 = norm(proj([0, back[0], back[1], back[2]], [u], [-1]));
-  const e2 = norm(proj([0, up[0], up[1], up[2]], [u, e3], [-1, 1]));
-  let e1 = norm(proj([0, right[0], right[1], right[2]], [u, e3, e2], [-1, 1, 1]));
-  // Keep the frame right-handed even if `right` was degenerate.
-  if (!e1.every(Number.isFinite)) e1 = [0, 0, 0, 0];
-  const E = [u, e1, e2, e3].map((v) => lower(g, v)) as [Vec4, Vec4, Vec4, Vec4];
-  return { e: [u, e1, e2, e3], E };
+  build(3, back);
+  build(2, up);
+  build(1, right);
+  // Keep the frame usable even if `right` was degenerate.
+  if (!e[1].every(Number.isFinite)) e[1][0] = e[1][1] = e[1][2] = e[1][3] = 0;
+  for (let k = 0; k < 4; k++) lower(g, e[k], out.E[k]);
+  return out;
 }
 
 /** Lorentz factor between two observers: γ = −u·v. */
@@ -651,19 +710,28 @@ export function traceRay(a: number, pos: Vec3, kCov: Vec4, o: TraceOptions = {})
 }
 
 /**
- * Remaining light bending of a ray leaving radius r along direction v, in the weak-field limit:
- * deflection (2/b)(1 − s/√(b² + s²)) toward the hole, b = impact parameter, s = distance past
- * closest approach (Einstein's 4M/b split along the path). Lets the integration stop early.
+ * Remaining light bending of a ray leaving radius r (outward) along direction v, to first order in
+ * M/r: Einstein's 4M/b split along the path, the part still to come being (2M/b)(1 − cos ψ) toward
+ * the hole (ψ = angle between the ray and the radial direction). That formula holds in isotropic
+ * (harmonic-like) coordinates, whereas the Kerr–Schild spatial chart is Schwarzschild-like (areal r):
+ * with ρ ≈ r − M, a ray's angle to the radial direction obeys tan ψ_iso = (1 − M/r) tan ψ, i.e.
+ * ψ_iso ≈ ψ − (M/r) sin ψ cos ψ. Without that change of chart the asymptotic direction depends on
+ * where the numerical integration hands over — by ≈ M b / r², several pixels at r = 60 M. Spin
+ * enters at O(aM/r²) and is neglected. Lets the integration stop early.
  */
-export function weakFieldTail(x: Vec3, v: Vec3): Vec3 {
-  const s = x[0] * v[0] + x[1] * v[1] + x[2] * v[2];
-  const c: Vec3 = [x[0] - s * v[0], x[1] - s * v[1], x[2] - s * v[2]];
-  const b = Math.hypot(c[0], c[1], c[2]);
-  if (b < 1e-9) return v;
-  const defl = (2 / b) * (1 - s / Math.sqrt(b * b + s * s));
-  const w: Vec3 = [v[0] - (defl * c[0]) / b, v[1] - (defl * c[1]) / b, v[2] - (defl * c[2]) / b];
-  const n = Math.hypot(w[0], w[1], w[2]);
-  return [w[0] / n, w[1] / n, w[2] / n];
+export function weakFieldTail(x: Vec3, v: Vec3, mass = 1): Vec3 {
+  const r = Math.hypot(x[0], x[1], x[2]);
+  if (r < 1e-9) return v;
+  const n: Vec3 = [x[0] / r, x[1] / r, x[2] / r];
+  const c = v[0] * n[0] + v[1] * n[1] + v[2] * n[2];
+  const t: Vec3 = [v[0] - c * n[0], v[1] - c * n[1], v[2] - c * n[2]];
+  const s = Math.hypot(t[0], t[1], t[2]);
+  if (s < 1e-12) return v; // radial: no bending
+  const psi = Math.atan2(s, c) - (mass / r) * s * c;
+  const b = Math.max((r - mass) * Math.sin(psi), 1e-9);
+  const ang = psi + mass * (2 / b) * (1 - Math.cos(psi));
+  const ca = Math.cos(ang), sa = Math.sin(ang) / s;
+  return [ca * n[0] + sa * t[0], ca * n[1] + sa * t[1], ca * n[2] + sa * t[2]];
 }
 
 /** Build k_μ = −E0 + dⁱ E_i for a camera-frame direction d = (right, up, back) components. */

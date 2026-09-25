@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import type { PlanetSpec, PlanetUpdate, PlanetView } from './types';
 import { resolveAtmosphereSpec, type AtmosphereRenderParams } from '../../physics/planets-atmosphere';
 import { AURORA_LINES, lambertPhase, lineColor } from '../../physics/planets-photometry';
-import { luminousEfficiency } from '../../physics/spectrum';
+import { AURORA_LINES_NM, AURORA_SHELL_KM, LIGHTS_SCALE, NIGHT_GAIN, auroraLineGains, kiloRayleighRadiance, planetSteps } from './glow';
 import { acquireLUTs, generateLUTs, releaseLUTs, type AtmosphereLUTs } from './luts';
 import { BAKE_KINDS, bakeSurface, bakeSize, kindDefine, worldUniforms, type BakedSurface } from './bake';
 import { ringTexture } from './rings';
@@ -41,17 +41,22 @@ export interface PlanetRenderer extends PlanetView {
 /**
  * Radiance of a saturated city-light pixel. Real night lights are ~10⁻⁵ of daylight; like every
  * image of Earth at night they are shown far brighter than a daylight exposure would record
- * (the Earth experience says so in its info card).
+ * (the Earth experience says so in its info card). See glow.ts.
  */
-export const LIGHTS_SCALE = 0.9;
+export { LIGHTS_SCALE };
 
 /**
- * Aurora and airglow get the same night-vision exaggeration as the city lights (≈ 10⁴ over a daylight
- * exposure), so their brightness relative to the cities is physical: a bright auroral arc
- * (~100 kR in O I 557.7 nm, ≈ 3 × 10⁻⁴ W m⁻² sr⁻¹) is comparable to a city seen from orbit, and the
- * ~250 R airglow layer is only visible edge-on at the limb, as in astronaut photographs.
+ * The night-vision gain (~10⁵ over a daylight exposure) that aurora and airglow share with the city
+ * lights, so their brightness relative to the cities is physical: a bright auroral arc (~100 kR in
+ * O I 557.7 nm, ≈ 2.8 × 10⁻⁵ W m⁻² sr⁻¹ seen straight down) is a tenth of a bright city, brighter
+ * edge-on; the ~400 R airglow layer is only visible edge-on at the limb, as in astronaut photographs.
  */
-export const NIGHT_GLOW_SCALE = 120;
+export const NIGHT_GLOW_SCALE = NIGHT_GAIN;
+
+/** Zenith column rates of the night airglow (kR): O I 557.7 nm and the mesospheric Na D doublet. */
+const AIRGLOW_KR = { green: 0.4, sodium: 0.1 };
+/** Scale height (km) of the Gaussian airglow layer at 95 km (AURORA_GLSL.airglowEmission). */
+const AIRGLOW_WIDTH_KM = 6;
 
 const tmpM = new THREE.Matrix4();
 const tmpV = new THREE.Vector3();
@@ -59,14 +64,10 @@ const tmpV2 = new THREE.Vector3();
 const tmpQ = new THREE.Quaternion();
 const tmpS = new THREE.Vector3();
 
-/**
- * Linear RGB of an emission line carrying a given radiant power (relative to 555 nm): the
- * chromaticity of λ scaled by its luminous efficiency V(λ), so a violet line is as dim as it is.
- */
-function lineRadiance(nm: number, scale: number): THREE.Vector3 {
+/** Linear RGB of an emission line of luminance `lum` (renderer units): the chromaticity of λ × lum. */
+function lineRGB(nm: number, lum: number): THREE.Vector3 {
   const c = lineColor(nm);
-  const k = (luminousEfficiency(nm) / luminousEfficiency(555)) * scale;
-  return new THREE.Vector3(c[0] * k, c[1] * k, c[2] * k);
+  return new THREE.Vector3(c[0] * lum, c[1] * lum, c[2] * lum);
 }
 
 let sharedEarthDefaults: { magAxis: THREE.Vector3 } | null = null;
@@ -140,6 +141,8 @@ export class Planet implements PlanetRenderer {
   private world: Record<string, THREE.IUniform> | null = null;
   private earth: EarthImagery | null = null;
   private earthMonths: [number, number] = [-1, -1];
+  private readonly blend = { a: 0, b: 0, t: 0 };
+  private renderer: THREE.WebGLRenderer | null = null;
   private usesEarth = false;
   private usesMoon = false;
   private disposed = false;
@@ -181,6 +184,13 @@ export class Planet implements PlanetRenderer {
     const airglowAmt = spec.airglow ?? (kind === 'earth' ? 0.6 : 0);
     const hasAurora = (auroraAmt > 0 || airglowAmt > 0) && !!this.atmo;
     const radiusKm = spec.radiusKm ?? (kind === 'earth' ? 6371 : 6371);
+    const steps = planetSteps(detail);
+    const glowGain = auroraLineGains(radiusKm);
+    // Airglow: zenith column rates → luminance per unit Gaussian profile per radius of path.
+    const airglowCol = (AIRGLOW_WIDTH_KM * Math.sqrt(Math.PI)) / radiusKm;
+    const airglowColor = lineRGB(AURORA_LINES.OI_GREEN, (AIRGLOW_KR.green * kiloRayleighRadiance(AURORA_LINES.OI_GREEN)) / airglowCol).add(
+      lineRGB(AURORA_LINES.NA_D, (AIRGLOW_KR.sodium * kiloRayleighRadiance(AURORA_LINES.NA_D)) / airglowCol),
+    );
 
     // Frame uniforms, recomputed per mesh in onBeforeRender.
     this.spinU = {
@@ -204,7 +214,8 @@ export class Planet implements PlanetRenderer {
       uPixelAngle: { value: 1e-3 },
       uDepthMode: { value: 0 },
       uLogDepthFC: { value: 1 },
-      uAtmoSteps: { value: Math.round(THREE.MathUtils.clamp(14 * detail, 6, 32)) },
+      uSteps: { value: new THREE.Vector3(steps.above, steps.below, steps.limb) },
+      uGlowSteps: { value: new THREE.Vector3(steps.auroraLow, steps.auroraHigh, steps.airglow) },
       uAtmoIntensity: { value: this.atmo?.intensity ?? 1 },
       uAtmoTint: { value: new THREE.Vector3(...(this.atmo?.tint ?? [1, 1, 1])) },
       uCloudLayer: { value: new THREE.Vector2(1 + 0.25 * H, 1 + 1.1 * H) },
@@ -225,12 +236,12 @@ export class Planet implements PlanetRenderer {
       uUmbraLight: { value: new THREE.Vector3(0, 0, 0) },
       uAurora: { value: auroraAmt },
       uAirglow: { value: airglowAmt },
-      uAuroraGreen: { value: lineRadiance(AURORA_LINES.OI_GREEN, 2 * NIGHT_GLOW_SCALE) },
-      uAuroraRed: { value: lineRadiance(AURORA_LINES.OI_RED, 2 * NIGHT_GLOW_SCALE) },
-      uAuroraBlue: { value: lineRadiance(AURORA_LINES.N2_PLUS, 2 * NIGHT_GLOW_SCALE) },
-      uAirglowColor: { value: lineRadiance(AURORA_LINES.OI_GREEN, 1).lerp(lineRadiance(AURORA_LINES.NA_D, 1), 0.35).multiplyScalar(0.004 * NIGHT_GLOW_SCALE) },
+      uAuroraGreen: { value: lineRGB(AURORA_LINES_NM.green, glowGain.green) },
+      uAuroraRed: { value: lineRGB(AURORA_LINES_NM.red, glowGain.red) },
+      uAuroraBlue: { value: lineRGB(AURORA_LINES_NM.blue, glowGain.blue) },
+      uAirglowColor: { value: airglowColor },
       uAuroraTime: { value: 0 },
-      uAuroraShell: { value: new THREE.Vector4(1 + 90 / radiusKm, 1 + 420 / radiusKm, 1 / radiusKm, 0) },
+      uAuroraShell: { value: new THREE.Vector4(1 + AURORA_SHELL_KM[0] / radiusKm, 1 + AURORA_SHELL_KM[1] / radiusKm, 1 / radiusKm, 0) },
       uRingTex: { value: null },
       uRingRange: { value: new THREE.Vector2(0, 0) },
       uRingOpacity: { value: spec.rings?.opacity ?? 1 },
@@ -246,7 +257,7 @@ export class Planet implements PlanetRenderer {
       this.common.uRingRange.value.set(spec.rings!.inner, spec.rings!.outer);
     }
 
-    const defines: Record<string, string> = {};
+    const defines: Record<string, string> = { DETAIL_LEVEL: String(steps.detailLevel) };
     if (this.usesEarth) defines.KIND_EARTH = '';
     else if (this.usesMoon) defines.TEX_MOON = '';
     else defines[kindDefine(kind)] = '';
@@ -329,7 +340,9 @@ export class Planet implements PlanetRenderer {
 
     // ——— Atmosphere: transmittance (multiply) then in-scatter (add) ———
     if (this.atmo) {
-      const ag = proxyGeometry(this.atmo.top, this.ellipsoid, 12, 1.004);
+      // The proxy encloses the air and, on worlds with aurora/airglow, their emitting shells too.
+      const shellTop = hasAurora ? Math.max(this.atmo.top, 1 + AURORA_SHELL_KM[1] / radiusKm) : this.atmo.top;
+      const ag = proxyGeometry(shellTop, this.ellipsoid, 12, 1.004);
       this.geometries.push(ag);
       const mk = (transmit: boolean) => {
         const m = new THREE.ShaderMaterial({
@@ -385,7 +398,8 @@ export class Planet implements PlanetRenderer {
     // ——— Imagery ———
     if (this.usesEarth) {
       this.surface.visible = false;
-      this.ready = acquireEarthImagery().then(async (img) => {
+      const maxWidth = detail >= 0.9 ? 4096 : 2048;
+      this.ready = acquireEarthImagery({ anisotropy: 8, maxWidth }).then(async (img) => {
         if (this.disposed) return;
         this.earth = img;
         this.surfaceMat.uniforms.uNight.value = img.night;
@@ -396,7 +410,7 @@ export class Planet implements PlanetRenderer {
       });
     } else if (this.usesMoon) {
       this.surface.visible = false;
-      this.ready = acquireMoonImagery().then((m) => {
+      this.ready = acquireMoonImagery({ anisotropy: 8, maxWidth: detail >= 0.9 ? 4096 : 2048 }).then((m) => {
         if (this.disposed) return;
         this.surfaceMat.uniforms.uMoonColor.value = m.color;
         this.surfaceMat.uniforms.uMoonHeight.value = m.height;
@@ -421,8 +435,17 @@ export class Planet implements PlanetRenderer {
       u.uCubeB.value = this.baked.normal?.texture ?? this.baked.albedo?.texture ?? null;
       u.uCubeC.value = this.baked.clouds?.texture ?? this.baked.albedo?.texture ?? null;
     }
+    this.renderer = renderer;
     const aniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
-    if (this.earth) for (const t of [this.earth.night, this.earth.clouds, this.earth.topo]) t.anisotropy = aniso;
+    if (this.earth) {
+      // Upload (and build mipmaps) now rather than inside the first frame that draws the planet.
+      for (const t of [this.earth.night, this.earth.clouds, this.earth.topo]) {
+        t.anisotropy = aniso;
+        renderer.initTexture(t);
+      }
+      const u = this.surfaceMat.uniforms;
+      for (const t of [u.uDayA.value, u.uDayB.value] as Array<THREE.Texture | null>) if (t) renderer.initTexture(t);
+    }
   }
 
   // ——— Frame sync ———
@@ -515,7 +538,7 @@ export class Planet implements PlanetRenderer {
     const k = (2 / 3) * lambertPhase(alpha) * (this.atmo ? 1.1 : 1);
     const pc = this.pointMat.uniforms.uPointColor.value as THREE.Vector3;
     pc.set(this.meanAlbedo.r * k * c.uSunColor.value.x, this.meanAlbedo.g * k * c.uSunColor.value.y, this.meanAlbedo.b * k * c.uSunColor.value.z);
-    if (this.usesEarth) void this.syncSeason(false);
+    if (this.usesEarth) this.syncSeason(false);
   }
 
   setRotation(angle: number): void {
@@ -524,20 +547,31 @@ export class Planet implements PlanetRenderer {
 
   setDate(ms: number): void {
     this.dateMs = ms;
-    if (this.usesEarth) void this.syncSeason(false);
+    if (this.usesEarth) this.syncSeason(false);
   }
 
-  private async syncSeason(force: boolean): Promise<void> {
+  /**
+   * Seasonal imagery: blend weight every frame (no allocation); when the bracketing months change,
+   * load (once) and upload the new pair, and let the imagery cache release the months no longer used.
+   */
+  private syncSeason(force: boolean): Promise<void> | void {
     const img = this.earth;
     if (!img) return;
-    const { a, b, t } = seasonalBlend(this.dateMs);
+    const { a, b, t } = seasonalBlend(this.dateMs, this.blend);
     this.surfaceMat.uniforms.uDayMix.value = t;
     if (!force && this.earthMonths[0] === a && this.earthMonths[1] === b) return;
-    this.earthMonths = [a, b];
-    const [ta, tb] = await Promise.all([img.loadDay(a), img.loadDay(b)]);
-    if (this.disposed || this.earthMonths[0] !== a || this.earthMonths[1] !== b) return;
-    this.surfaceMat.uniforms.uDayA.value = ta;
-    this.surfaceMat.uniforms.uDayB.value = tb;
+    this.earthMonths[0] = a;
+    this.earthMonths[1] = b;
+    return Promise.all([img.loadDay(a), img.loadDay(b)]).then(([ta, tb]) => {
+      if (this.disposed || this.earthMonths[0] !== a || this.earthMonths[1] !== b) return;
+      this.surfaceMat.uniforms.uDayA.value = ta;
+      this.surfaceMat.uniforms.uDayB.value = tb;
+      img.useMonths(this, a, b);
+      if (this.renderer) {
+        this.renderer.initTexture(ta);
+        this.renderer.initTexture(tb);
+      }
+    });
   }
 
   /** (ext) Planetocentric position of the named storm (rad), or null. */
@@ -577,7 +611,10 @@ export class Planet implements PlanetRenderer {
     this.ringTex?.dispose();
     this.baked?.dispose();
     if (this.luts) releaseLUTs(this.luts);
-    if (this.usesEarth) releaseEarthImagery();
+    if (this.usesEarth) {
+      this.earth?.release(this);
+      releaseEarthImagery();
+    }
     if (this.usesMoon) releaseMoonImagery();
   }
 }

@@ -41,6 +41,45 @@ export function balmerColor(): THREE.Color {
   return new THREE.Color(r, g, b);
 }
 
+/**
+ * CPU twin of the shader's ray–jet interval (for tests): the parameter range [t0, t1] (t ≥ 0) where the
+ * ray ro + t·rd lies inside the cone r ≤ R0 + k·z with 0 ≤ z ≤ zMax, or null. The interior of one
+ * nappe of a cone is convex, so the answer is a single interval; the quadratic
+ * Q(t) = A t² + 2B t + C ≤ 0 describes both nappes and the slab removes the far one (its apex sits at
+ * z = −R0/k < 0).
+ */
+export function plumeConeInterval(ro: THREE.Vector3, rd: THREE.Vector3, R0: number, k: number, zMax: number): [number, number] | null {
+  const w0 = R0 + k * ro.z;
+  const A = rd.x * rd.x + rd.y * rd.y - k * k * rd.z * rd.z;
+  const B = ro.x * rd.x + ro.y * rd.y - k * w0 * rd.z;
+  const C = ro.x * ro.x + ro.y * ro.y - w0 * w0;
+  const disc = B * B - A * C;
+  let t0 = 0, t1 = 1e9;
+  if (Math.abs(A) < 1e-7) {
+    if (Math.abs(B) < 1e-9) {
+      if (C > 0) return null;
+    } else if (B > 0) t1 = -C / (2 * B);
+    else t0 = -C / (2 * B);
+  } else if (A > 0) {
+    if (disc < 0) return null;
+    const h = Math.sqrt(disc);
+    t0 = (-B - h) / A;
+    t1 = (-B + h) / A;
+  } else {
+    const h = Math.sqrt(Math.max(disc, 0));
+    const tLo = (-B + h) / A, tHi = (-B - h) / A;
+    if (rd.z > 0) t0 = tHi;
+    else t1 = tLo;
+  }
+  if (Math.abs(rd.z) > 1e-9) {
+    const z0 = -ro.z / rd.z, z1 = (zMax - ro.z) / rd.z;
+    t0 = Math.max(t0, Math.min(z0, z1));
+    t1 = Math.min(t1, Math.max(z0, z1));
+  } else if (ro.z < 0 || ro.z > zMax) return null;
+  t0 = Math.max(t0, 0);
+  return t1 > t0 ? [t0, t1] : null;
+}
+
 const VERT = /* glsl */ `
 out vec3 vPosL;
 void main() {

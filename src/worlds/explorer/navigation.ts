@@ -12,11 +12,14 @@ import { Frame, commonAncestor, convertPoint, convertDirection, rootDirToFrame, 
  * AUTOPILOT. A trip from A to B is flown in logarithmic distance. Departing, the distance from the
  * start grows as r_s = L₀ (e^λ − 1); arriving, the distance to the end shrinks as r_t = L₁ (e^μ − 1),
  * where L₀, L₁ are the natural scales of the two ends (e.g. the planet's radius, the galaxy's size).
- * The trip parameter Λ = λ + (μ_max − μ) runs over Λ_tot = ln(1 + D/2L₀) + ln(1 + D/2L₁) with a
- * quintic ease, so the traveller leaves smoothly, crosses the middle at ~D/2 per unit Λ (velocity is
- * continuous at the switch), and arrives at rest. Every point is evaluated in the frame of the end it
- * is close to (full float64 precision at both ends); in the middle the two expressions are blended in
- * their common ancestor frame, which also absorbs the motion of moving end frames (planets).
+ * The two branches meet at r_s = X, where their rates dr/dΛ = L₀ + r_s and L₁ + r_t agree:
+ * L₀ + X = L₁ + (D − X), i.e. X = (D + L₁ − L₀)/2 (clamped inside the trip when one end's scale
+ * exceeds the whole distance). The trip parameter Λ = λ + (μ_max − μ) runs over
+ * Λ_tot = ln(1 + X/L₀) + ln(1 + (D − X)/L₁) with a quintic ease, so the traveller leaves smoothly,
+ * crosses the switch with continuous velocity, and arrives at rest. Every point is evaluated in the
+ * frame of the end it is close to (full float64 precision at both ends); in the middle the two
+ * expressions are blended in their common ancestor frame, which also absorbs the motion of moving end
+ * frames (planets).
  */
 
 export const SPEED_OF_LIGHT = 299_792_458;
@@ -73,25 +76,38 @@ export function tripDuration(logLength: number): number {
   return THREE.MathUtils.clamp(3.5 + 0.42 * logLength, 5, 24);
 }
 
+/**
+ * Distance from the start (m) at which the departure branch hands over to the arrival branch:
+ * X = (D + L₁ − L₀)/2 makes dr/dΛ continuous there; kept within [2 %, 98 %] of the trip.
+ */
+export function tripSwitch(D: number, L0: number, L1: number): number {
+  return THREE.MathUtils.clamp(0.5 * (D + L1 - L0), 0.02 * D, 0.98 * D);
+}
+
 /** Log length Λ of a trip of distance D between ends of scales L0, L1 (all metres). */
 export function tripLogLength(D: number, L0: number, L1: number): number {
-  return Math.log1p(D / (2 * Math.max(L0, 1e-3))) + Math.log1p(D / (2 * Math.max(L1, 1e-3)));
+  const a = Math.max(L0, 1e-3), b = Math.max(L1, 1e-3);
+  const X = tripSwitch(D, a, b);
+  return Math.log1p(X / a) + Math.log1p((D - X) / b);
 }
 
 /**
- * Distance from the start and to the end (metres) at trip parameter Λ ∈ [0, Λtot].
- * Pure function; exported for tests.
+ * Distance from the start and to the end (metres) at trip parameter Λ ∈ [0, Λtot], and the rate
+ * dr/dΛ (metres per unit Λ) along the path. Pure function; exported for tests.
  */
-export function tripDistances(Lam: number, D: number, L0: number, L1: number): { fromStart: number; toEnd: number; departing: boolean } {
-  const lmax = Math.log1p(D / (2 * L0));
-  const mmax = Math.log1p(D / (2 * L1));
+export function tripDistances(Lam: number, D: number, L0: number, L1: number): { fromStart: number; toEnd: number; departing: boolean; rate: number } {
+  const a = Math.max(L0, 1e-3), b = Math.max(L1, 1e-3);
+  const X = tripSwitch(D, a, b);
+  const lmax = Math.log1p(X / a);
+  const mmax = Math.log1p((D - X) / b);
   if (Lam <= lmax) {
-    const rs = L0 * Math.expm1(Math.max(0, Lam));
-    return { fromStart: rs, toEnd: D - rs, departing: true };
+    const rs = a * Math.expm1(Math.max(0, Lam));
+    return { fromStart: rs, toEnd: D - rs, departing: true, rate: a + rs };
   }
-  const mu = Math.max(0, mmax - (Lam - lmax));
-  const rt = L1 * Math.expm1(mu);
-  return { fromStart: D - rt, toEnd: rt, departing: false };
+  // (λ_max + μ_max is Λ_tot exactly as tripLogLength computes it, so μ = 0 at the end, not ±1 ULP.)
+  const mu = Math.max(0, lmax + mmax - Lam);
+  const rt = b * Math.expm1(mu);
+  return { fromStart: D - rt, toEnd: rt, departing: false, rate: b + rt };
 }
 
 export class Trip {
@@ -113,10 +129,12 @@ export class Trip {
   private q1 = new THREE.Quaternion();
   private turn: number;
   private hasFinal: boolean;
-  /** Current speed (m/s), measured. */
+  /**
+   * Current speed along the path (m/s): dr/dΛ · Λ_tot · ṡ(u) / T, exact. (Differencing positions in
+   * the root frame would not do: near a planet the root's float64 grain is ~50 km, ≈ 3000 km/s of
+   * noise at 60 fps.)
+   */
   speed = 0;
-  private prevRoot = new THREE.Vector3();
-  private prevValid = false;
 
   constructor(start: TripEnd, end: TripEnd, o: TripOptions = {}) {
     this.start = { frame: start.frame, position: start.position.clone(), scale: start.scale };
@@ -170,13 +188,10 @@ export class Trip {
    */
   step(dt: number, nav: NavState): void {
     this.t = Math.min(this.duration, this.t + dt);
-    this.sample(this.progress, nav);
-    // Measured speed (root axes, metres).
-    const rootPos = convertPoint(nav.position, nav.frame, rootOf(nav.frame), _w).multiplyScalar(rootOf(nav.frame).metres);
-    if (this.prevValid && dt > 0) this.speed = rootPos.distanceTo(this.prevRoot) / dt;
-    this.prevRoot.copy(rootPos);
-    this.prevValid = true;
-    if (this.done) this.speed = 0;
+    const u = this.progress;
+    const Lam = smoother(u) * this.logLength;
+    this.speed = this.done ? 0 : (tripDistances(Lam, this.distance, this.start.scale, this.end.scale).rate * this.logLength * smootherDeriv(u)) / this.duration;
+    this.sample(u, nav);
   }
 
   /** Position and attitude at progress u ∈ [0, 1]. */
@@ -223,13 +238,6 @@ export class Trip {
   }
 }
 
-function rootOf(f: Frame): Frame {
-  let r = f;
-  while (r.parent) r = r.parent;
-  return r;
-}
-
-const _w = new THREE.Vector3();
 const _pa = new THREE.Vector3();
 const _pb = new THREE.Vector3();
 const _q = new THREE.Quaternion();

@@ -29,11 +29,8 @@ export interface ProcSystemSpec {
   parent: Frame;
   position: THREE.Vector3;
   seed: number;
+  /** Generator hint: always a fixed stage and the catalogue T_eff (explorer/hosts.ts procHostHint). */
   hint: StarHint;
-  /** Physical star (for lighting): luminosity L☉, radius R☉, T_eff. */
-  lum: number;
-  radius: number;
-  teff: number;
 }
 
 export class ProcSystem {

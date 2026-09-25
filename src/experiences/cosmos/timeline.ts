@@ -191,19 +191,17 @@ function clamp01(x: number): number {
 /**
  * Visible-band radiance of a blackbody at T relative to T = 3000 K (the last-scattering surface),
  * ∫ B_λ(T) ȳ(λ) dλ. It falls by ~10⁴ between 3000 K and 1000 K: the afterglow leaves the visible
- * a few hundred million years into the Dark Ages.
+ * a few hundred million years into the Dark Ages. Evaluated every frame, so the photopic ȳ(λ)
+ * table is built once and nothing is allocated per call (81 Planck terms ≈ a few µs).
  */
-const lumCache = new Map<number, number>();
+const Y_BAR = Float64Array.from({ length: 81 }, (_, i) => cieXYZ(380 + 5 * i)[1]);
 function visibleRadiance(T: number): number {
-  const key = Math.round(T);
-  const hit = lumCache.get(key);
-  if (hit !== undefined) return hit;
+  const t = Math.max(T, 50);
   let s = 0;
-  for (let nm = 380; nm <= 780; nm += 5) s += planck(nm * 1e-9, Math.max(T, 50)) * cieXYZ(nm)[1];
-  if (lumCache.size > 5000) lumCache.clear();
-  lumCache.set(key, s);
+  for (let i = 0; i < 81; i++) s += planck((380 + 5 * i) * 1e-9, t) * Y_BAR[i];
   return s;
 }
+const RADIANCE_3000 = visibleRadiance(3000);
 export function fireballRadiance(T: number): number {
-  return visibleRadiance(T) / visibleRadiance(3000);
+  return visibleRadiance(T) / RADIANCE_3000;
 }

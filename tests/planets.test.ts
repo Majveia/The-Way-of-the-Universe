@@ -1,5 +1,36 @@
 import { describe, expect, it } from 'vitest';
-import { gmst, moonState, sunState, msToJD, solarElevation, meanObliquity, eclipticToEquatorial } from '../src/physics/planets-ephemeris';
+import * as THREE from 'three';
+import { gmst, moonState, sunState, msToJD, solarElevation, meanObliquity, eclipticToEquatorial, radecToVector } from '../src/physics/planets-ephemeris';
+import { astroToThree } from '../src/physics/kepler';
+import {
+  AURORA_BRIGHT_KR,
+  AURORA_LINES_NM,
+  CITY_LUMINANCE,
+  LIGHTS_SCALE,
+  NIGHT_GAIN,
+  UNIT_LUMINANCE,
+  auroraGreenProfile,
+  auroraLineGains,
+  auroraRedProfile,
+  kiloRayleighLuminance,
+  kiloRayleighRadiance,
+  planetSteps,
+  profileColumnKm,
+} from '../src/worlds/planet/glow';
+import {
+  composeSeg,
+  integrateAtmoRef,
+  lutDecode,
+  lutEncode,
+  occluderVisibility,
+  raySphere,
+  shellIntegral,
+  shellPath,
+  shellSample,
+  type V3,
+} from '../src/worlds/planet/reference';
+import { LUT_SCALE } from '../src/worlds/planet/luts';
+import { seasonalBlend, utcYear } from '../src/worlds/planet/textures';
 import {
   EARTH_ATMOSPHERE,
   MARS_ATMOSPHERE,
@@ -14,6 +45,7 @@ import {
   transmittanceToTop,
 } from '../src/physics/planets-atmosphere';
 import {
+  C2_555,
   SUN_RADIANCE_1AU,
   cloudReflectance,
   diskAverageRadiance,

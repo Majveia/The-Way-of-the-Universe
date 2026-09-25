@@ -661,7 +661,7 @@ class Gargantua implements Experience {
     const target = this.baseExposure * auto;
     this.exposure = this.exposure < 0 || this.ctx.engine.shotMode ? target : this.exposure + (target - this.exposure) * (1 - Math.exp(-dt / 0.35));
     this.ctx.post.exposure = this.exposure;
-    this.bh.setParams({ time: this.time });
+    this.bh.setTime(this.time);
 
     this.readoutTimer -= dt;
     if (this.readoutTimer <= 0) {

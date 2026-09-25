@@ -4,6 +4,7 @@ import { BlackHoleRenderer, type BlackHoleQuality } from '../../worlds/blackhole
 import { FullscreenQuad, FULLSCREEN_VERT } from '../../core/post/FullscreenQuad';
 import { Frame, UNIT } from '../../worlds/explorer/frames';
 import { LayerFader } from '../../worlds/explorer/LayerFader';
+import { SGRA } from '../../worlds/explorer/universe';
 
 /**
  * Sagittarius A*, the Milky Way's central black hole, as a stop of the explorer.
@@ -19,7 +20,7 @@ import { LayerFader } from '../../worlds/explorer/LayerFader';
  * the bright thin disk is drawn so the lensing can be seen, and the UI says so. The ray-traced view is
  * mixed in over 2 500 → 1 500 r_g, where lensing is still negligible, so nothing pops.
  */
-export const SGRA = { massSun: 4.3e6, rgMetres: 6.35e9, tgSeconds: 21.2 };
+export { SGRA };
 const RG_PC = SGRA.rgMetres / UNIT.PC;
 /** Typical (log-mean) radiance of the lensed galactic-centre sky, post-exposure units. */
 const ENV_LEVEL = 0.012;
@@ -31,6 +32,31 @@ out vec4 outColor;
 uniform sampler2D tSrc;
 void main() { outColor = vec4(texture(tSrc, vUv).rgb, 1.0); }`;
 
+/**
+ * Metering reduction: each texel of a 16 × 16 grid over a captured face stores the mean natural log of
+ * the luminance of 4 × 4 taps in its footprint, packed as 16-bit fixed point in R, G of an RGBA8
+ * target — readable on every WebGL2 device (float readbacks are not guaranteed) and small enough to
+ * read back asynchronously without stalling the frame. Range: ln Y ∈ [−12, 4].
+ */
+const METER_GRID = 16;
+const LOGLUM_FRAG = /* glsl */ `
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D tSrc;
+void main() {
+  vec2 cell = floor(vUv * ${METER_GRID}.0);
+  float s = 0.0;
+  for (int j = 0; j < 4; j++)
+  for (int i = 0; i < 4; i++) {
+    vec2 uv = (cell + (vec2(float(i), float(j)) + 0.5) * 0.25) / ${METER_GRID}.0;
+    vec3 c = texture(tSrc, uv).rgb;
+    s += log(max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-5));
+  }
+  float v = clamp((s / 16.0 + 12.0) / 16.0, 0.0, 1.0) * 255.0;
+  outColor = vec4(floor(v) / 255.0, fract(v), 0.0, 1.0);
+}`;
+
 export class SgrARegime {
   readonly frame: Frame;
   bh: BlackHoleRenderer | null = null;
@@ -40,6 +66,10 @@ export class SgrARegime {
   private faceRT: THREE.WebGLRenderTarget | null = null;
   private copy: FullscreenQuad;
   private copyMat: THREE.ShaderMaterial;
+  private meterMat: THREE.ShaderMaterial;
+  private meterRT: THREE.WebGLRenderTarget | null = null;
+  private meterBuf = new Uint8Array(METER_GRID * 6 * METER_GRID * 4);
+  private meterToken = 0;
   private fader: LayerFader;
   private captured = false;
   private cam = new THREE.PerspectiveCamera(55, 1, 0.01, 1e9);
@@ -58,6 +88,7 @@ export class SgrARegime {
     this.fader = new LayerFader(ctx.renderer, 'mix');
     this.copyMat = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: FULLSCREEN_VERT, fragmentShader: COPY_FRAG, uniforms: { tSrc: { value: null } }, depthTest: false, depthWrite: false });
     this.copy = new FullscreenQuad(this.copyMat);
+    this.meterMat = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: FULLSCREEN_VERT, fragmentShader: LOGLUM_FRAG, uniforms: { tSrc: { value: null } }, depthTest: false, depthWrite: false });
     // Cube-face cameras (three.js CubeCamera conventions, WebGL coordinate system).
     const dirs: Array<[number[], number[]]> = [
       [[1, 0, 0], [0, -1, 0]],
@@ -90,6 +121,9 @@ export class SgrARegime {
       this.cube = null;
       this.faceRT?.dispose();
       this.faceRT = null;
+      this.meterRT?.dispose();
+      this.meterRT = null;
+      this.meterToken++;
       this.captured = false;
     }
   }
@@ -107,42 +141,52 @@ export class SgrARegime {
     const r = this.ctx.renderer;
     const size = this.ctx.quality.detail >= 1 ? 512 : 256;
     if (!this.cube) {
-      this.cube = new THREE.WebGLCubeRenderTarget(size, { type: THREE.HalfFloatType, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter });
-      this.faceRT = new THREE.WebGLRenderTarget(size, size, { type: THREE.HalfFloatType, depthBuffer: true });
+      // Half float where it is renderable (HDR sky); 8-bit otherwise, so the lens never samples an
+      // incomplete (black) cube map.
+      const type = this.ctx.engine.halfFloat ? THREE.HalfFloatType : THREE.UnsignedByteType;
+      this.cube = new THREE.WebGLCubeRenderTarget(size, { type, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter });
+      this.faceRT = new THREE.WebGLRenderTarget(size, size, { type, depthBuffer: true });
+      this.meterRT = new THREE.WebGLRenderTarget(METER_GRID * 6, METER_GRID, { type: THREE.UnsignedByteType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false });
     }
     const prev = r.getRenderTarget();
-    // Meter the captured sky (log-mean luminance over all faces, sparse samples) so the lensed
-    // environment keeps the dark-adapted look of the sky it replaces (a bulge-lit sky is bright).
-    const buf = new Uint16Array(size * size * 4);
-    let sumLog = 0;
-    let n = 0;
+    const meter = this.meterRT!;
     for (let i = 0; i < 6; i++) {
       r.setRenderTarget(this.faceRT);
       r.setClearColor(0x000000, 1);
       r.clear(true, true, false);
       draw(this.faceCams[i], this.faceRT!);
-      try {
-        r.readRenderTargetPixels(this.faceRT!, 0, 0, size, size, buf);
-        for (let k = 0; k < size * size; k += 97) {
-          const R = THREE.DataUtils.fromHalfFloat(buf[k * 4]), G = THREE.DataUtils.fromHalfFloat(buf[k * 4 + 1]), B = THREE.DataUtils.fromHalfFloat(buf[k * 4 + 2]);
-          const Y = 0.2126 * R + 0.7152 * G + 0.0722 * B;
-          if (Number.isFinite(Y)) {
-            sumLog += Math.log(Math.max(Y, 1e-5));
-            n++;
-          }
-        }
-      } catch {
-        /* metering is optional */
-      }
       this.copyMat.uniforms.tSrc.value = this.faceRT!.texture;
       r.setRenderTarget(this.cube, i);
       r.render(this.copy.scene, this.copy.camera);
+      // Log-luminance of this face into its 16 × 16 cell of the meter target.
+      this.meterMat.uniforms.tSrc.value = this.faceRT!.texture;
+      this.copy.mesh.material = this.meterMat;
+      meter.viewport.set(i * METER_GRID, 0, METER_GRID, METER_GRID);
+      r.setRenderTarget(meter);
+      r.render(this.copy.scene, this.copy.camera);
+      this.copy.mesh.material = this.copyMat;
     }
+    meter.viewport.set(0, 0, meter.width, meter.height);
     r.setRenderTarget(prev);
-    const logMean = n > 0 ? Math.exp(sumLog / n) : 0.05;
-    this.envNorm = THREE.MathUtils.clamp(ENV_LEVEL / Math.max(logMean, 1e-6), 1e-3, 10);
     this.bh.setEnvironment(this.cube.texture);
     this.captured = true;
+    // Meter the captured sky (log-mean luminance over all faces) so the lensed environment keeps the
+    // dark-adapted look of the sky it replaces (a bulge-lit sky is bright). Read back asynchronously
+    // (no pipeline stall); the lens is still invisible here (it mixes in below 2 500 r_g).
+    const token = ++this.meterToken;
+    r.readRenderTargetPixelsAsync(meter, 0, 0, meter.width, meter.height, this.meterBuf)
+      .then(() => {
+        if (token !== this.meterToken) return;
+        const b = this.meterBuf;
+        let sum = 0;
+        const n = meter.width * meter.height;
+        for (let k = 0; k < n; k++) sum += ((b[k * 4] + b[k * 4 + 1] / 255) / 255) * 16 - 12;
+        this.envNorm = THREE.MathUtils.clamp(ENV_LEVEL / Math.max(Math.exp(sum / n), 1e-6), 1e-3, 10);
+      })
+      .catch(() => {
+        /* metering is optional: keep the default normalisation */
+      });
+    r.setRenderTarget(prev);
   }
 
   /** Advance the disk's clock by `seconds` of simulated time. */
@@ -181,10 +225,13 @@ export class SgrARegime {
   }
 
   dispose(): void {
+    this.meterToken++;
     this.bh?.dispose();
     this.cube?.dispose();
     this.faceRT?.dispose();
+    this.meterRT?.dispose();
     this.copyMat.dispose();
+    this.meterMat.dispose();
     this.fader.dispose();
   }
 }

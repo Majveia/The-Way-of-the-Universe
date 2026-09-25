@@ -42,6 +42,12 @@ function eqVecToGal(x: number, y: number, z: number, out: THREE.Vector3): THREE.
   return out.set(gx, gz, -gy);
 }
 
+/**
+ * Sagittarius A*: mass 4.30 × 10⁶ M☉ (GRAVITY Collaboration 2022), so r_g = GM/c² = 6.35 × 10⁹ m
+ * (0.042 AU) and t_g = r_g/c = 21.2 s. The explorer's black-hole frame is measured in r_g.
+ */
+export const SGRA = { massSun: 4.3e6, rgMetres: 6.35e9, tgSeconds: 21.2 };
+
 /** Virgo cluster centre (M87): direction and distance. */
 export const VIRGO = { l: 283.78, b: 74.49, distanceMpc: 16.5 };
 

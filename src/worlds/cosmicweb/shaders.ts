@@ -47,12 +47,13 @@ export const DENSITY_SAMPLE_GLSL = /* glsl */ `
 uniform sampler2D uDensity;
 uniform float uGrid;       // G
 uniform float uTilesX;
+uniform float uDensDec;    // 1 for float atlases; undoes the 8-bit fallback's scaling
 float densityTexel(ivec3 c) {
   int G = int(uGrid + 0.5);
   c = (c + 4 * G) % G;   // % is undefined for negative operands in GLSL ES 3.00
   int tx = c.z % int(uTilesX + 0.5);
   int ty = c.z / int(uTilesX + 0.5);
-  return texelFetch(uDensity, ivec2(tx * G + c.x, ty * G + c.y), 0).r;
+  return texelFetch(uDensity, ivec2(tx * G + c.x, ty * G + c.y), 0).r * uDensDec;
 }
 float sampleDensity(vec3 u) {
   vec3 g = u * uGrid - 0.5;
@@ -80,6 +81,12 @@ uniform float uWrap;       // 1 = periodic wrap around uWrapCenter (immersive), 
 uniform vec3 uOffset;      // replica offset in boxes
 uniform vec4 uSlab;        // xyz = axis (unit), w = half thickness (box fraction; 0 = off)
 uniform float uSlabCenter;
+#ifdef REPLICAS
+in vec3 aOffset;           // periodic image of the box (instanced: one draw for all 26 neighbours)
+#define OFFSET aOffset
+#else
+#define OFFSET uOffset
+#endif
 vec3 placeWorld(vec3 u, out float keep) {
   keep = 1.0;
   vec3 rel;
@@ -90,7 +97,7 @@ vec3 placeWorld(vec3 u, out float keep) {
     s -= floor(s + 0.5);
     keep = 1.0 - smoothstep(uSlab.w * 0.8, uSlab.w, abs(s));
   }
-  return (rel + uOffset) * uBoxWorld;
+  return (rel + OFFSET) * uBoxWorld;
 }
 `;
 
@@ -154,6 +161,9 @@ ${DENSITY_SAMPLE_GLSL}
 ${PLACE_GLSL}
 uniform float uSpacing;    // mean interparticle spacing, world units
 uniform float uSmooth;     // smoothing length in units of the spacing at mean density
+uniform float uHMax;       // largest smoothing length (deep voids), in units of the spacing
+uniform vec2 uVoidFade;    // ρ/ρ̄ over which the emission of void particles fades in (y ≤ x: off)
+uniform vec3 uThin;        // importance thinning below ρ/ρ̄ = x: keep fraction (ρ/x)^y, at least z (z = 0: off)
 uniform float uFocalPx;    // focal length in pixels
 uniform float uMinPx;
 uniform float uMaxPx;
@@ -166,8 +176,15 @@ uniform float uGain;
 uniform float uEmit;       // emissivity per unit mass ∝ (ρ/ρ̄)^uEmit (collisional emission ∝ ρ², clumping)
 out float vW;
 out float vLog;
+flat out float vSeed;
 void main() {
+#ifdef REPLICAS
+  // Each periodic image draws a different sparse subset of the particles.
+  int off = int(dot(aOffset, vec3(1.0, 2.0, 3.0)) + 12.5);
+  int id = gl_VertexID * uStride + (off - (off / uStride) * uStride);
+#else
   int id = gl_VertexID * uStride + uStrideOffset;
+#endif
   vec3 u = fetchBox(id);
   float rho = max(sampleDensity(u), 0.02);
   float keep;
@@ -176,7 +193,7 @@ void main() {
   float dist = max(-mv.z, 1e-4);
   gl_Position = projectionMatrix * mv;
   // SPH-like adaptive smoothing: h ∝ (m/ρ)^{1/3}.
-  float h = clamp(uSmooth * uSpacing * pow(rho, -1.0 / 3.0), 0.3 * uSpacing, 2.6 * uSpacing);
+  float h = clamp(uSmooth * uSpacing * pow(rho, -1.0 / 3.0), 0.3 * uSpacing, uHMax * uSpacing);
   float r = clamp(h * uFocalPx / dist, uMinPx, uMaxPx);
   gl_PointSize = 2.0 * r;
   // Energy-normalised: the flux m/d² spreads over the sprite (mean kernel 1/4 over the disk).
@@ -186,29 +203,65 @@ void main() {
   float fade = smoothstep(uNear, uNear + 2.0 * h, dist);
   if (uFadeFar > 0.0) fade *= 1.0 - smoothstep(0.78 * uFadeFar, uFadeFar, length(mv.xyz));
   fade *= keep;
-  if (dot(uOffset, uOffset) > 0.0) {
+  // Emission ∝ ρ² leaves the deepest voids almost dark, yet their particles carry the largest
+  // sprites (h ∝ ρ^(−1/3)): fading them out keeps voids black and saves most of the fill rate.
+  if (uVoidFade.y > uVoidFade.x) fade *= smoothstep(uVoidFade.x, uVoidFade.y, rho);
+  // Importance thinning. Below mean density the sprites are big (h ∝ ρ^(−1/3)) but faint
+  // (emission ∝ ρ²): at z = 0 they are over half of all sprite fragments for ~1 % of the light.
+  // Draw only a fraction P(ρ) of them, chosen by a fixed per-particle random number u, and
+  // divide by the expected acceptance E(P): the expected light is unchanged, dense particles
+  // (P = 1) always count exactly once, and the linear band of width ε in u lets particles fade
+  // in and out smoothly as their density evolves — nothing pops.
+  if (uThin.z > 0.0 && rho < uThin.x) {
+    const float EPS = 0.15;
+    float P = max(pow(rho / uThin.x, uThin.y), uThin.z);
+    uint hsh = uint(id) * 2654435761u;
+    hsh ^= hsh >> 15;
+    hsh *= 2246822519u;
+    hsh ^= hsh >> 13;
+    float u = float(hsh >> 8) * (1.0 / 16777216.0);
+    float acc = clamp((P - u) / EPS + 1.0, 0.0, 1.0);
+    float E = P <= 1.0 - EPS ? P + 0.5 * EPS : 1.0 - (1.0 - P) * (1.0 - P) / (2.0 * EPS);
+    fade *= acc / E;
+  }
+  if (dot(OFFSET, OFFSET) > 0.0) {
     // Periodic replicas: a faint suggestion of the infinite universe — dimming with distance from
     // the simulated box and never close to the camera (no giant sprites across the view).
     vec3 outside = max(abs(w / uBoxWorld) - 0.5, 0.0);
     fade *= exp(-3.0 * length(outside)) * smoothstep(0.35 * uBoxWorld, 0.9 * uBoxWorld, dist);
   }
   vW = w8 * fade * uGain * pow(rho, uEmit);
-  vLog = log2(rho) * 0.30103;   // log10
-  if (fade <= 0.0) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+  vLog = min(log2(rho) * 0.30103, 3.0);   // log10
+  vSeed = float(id & 4095) * 0.6180339;
+  // Culled: a point whose centre is outside the clip volume is discarded before rasterisation.
+  if (fade <= 0.0) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    gl_PointSize = 1.0;
+  }
 }`;
 
 export const ACCUM_FRAG = /* glsl */ `
 precision highp float;
 in float vW;
 in float vLog;
+flat in float vSeed;
 out vec4 outColor;
+uniform float uEncode;     // 1 for half-float accumulators; < 1 for the 8-bit fallback
+uniform float uDither;     // 0, or one 8-bit step: stochastic rounding for the 8-bit fallback
 void main() {
   vec2 q = gl_PointCoord * 2.0 - 1.0;
   float r2 = dot(q, q);
   if (r2 >= 1.0) discard;
   float k = 1.0 - r2;
   k = k * k * k;                 // (1 − s²)³, mean 1/4 over the disk
-  float w = vW * k;
+  float w = vW * k * uEncode;
+  if (uDither > 0.0) {
+    // 8-bit sums: add ±½ LSB of noise so faint contributions round up as often as they would
+    // have added up, and store the (non-negative) mean-log channel as (log10ρ + 2)/5.
+    float n = (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233)) + vSeed) * 43758.5453) - 0.5) * uDither;
+    outColor = vec4(w + n, w * (vLog + 2.0) * 0.2 + n, 0.0, 0.0);
+    return;
+  }
   outColor = vec4(w, w * vLog, 0.0, 0.0);
 }`;
 
@@ -226,6 +279,8 @@ uniform float uSoft;
 uniform float uBright;
 uniform float uFloor;
 uniform float uSat;
+uniform float uDecode;     // 1 / the accumulator's encoding scale
+uniform float uLogMode;    // 0: g = Σw·log10ρ; 1 (8-bit): g = Σw·(log10ρ + 2)/5
 vec3 palette(float x) {
   // x = mean log10(ρ/ρ̄): voids → filaments → nodes
   const vec3 c0 = vec3(0.045, 0.030, 0.200);   // deep indigo
@@ -245,9 +300,10 @@ vec3 palette(float x) {
 }
 void main() {
   vec4 a = texture(tAccum, vUv);
-  float col = max(a.r, 0.0);
-  if (col <= 1e-7) { outColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
-  float mlog = a.g / col;
+  float col = max(a.r, 0.0) * uDecode;
+  if (col <= 1e-7) { outColor = vec4(0.0); return; }
+  float mlog = a.g / max(a.r, 1e-12);
+  if (uLogMode > 0.5) mlog = mlog * 5.0 - 2.0;
   float b = asinh(col / uSoft);
   b = max(b - uFloor, 0.0);
   vec3 c = palette(mlog);
@@ -255,7 +311,7 @@ void main() {
   c = max(vec3(l) + uSat * (c - vec3(l)), 0.0);
   // Hotter, denser gas also glows more strongly.
   float boost = 1.0 + 0.35 * clamp(mlog, 0.0, 3.0);
-  outColor = vec4(c * b * uBright * boost, 1.0);
+  outColor = vec4(c * b * uBright * boost, 0.0);
 }`;
 
 // ——— Galaxies ———
@@ -360,8 +416,9 @@ void main() {
   vec3 u = fetchBox(id);
   float dl = aDelta * (127.0 / 32.0) * uSigmaL;
   float nu = 1.686 / max(uD, 1e-4);
-  float fDwarf = erfcApprox((nu - dl) / sqrt(2.0 * uVarDwarf));
-  float fBright = erfcApprox((nu - dl) / sqrt(2.0 * uVarBright));
+  // A region that has itself collapsed (δL ≥ δc/D) is entirely in halos: f ≤ 1.
+  float fDwarf = min(erfcApprox((nu - dl) / sqrt(2.0 * uVarDwarf)), 1.0);
+  float fBright = min(erfcApprox((nu - dl) / sqrt(2.0 * uVarBright)), 1.0);
   float lum = 0.06 * fDwarf + fBright;
   float rho = max(sampleDensity(u), 0.02);
   float keep;

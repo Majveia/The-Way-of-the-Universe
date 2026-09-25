@@ -1,6 +1,7 @@
 /**
  * Pure helpers for the Earth experience (unit-tested in tests/planets.test.ts).
  */
+import * as THREE from 'three';
 import { AU } from '../../physics/constants';
 import { radecToVector, sunState, msToJD, VOYAGER1_PALE_BLUE_DOT } from '../../physics/planets-ephemeris';
 
@@ -16,13 +17,18 @@ export const smooth = (a: number, b: number, x: number) => {
 /** Pale-Blue-Dot progress (0 near the Earth → 1 at Voyager's 40 AU) from camera distance (R⊕). */
 export const pbdProgress = (d: number) => smooth(Math.log(300), Math.log(9e5), Math.log(Math.max(d, 1)));
 
+/** Angular size of one pixel of Voyager's narrow-angle camera, degrees (0.424° over 800 px). */
+export const NAC_PIXEL_DEG = 0.424 / 800;
+
 /**
- * Vertical field of view (deg): 34° near the Earth, narrowing toward Voyager's narrow-angle camera
- * (0.424° over 800 px → 0.38° over 720 px, i.e. the same angular pixel) as the camera recedes.
+ * Field of view (deg) across the narrow dimension of a viewport `viewportPx` CSS pixels wide: 34° near
+ * the Earth, narrowing as the camera recedes until one CSS pixel spans one pixel of Voyager's
+ * narrow-angle camera (0.424° / 800 px) — so the Earth ends as the same 0.12-pixel dot on any screen.
  */
-export function fovForDistance(d: number): number {
+export function fovForDistance(d: number, viewportPx = 720): number {
   const t = pbdProgress(d);
-  return Math.exp(Math.log(34) + (Math.log(0.38) - Math.log(34)) * smooth(0.25, 1, t));
+  const far = NAC_PIXEL_DEG * Math.max(viewportPx, 1);
+  return Math.exp(Math.log(34) + (Math.log(far) - Math.log(34)) * smooth(0.25, 1, t));
 }
 
 /**
@@ -56,3 +62,21 @@ export function voyagerSunEarthAngle(): number {
 
 /** Apparent diameter of a sphere of radius r at distance d, in pixels of a camera with angular pixel p (rad). */
 export const apparentPixels = (r: number, d: number, pixelAngle: number) => (2 * Math.asin(Math.min(1, r / d))) / pixelAngle;
+
+const mx = new THREE.Vector3();
+const my = new THREE.Vector3();
+const mz = new THREE.Vector3();
+const mm = new THREE.Matrix4();
+
+/**
+ * Orientation of the tidally locked Moon (three.js frame): body +x (lunar longitude 0, the near side's
+ * centre) toward the Earth, body +y (north pole) along the ecliptic pole (0, cos ε, sin ε) — the lunar
+ * equator is within 1.5° of the ecliptic (Cassini's laws); libration is not modelled.
+ */
+export function moonOrientation(moonPos: THREE.Vector3, obliquity: number, out: THREE.Quaternion): THREE.Quaternion {
+  my.set(0, Math.cos(obliquity), Math.sin(obliquity));
+  mx.copy(moonPos).negate().normalize();
+  mx.addScaledVector(my, -mx.dot(my)).normalize();
+  mz.crossVectors(mx, my);
+  return out.setFromRotationMatrix(mm.makeBasis(mx, my, mz));
+}

@@ -154,3 +154,40 @@ it('explore split integrator', () => {
   }
   console.log(rows.join('\n'));
 });
+it('explore old scheme error', () => {
+  const rows: string[] = [];
+  const H = A.rayleighH;
+  for (const vz of [0, 45, 70, 85]) {
+    const g = [0, 1, 0];
+    const vdir = [Math.sin(vz * DEG), Math.cos(vz * DEG), 0];
+    const cam = [g[0] + vdir[0] * 3, g[1] + vdir[1] * 3, g[2] + vdir[2] * 3];
+    const rd = [-vdir[0], -vdir[1], -vdir[2]];
+    const top = raySphere(cam, rd, A.top)!; const gr = raySphere(cam, rd, 1)!;
+    const ctop = raySphere(cam, rd, 1 + 1.1 * H)!; const cbase = raySphere(cam, rd, 1 + 0.25 * H)!;
+    for (const sz of [0, 60, 85]) {
+      const sun = [Math.sin(sz * DEG) * Math.cos(0.7), Math.cos(sz * DEG), Math.sin(sz * DEG) * Math.sin(0.7)];
+      const ref = integrate(cam, rd, sun, top[0], gr[0], 800);
+      const old = compose(integrate(cam, rd, sun, top[0], ctop[0], 14), integrate(cam, rd, sun, cbase[0], gr[0], 3));
+      rows.push(`vz ${vz} sz ${sz} L err R/G/B ${[0, 1, 2].map((k) => (100 * (old.L[k] - ref.L[k]) / ref.L[k]).toFixed(1) + '%').join(' ')}  T ref ${ref.T.map((x) => x.toFixed(3)).join(',')} old ${old.T.map((x) => x.toFixed(3)).join(',')}`);
+    }
+  }
+  console.log(rows.join('\n'));
+});
+it('explore aurora columns', () => {
+  const ss = (a: number, b: number, x: number) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+  const lower = (h: number) => ss(88, 102, h);
+  const green = (h: number) => lower(h) * Math.exp(-Math.max(h - 112, 0) / 38) * Math.exp(-Math.max(108 - h, 0) / 6);
+  const red = (h: number) => ss(150, 230, h) * Math.exp(-Math.max(h - 260, 0) / 90) * 0.32;
+  const blue = (h: number) => lower(h) * Math.exp(-Math.abs(h - 100) / 9) * 0.45;
+  const col = (f: (h: number) => number, h0: number, h1: number) => { let s = 0; const n = 20000; for (let i = 0; i < n; i++) { const h = h0 + (h1 - h0) * (i + 0.5) / n; s += f(h) * (h1 - h0) / n; } return s; };
+  console.log({ greenTrunc: col(green, 80, 100), greenFull: col(green, 80, 420), redTrunc: col(red, 80, 100), redFull: col(red, 80, 420), blueTrunc: col(blue, 80, 100), blueFull: col(blue, 80, 420) });
+  // airglow gaussian column
+  const ag = (h: number) => Math.exp(-(((h - 95) / 6) ** 2));
+  console.log({ airTrunc: col(ag, 77, 100), airFull: col(ag, 77, 113) });
+});
+import { luminousEfficiency } from '../src/physics/spectrum';
+import { auroraLineGains, kiloRayleighRadiance, NIGHT_GAIN } from '../src/worlds/planet/glow';
+it('explore V', () => {
+  console.log([427.8, 555, 557.7, 589, 630].map((nm) => [nm, luminousEfficiency(nm)]));
+  console.log({ NIGHT_GAIN, kr557: kiloRayleighRadiance(557.73), kr630: kiloRayleighRadiance(630.03), kr428: kiloRayleighRadiance(427.81), gains: auroraLineGains(6371) });
+});

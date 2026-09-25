@@ -58,6 +58,11 @@ export class Hud {
   private style: HTMLStyleElement;
   private v = new THREE.Vector3();
   private boxes: Array<[number, number, number, number]> = [];
+  /** Reused label boxes and the text last written to each label element (no per-frame garbage). */
+  private boxPool: Array<[number, number, number, number]> = [];
+  private shownText: string[] = [];
+  private shownSub: string[] = [];
+  private shownCool: boolean[] = [];
   private uiBoxes: Array<[number, number, number, number]> = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
   labelsOn = true;
 
@@ -93,7 +98,11 @@ export class Hud {
     this.root.appendChild(this.home);
   }
 
-  /** Project a world direction (camera at the origin) to CSS pixels; null if behind or off-screen. */
+  /**
+   * Project a world direction (camera at the origin) to CSS pixels; null if behind or off-screen.
+   * The returned pair is reused by the next call: consume it first.
+   */
+  private pp: [number, number] = [0, 0];
   private project(dir: THREE.Vector3, camera: THREE.Camera, w: number, h: number): [number, number] | null {
     const p = this.v.copy(dir).applyMatrix3(_rot.setFromMatrix4(camera.matrixWorldInverse));
     if (p.z >= -1e-6) return null;
@@ -102,7 +111,9 @@ export class Hud {
     const x = (p.x * 0.5 + 0.5) * w;
     const y = (-p.y * 0.5 + 0.5) * h;
     if (x < -40 || x > w + 40 || y < -40 || y > h + 40) return null;
-    return [x, y];
+    this.pp[0] = x;
+    this.pp[1] = y;
+    return this.pp;
   }
 
   update(items: readonly LabelItem[], target: LabelItem | null, camera: THREE.Camera, w: number, h: number, reserved?: readonly [number, number, number, number][], home: LabelItem | null = null): void {
@@ -140,6 +151,7 @@ export class Hud {
     } else this.home.style.opacity = '0';
 
     let k = 0;
+    let nb = 0;
     if (this.labelsOn) {
       const sorted = (items as LabelItem[]).sort(byPriority);
       for (const it of sorted) {
@@ -147,18 +159,26 @@ export class Hud {
         const p = this.project(it.dir, camera, w, h);
         if (!p) continue;
         const bw = 7 * (it.text.length + (it.sub?.length ?? 0)) + 24;
-        const box: [number, number, number, number] = [p[0] + 6, p[1] - 8, p[0] + 6 + bw, p[1] + 8];
-        if (this.boxes.some((b) => !(box[2] < b[0] || box[0] > b[2] || box[3] < b[1] || box[1] > b[3]))) continue;
+        const x0 = p[0] + 6, y0 = p[1] - 8, x1 = p[0] + 6 + bw, y1 = p[1] + 8;
+        let hit = false;
+        for (const b of this.boxes) if (!(x1 < b[0] || x0 > b[2] || y1 < b[1] || y0 > b[3])) { hit = true; break; }
+        if (hit) continue;
+        const box = this.boxPool[nb] ?? (this.boxPool[nb] = [0, 0, 0, 0]);
+        nb++;
+        box[0] = x0; box[1] = y0; box[2] = x1; box[3] = y1;
         this.boxes.push(box);
-        const el = this.labels[k++];
-        const html = `<b>${it.text}</b>${it.sub ? `<i>${it.sub}</i>` : ''}`;
-        if (el.dataset.h !== html) {
-          el.innerHTML = html;
-          el.dataset.h = html;
+        const el = this.labels[k];
+        const sub = it.sub ?? '';
+        if (this.shownText[k] !== it.text || this.shownSub[k] !== sub) {
+          el.innerHTML = `<b>${it.text}</b>${sub ? `<i>${sub}</i>` : ''}`;
+          this.shownText[k] = it.text;
+          this.shownSub[k] = sub;
         }
-        el.classList.toggle('cool', !!it.cool);
+        const cool = !!it.cool;
+        if (this.shownCool[k] !== cool) el.classList.toggle('cool', (this.shownCool[k] = cool));
         el.style.opacity = '1';
         el.style.transform = `translate3d(${(p[0] + 8).toFixed(1)}px, ${(p[1] - 7).toFixed(1)}px, 0)`;
+        k++;
       }
     }
     for (; k < this.labels.length; k++) this.labels[k].style.opacity = '0';

@@ -10,7 +10,14 @@ import { ATMO_GLSL, ATMO_LOOKUP_GLSL } from './glsl';
  *  - isotropic multiple-scattering contribution Ψ_ms(r, μ_s)        32 × 32   (Hillaire 2020, §5.5)
  *  - sky irradiance on a horizontal surface E_sky(r, μ_s)          64 × 16
  * All per unit *true* solar irradiance. Shared between planets with identical parameters.
+ *
+ * Portability: the tables are RGBA16F render targets (EXT_color_buffer_float or _half_float; half
+ * floats are filterable in core WebGL2). Where those are not renderable the framebuffer is
+ * incomplete and the tables would silently stay zero — a black planet — so generateLUTs checks and
+ * falls back to RGBA8 targets storing sqrt(value / LUT_SCALE) (uLutEnc = 1).
  */
+/** Encoding ranges for the RGBA8 fallback: transmittance, multiple scattering, sky irradiance. */
+export const LUT_SCALE: readonly [number, number, number] = [1, 4, 2];
 
 const TRANS_FRAG = /* glsl */ `
 precision highp float;
@@ -38,7 +45,7 @@ void main() {
     vec3 dn = atmoDensity(ri - 1.0);
     tau += (uRay * dn.x + uMieE * dn.y + uAbsorb * dn.z) * dt;
   }
-  outColor = vec4(exp(-tau), 1.0);
+  outColor = vec4(lutEncode(exp(-tau), uLutScale.x), 1.0);
 }`;
 
 const MS_FRAG = /* glsl */ `
@@ -97,7 +104,7 @@ void main() {
   float n = float(SQ * SQ);
   Lsum /= n;
   Fsum /= n;
-  outColor = vec4(Lsum / max(vec3(1.0) - Fsum, vec3(0.05)), 1.0);
+  outColor = vec4(lutEncode(Lsum / max(vec3(1.0) - Fsum, vec3(0.05)), uLutScale.y), 1.0);
 }`;
 
 const IRR_FRAG = /* glsl */ `
@@ -149,7 +156,7 @@ void main() {
       E += L;
     }
   }
-  outColor = vec4(PI * E / float(NI * NJ), 1.0);
+  outColor = vec4(lutEncode(PI * E / float(NI * NJ), uLutScale.z), 1.0);
 }`;
 
 export interface AtmosphereLUTs {
@@ -157,6 +164,8 @@ export interface AtmosphereLUTs {
   transmittance: THREE.WebGLRenderTarget;
   multiScatter: THREE.WebGLRenderTarget;
   irradiance: THREE.WebGLRenderTarget;
+  /** True when the tables fell back to sqrt-encoded RGBA8 (no renderable half floats). */
+  encoded: boolean;
   /** Uniform values describing the atmosphere (shared objects; merge into materials). */
   uniforms: Record<string, THREE.IUniform>;
   ready: boolean;
@@ -165,9 +174,9 @@ export interface AtmosphereLUTs {
 
 const cache = new Map<string, AtmosphereLUTs>();
 
-function makeTarget(w: number, h: number): THREE.WebGLRenderTarget {
+function makeTarget(w: number, h: number, type: THREE.TextureDataType = THREE.HalfFloatType): THREE.WebGLRenderTarget {
   const t = new THREE.WebGLRenderTarget(w, h, {
-    type: THREE.HalfFloatType,
+    type,
     format: THREE.RGBAFormat,
     minFilter: THREE.LinearFilter,
     magFilter: THREE.LinearFilter,
@@ -201,6 +210,8 @@ export function atmosphereUniforms(a: AtmosphereRenderParams, sunAngularRadius =
     uTransLUT: { value: null },
     uMSLUT: { value: null },
     uIrrLUT: { value: null },
+    uLutEnc: { value: 0 },
+    uLutScale: { value: new THREE.Vector3(...LUT_SCALE) },
   };
 }
 
@@ -217,6 +228,7 @@ export function acquireLUTs(a: AtmosphereRenderParams): AtmosphereLUTs {
       transmittance: makeTarget(256, 64),
       multiScatter: makeTarget(32, 32),
       irradiance: makeTarget(64, 16),
+      encoded: false,
       uniforms: atmosphereUniforms(a, 0.00465),
       ready: false,
       refs: 0,
@@ -243,6 +255,22 @@ export function releaseLUTs(e: AtmosphereLUTs): void {
 /** Render the three tables (idempotent). Safe to call from inside onBeforeRender. */
 export function generateLUTs(renderer: THREE.WebGLRenderer, e: AtmosphereLUTs): void {
   if (e.ready) return;
+  const prevTarget = renderer.getRenderTarget();
+  const prevFace = renderer.getActiveCubeFace();
+  const prevMip = renderer.getActiveMipmapLevel();
+  if (!e.encoded && !halfFloatRenderable(renderer, e.transmittance)) {
+    // Fall back to sqrt-encoded RGBA8 tables (see LUT_SCALE).
+    for (const t of [e.transmittance, e.multiScatter, e.irradiance]) t.dispose();
+    e.transmittance = makeTarget(256, 64, THREE.UnsignedByteType);
+    e.multiScatter = makeTarget(32, 32, THREE.UnsignedByteType);
+    e.irradiance = makeTarget(64, 16, THREE.UnsignedByteType);
+    e.uniforms.uTransLUT.value = e.transmittance.texture;
+    e.uniforms.uMSLUT.value = e.multiScatter.texture;
+    e.uniforms.uIrrLUT.value = e.irradiance.texture;
+    e.uniforms.uLutEnc.value = 1;
+    e.encoded = true;
+    console.info('planet: half-float render targets unavailable; atmosphere tables use RGBA8');
+  }
   const scene = new THREE.Scene();
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   const geo = new THREE.BufferGeometry();
@@ -255,7 +283,7 @@ export function generateLUTs(renderer: THREE.WebGLRenderer, e: AtmosphereLUTs): 
       fragmentShader: frag,
       // A small but non-zero stellar radius keeps smoothstep() well defined; the target being
       // written is never bound as an input (no feedback loop).
-      uniforms: { ...e.uniforms, uSunAng: { value: 0.002 }, uMSLUT: { value: frag === TRANS_FRAG || frag === MS_FRAG ? null : e.multiScatter.texture }, uIrrLUT: { value: null } },
+      uniforms: { ...e.uniforms, uSunAng: { value: 0.002 }, uTransLUT: { value: frag === TRANS_FRAG ? null : e.transmittance.texture }, uMSLUT: { value: frag === TRANS_FRAG || frag === MS_FRAG ? null : e.multiScatter.texture }, uIrrLUT: { value: null } },
       depthTest: false,
       depthWrite: false,
     });
@@ -264,9 +292,6 @@ export function generateLUTs(renderer: THREE.WebGLRenderer, e: AtmosphereLUTs): 
   const mesh = new THREE.Mesh(geo, mats[0]);
   mesh.frustumCulled = false;
   scene.add(mesh);
-  const prevTarget = renderer.getRenderTarget();
-  const prevFace = renderer.getActiveCubeFace();
-  const prevMip = renderer.getActiveMipmapLevel();
   const prevXR = renderer.xr.enabled;
   renderer.xr.enabled = false;
   for (let i = 0; i < 3; i++) {
@@ -279,4 +304,16 @@ export function generateLUTs(renderer: THREE.WebGLRenderer, e: AtmosphereLUTs): 
   for (const m of mats) m.dispose();
   geo.dispose();
   e.ready = true;
+}
+
+/** Whether `rt` (a half-float target) can be rendered to on this device. */
+function halfFloatRenderable(renderer: THREE.WebGLRenderer, rt: THREE.WebGLRenderTarget): boolean {
+  const ext = renderer.extensions;
+  if (ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float')) return true;
+  const gl = renderer.getContext();
+  const prev = renderer.getRenderTarget();
+  renderer.setRenderTarget(rt);
+  const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+  renderer.setRenderTarget(prev);
+  return ok;
 }
