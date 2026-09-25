@@ -1,0 +1,11 @@
+import { chromium } from 'playwright-core';
+const browser = await chromium.launch({ headless: true, args: ['--use-angle=swiftshader','--enable-unsafe-swiftshader','--ignore-gpu-blocklist','--disable-dev-shm-usage'] });
+const page = await browser.newPage({ viewport: { width: 960, height: 540 }, ignoreHTTPSErrors: true });
+const errs = [];
+page.on('pageerror', e => errs.push(String(e)));
+await page.goto('http://127.0.0.1:5230/?bench=quick&quality=low#bench');
+await page.waitForFunction(() => window.__universe && window.__universe.bench, null, { timeout: 1500000, polling: 2000 });
+const rep = await page.evaluate(() => window.__universe.bench);
+await page.screenshot({ path: 'shots/bench-overlay.png' });
+console.log(JSON.stringify({ results: rep.results.map(r => [r.id, r.ok ? 'ok' : r.error, 'frames', r.frames, 'frameMs', r.frameMs.median, 'cpu', r.cpuMs.median, 'gpu', r.gpuMs?.median ?? null, 'draws', r.drawCalls, 'tris', r.triangles, 'pts', r.points, 'load', r.loadMs]), errs }));
+await browser.close();

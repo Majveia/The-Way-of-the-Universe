@@ -86,7 +86,8 @@ export class LocalSky {
     readonly cat: StarCatalog,
     detail: number,
   ) {
-    this.sky = new Sky({ catalog: cat, stars: Math.round(26000 * detail), milkyWay: 1, constellations: 0 });
+    // Milky Way bake resolution by tier (1024² faces ≈ 0.09°/texel ≈ 1.7 px at 1080p and 55°).
+    this.sky = new Sky({ catalog: cat, stars: Math.round(26000 * detail), milkyWay: 1, constellations: 0, bandResolution: detail >= 1 ? 1024 : detail >= 0.6 ? 768 : 512 });
     this.sky.minStarDistance = 1e-9;
     for (const [name, o] of Object.entries(STAR_OVERRIDES)) {
       const i = cat.find(name);

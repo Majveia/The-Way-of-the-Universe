@@ -272,6 +272,20 @@ export class UI {
     return m;
   }
 
+  /** Add a quiet text action to the menu footer (e.g. "Benchmark this device"). */
+  addMenuAction(label: string, run: () => void): () => void {
+    const keys = this.menuEl.querySelector('.menu-keys');
+    const b = el('button', 'menu-action');
+    b.type = 'button';
+    b.textContent = label;
+    b.addEventListener('click', () => {
+      this.closeMenu();
+      run();
+    });
+    keys?.appendChild(b);
+    return () => b.remove();
+  }
+
   setExperience(meta: ExperienceMeta | null): void {
     this.meta = meta;
     this.kickerEl.textContent = meta?.kicker ?? '';

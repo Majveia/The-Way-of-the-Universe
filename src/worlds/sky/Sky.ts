@@ -45,6 +45,13 @@ export interface SkyOptions {
   constellations?: number;
   /** Pre-exposure multiplier applied to all sky radiance (default 1). */
   exposure?: number;
+  /**
+   * Face size (texels) of the cube map the Milky Way band is baked into on first render (default
+   * 1024 ≈ 0.09°/texel; 0 = evaluate the procedural band per pixel every frame, as before). The bake
+   * turns 21 octaves of 3D simplex noise per pixel (~10 ms/frame at 1080p on a 2.5-TFLOPS GPU) into
+   * one cube-map fetch. Falls back to the procedural band where float render targets are unavailable.
+   */
+  bandResolution?: number;
 }
 
 /** Which relativistic effects to show for a moving observer (all physical by default). */
@@ -110,28 +117,20 @@ void main() {
   gl_Position = clip;
 }`;
 
-const BAND_FRAG = /* glsl */ `
-precision highp float;
-${COMMON_GLSL}
-${NOISE_GLSL}
-${BLACKBODY_GLSL}
-${RELATIVITY_UNIFORMS_GLSL}
-${RELATIVITY_GLSL}
-in vec3 vDir;
-in vec3 vWorld;
-out vec4 outColor;
-uniform float uIntensity;
+/**
+ * The procedural Milky Way (galactic three.js frame: +X = galactic centre, +Y = north galactic pole).
+ * `band(d)` returns (emission·transmission, warm fraction, transmission) for a unit direction d.
+ * The warm fraction is a smooth analytic function of direction (`bandWarm`), so the bake stores only
+ * the two noisy channels (emission·transmission, transmission) and the warm term is recomputed.
+ */
+const BAND_FN_GLSL = /* glsl */ `
 uniform float uSeed;
-uniform float uExposure;
-uniform mat3 uSkyRotInv;
-uniform vec3 uCmbBeta;
-uniform float uCmbBetaMag;
-uniform float uCmbGamma;
-uniform float uCmbLogScale;
-uniform float uCmbOn;
-
-// The Milky Way in the galactic three.js frame: +X = galactic centre, +Y = north galactic pole.
-// Returns (emission·transmission, warm fraction, transmission) for direction d.
+float bandWarm(vec3 d) {
+  // Colour: old warm light toward the bulge, bluer star-forming disk elsewhere.
+  float l = atan(-d.z, d.x);
+  float bulge = exp(-(l * l) / (2.0 * 0.26 * 0.26)) * exp(-abs(d.y) / 0.14);
+  return clamp(bulge * 1.6 + 0.2, 0.0, 1.0);
+}
 vec3 band(vec3 d) {
   float sb = d.y;                       // sin(b)
   float l = atan(-d.z, d.x);            // galactic longitude, 0 at the centre
@@ -153,15 +152,68 @@ vec3 band(vec3 d) {
   float dust = (smoothstep(-0.05, 0.45, dn) * 0.8 + 0.6 * smoothstep(0.6, 0.95, fil))
              * exp(-abs(sb + 0.01 * sin(l * 3.0)) / 0.035);
   float trans = exp(-dust * 2.4);
-  // Colour: old warm light toward the bulge, bluer star-forming disk elsewhere; dust reddens.
-  float warm = clamp(bulge * 1.6 + 0.2, 0.0, 1.0);
-  return vec3(emission * trans, warm, trans);
+  // (dust reddens: the caller tints by the transmission)
+  return vec3(emission * trans, bandWarm(d), trans);
+}`;
+
+/**
+ * Bakes the band into one face of a cube map. Face/texel → direction follows the GL cube-map
+ * convention (OpenGL ES 3.0 §3.8.10, Table 3.21), so `texture(samplerCube, d)` returns band(d).
+ */
+const BAND_BAKE_FRAG = /* glsl */ `
+precision highp float;
+${NOISE_GLSL}
+out vec4 outColor;
+uniform int uFace;
+uniform float uSize;
+${BAND_FN_GLSL}
+void main() {
+  vec2 st = gl_FragCoord.xy / uSize * 2.0 - 1.0;
+  vec3 d;
+  if (uFace == 0) d = vec3(1.0, -st.y, -st.x);
+  else if (uFace == 1) d = vec3(-1.0, -st.y, st.x);
+  else if (uFace == 2) d = vec3(st.x, 1.0, st.y);
+  else if (uFace == 3) d = vec3(st.x, -1.0, -st.y);
+  else if (uFace == 4) d = vec3(st.x, -st.y, 1.0);
+  else d = vec3(-st.x, -st.y, -1.0);
+  vec3 b = band(normalize(d));
+  outColor = vec4(b.x, b.z, 0.0, 1.0);
+}`;
+
+const BAND_FRAG = /* glsl */ `
+precision highp float;
+${COMMON_GLSL}
+${NOISE_GLSL}
+${BLACKBODY_GLSL}
+${RELATIVITY_UNIFORMS_GLSL}
+${RELATIVITY_GLSL}
+in vec3 vDir;
+in vec3 vWorld;
+out vec4 outColor;
+uniform float uIntensity;
+uniform float uExposure;
+uniform mat3 uSkyRotInv;
+uniform vec3 uCmbBeta;
+uniform float uCmbBetaMag;
+uniform float uCmbGamma;
+uniform float uCmbLogScale;
+uniform float uCmbOn;
+${BAND_FN_GLSL}
+#ifdef BAND_BAKED
+uniform samplerCube uBandTex;
+// One (seamless, bilinear) cube-map fetch instead of 21 octaves of simplex noise.
+vec3 bandAt(vec3 d) {
+  vec2 e = texture(uBandTex, d).rg;
+  return vec3(e.x, bandWarm(d), e.y);
 }
+#else
+vec3 bandAt(vec3 d) { return band(d); }
+#endif
 
 void main() {
   vec3 col = vec3(0.0);
   if (uBetaMag < 1e-7) {
-    vec3 b = band(normalize(vDir));
+    vec3 b = bandAt(normalize(vDir));
     vec3 c = mix(blackbody(8200.0), blackbody(4200.0), b.y);
     c *= mix(vec3(1.0, 0.78, 0.6), vec3(1.0), b.z);
     col = c * b.x * uIntensity * 0.075;
@@ -169,7 +221,7 @@ void main() {
     // Moving observer: find the rest-frame direction this pixel sees, then Doppler-shift the light.
     float delta;
     vec3 dRest = relDeaberrate(normalize(vWorld), delta);
-    vec3 b = band(normalize(uSkyRotInv * dRest));
+    vec3 b = bandAt(normalize(uSkyRotInv * dRest));
     float dc = uRelFlags.y > 0.5 ? delta : 1.0;
     // Diluted starlight keeps its spectral shape: I'_V / I_V = L(δT) / L(T) (no δ² for extended light).
     float kCool = uRelFlags.z > 0.5 ? pow(10.0, clamp(logLum(8200.0 * delta) - logLum(8200.0), -30.0, 12.0)) : 1.0;
@@ -394,6 +446,15 @@ export class Sky {
   private tmpM4 = new THREE.Matrix4();
   private maxPointRadius = 0;
   private cmbScale = 0;
+  /** The band baked into a cube map (galactic frame): state, target and the material that samples it. */
+  private bandBake: 'pending' | 'done' | 'failed' | 'off' = 'pending';
+  private bandCube: THREE.WebGLCubeRenderTarget | null = null;
+  private bandMatBaked: THREE.ShaderMaterial | null = null;
+  /**
+   * Use the baked band once available (default). Set false to draw the procedural band every frame
+   * (debug / A–B comparison); the bake is kept.
+   */
+  bakeBand = true;
   /** Resolves once the catalogue (if requested) is on the GPU. */
   readonly ready: Promise<void>;
 
@@ -427,25 +488,29 @@ export class Sky {
     this.stars = this.buildProcedural(o, this.proc3d);
     this.starMat = this.stars.material as THREE.ShaderMaterial;
 
+    // One uniforms object shared by the procedural and the baked band materials.
+    const bandUniforms = {
+      ...this.shared,
+      uIntensity: { value: o.milkyWay ?? 1 },
+      uSeed: { value: this.bandSeed },
+      uSkyRotInv: { value: new THREE.Matrix3() },
+      uCmbBeta: { value: new THREE.Vector3(1, 0, 0) },
+      uCmbBetaMag: { value: 0 },
+      uCmbGamma: { value: 1 },
+      uCmbLogScale: { value: 0 },
+      uCmbOn: { value: 0 },
+      uBandTex: { value: null as THREE.Texture | null },
+    };
     this.bandMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
       vertexShader: BAND_VERT,
       fragmentShader: BAND_FRAG,
-      uniforms: {
-        ...this.shared,
-        uIntensity: { value: o.milkyWay ?? 1 },
-        uSeed: { value: this.bandSeed },
-        uSkyRotInv: { value: new THREE.Matrix3() },
-        uCmbBeta: { value: new THREE.Vector3(1, 0, 0) },
-        uCmbBetaMag: { value: 0 },
-        uCmbGamma: { value: 1 },
-        uCmbLogScale: { value: 0 },
-        uCmbOn: { value: 0 },
-      },
+      uniforms: bandUniforms,
       side: THREE.BackSide,
       depthTest: false,
       depthWrite: false,
     });
+    if ((o.bandResolution ?? 1024) <= 0) this.bandBake = 'off';
     this.band = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 48), this.bandMat);
     this.band.frustumCulled = false;
     this.band.renderOrder = -2;
@@ -769,8 +834,88 @@ export class Sky {
     this.observerGal.copy(this.observer).applyMatrix3(this.invRot);
   }
 
+  /**
+   * Bake the band into a cube map once (all six faces, one-time ≈ 6·N² band evaluations: ~30 ms on a
+   * mid laptop GPU at N = 1024, spent while the experience fades in). Restores the caller's render
+   * target (which may itself be a cube face, e.g. an environment probe).
+   */
+  private bakeBandCube(renderer: THREE.WebGLRenderer): void {
+    this.bandBake = 'failed';
+    const ext = renderer.extensions;
+    if (!(ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float'))) return;
+    const gl = renderer.getContext();
+    const maxCube = gl.getParameter(gl.MAX_CUBE_MAP_TEXTURE_SIZE) as number;
+    const size = Math.max(64, Math.min(this.opts.bandResolution ?? 1024, maxCube || 1024));
+    const prevRT = renderer.getRenderTarget();
+    const prevFace = renderer.getActiveCubeFace();
+    const prevMip = renderer.getActiveMipmapLevel();
+    const bakeMat = new THREE.ShaderMaterial({
+      glslVersion: THREE.GLSL3,
+      vertexShader: 'void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }',
+      fragmentShader: BAND_BAKE_FRAG,
+      uniforms: { uSeed: { value: this.bandSeed }, uFace: { value: 0 }, uSize: { value: size } },
+      depthTest: false,
+      depthWrite: false,
+    });
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), bakeMat);
+    quad.frustumCulled = false;
+    const scene = new THREE.Scene().add(quad);
+    const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    try {
+      // Two half-float channels (4 B/texel: 25 MB at N = 1024); RGBA16F if RG16F is not renderable.
+      for (const format of [THREE.RGFormat, THREE.RGBAFormat] as const) {
+        const rt = new THREE.WebGLCubeRenderTarget(size, {
+          type: THREE.HalfFloatType,
+          format,
+          generateMipmaps: false,
+          minFilter: THREE.LinearFilter,
+          magFilter: THREE.LinearFilter,
+          depthBuffer: false,
+          stencilBuffer: false,
+        });
+        renderer.setRenderTarget(rt, 0);
+        if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE) {
+          this.bandCube = rt;
+          break;
+        }
+        rt.dispose();
+      }
+      if (!this.bandCube) return;
+      for (let face = 0; face < 6; face++) {
+        bakeMat.uniforms.uFace.value = face;
+        renderer.setRenderTarget(this.bandCube, face);
+        renderer.render(scene, cam);
+      }
+      // Same uniforms object as the procedural material, so every setter drives both.
+      this.bandMatBaked = new THREE.ShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: BAND_VERT,
+        fragmentShader: BAND_FRAG,
+        uniforms: this.bandMat.uniforms,
+        defines: { BAND_BAKED: 1 },
+        side: THREE.BackSide,
+        depthTest: false,
+        depthWrite: false,
+      });
+      this.bandMat.uniforms.uBandTex.value = this.bandCube.texture;
+      this.bandBake = 'done';
+    } catch (e) {
+      console.warn('Sky: Milky Way bake failed, drawing it procedurally', e);
+      this.bandCube?.dispose();
+      this.bandCube = null;
+    } finally {
+      renderer.setRenderTarget(prevRT, prevFace, prevMip);
+      quad.geometry.dispose();
+      bakeMat.dispose();
+    }
+  }
+
   /** Draw the sky into the currently bound render target using the camera's rotation. */
   render(renderer: THREE.WebGLRenderer, camera: THREE.Camera, pixelRatio = 1): void {
+    if (this.bandBake === 'pending' && this.band.visible) this.bakeBandCube(renderer);
+    const baked = this.bandBake === 'done' && this.bakeBand && this.bandMatBaked;
+    const bandMat = baked ? this.bandMatBaked! : this.bandMat;
+    if (this.band.material !== bandMat) this.band.material = bandMat;
     const s = this.shared;
     s.uPixelRatio.value = pixelRatio;
     if (!this.maxPointRadius) {
@@ -853,6 +998,9 @@ export class Sky {
     this.band.geometry.dispose();
     this.starMat.dispose();
     this.bandMat.dispose();
+    this.bandMatBaked?.dispose();
+    this.bandCube?.dispose();
+    this.bandCube = null;
     this.catalogPoints?.geometry.dispose();
     this.star3dMat?.dispose();
     this.lines?.dispose();

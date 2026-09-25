@@ -810,3 +810,20 @@ kbd {
     transition-duration: 0.01ms !important;
   }
 }
+
+.menu-action {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.menu-action:hover {
+  color: var(--accent);
+}

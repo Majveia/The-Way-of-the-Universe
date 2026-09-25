@@ -178,7 +178,9 @@ class Voyage implements Experience {
     this.neb = new NebulaRegime(ctx);
     this.sol = new SolRegime(ctx, this.cosmos.local, (id) => this.selectBody(id), (p, c) => this.cosmos.addChild(p, c), JD0);
     this.ship = new Ship({ detail: Math.max(0.55, Math.min(1.3, q.detail)), shadowSize: q.detail >= 1 ? 2048 : 1024 });
-    this.ship.plume.steps = q.detail >= 1 ? 32 : q.detail >= 0.7 ? 24 : 20;
+    // Plume ray-march budget (max samples/pixel; the march adapts to ~4 samples per jet width).
+    this.ship.plume.steps = q.detail >= 1 ? 24 : q.detail >= 0.7 ? 14 : 10;
+    this.ship.plume.octaves = q.detail >= 1 ? 2 : 1;
     this.probe = new SkyProbe(q.detail >= 1 ? 128 : 64, ctx.engine.halfFloat);
     this.ship.setEnvironment(this.probe, 1);
     this.shipScene.add(this.ship.group);
