@@ -45,6 +45,7 @@ import {
   type AccumMode,
   type AtlasMode,
   type TargetSpec,
+  type WebFormats,
 } from './formats';
 
 export interface WebRendererOptions {
@@ -63,6 +64,8 @@ export interface WebRendererOptions {
   varBright: number;
   /** Quality detail (0.35 … 1.6). */
   detail: number;
+  /** Force target formats (testing the fallback paths); normally chosen from the device's extensions. */
+  formats?: Partial<WebFormats>;
 }
 
 export interface WebFrameState {
@@ -217,11 +220,14 @@ export class WebRenderer {
     const gl = renderer.getContext();
     const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array | null;
     this.maxPointSize = range && range[1] > 1 ? range[1] : 64;
-    const fm = chooseFormats({
-      colorBufferFloat: renderer.extensions.has('EXT_color_buffer_float'),
-      colorBufferHalfFloat: renderer.extensions.has('EXT_color_buffer_half_float'),
-      floatBlend: renderer.extensions.has('EXT_float_blend'),
-    });
+    const fm = {
+      ...chooseFormats({
+        colorBufferFloat: renderer.extensions.has('EXT_color_buffer_float'),
+        colorBufferHalfFloat: renderer.extensions.has('EXT_color_buffer_half_float'),
+        floatBlend: renderer.extensions.has('EXT_float_blend'),
+      }),
+      ...opts.formats,
+    };
     // Keyframe textures.
     this.texW = N >= 1 << 21 ? 2048 : 1024;
     this.texH = Math.ceil(N / this.texW);

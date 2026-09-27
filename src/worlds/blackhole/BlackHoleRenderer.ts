@@ -122,6 +122,8 @@ export interface BlackHoleRendererOptions {
   traceScale?: number;
   /** Override the cap on traced pixels per frame. */
   tracePixels?: number;
+  /** 'half' forces the half-float fallback of the lens map (to test devices without EXT_color_buffer_float). */
+  floatTargets?: 'auto' | 'half';
 }
 
 interface QualitySettings {
@@ -272,8 +274,9 @@ export class BlackHoleRenderer {
     const n = METER_W * METER_H;
     for (let i = 0; i < n; i++) this.meterSorted[i] = this.meterBuf[i * 4];
     this.meterSorted.sort();
-    const code = this.meterSorted[Math.floor(n * 0.95)];
-    this.highlightLuminance = Math.pow(2, (code / 255) * 24 - 16);
+    const decode = (q: number) => Math.pow(2, (this.meterSorted[Math.floor(n * q)] / 255) * 24 - 16);
+    this.highlightLuminance = decode(0.95);
+    this.bulkLuminance = decode(0.8);
     this.meterBusy = false;
   };
   private readonly onMeterFail = (): void => {
@@ -284,6 +287,8 @@ export class BlackHoleRenderer {
    * light (a camera exposing for its highlights). 0 until the first measurement arrives.
    */
   highlightLuminance = 0;
+  /** 80th-percentile cell luminance of the same metering: large only when bright gas fills the view. */
+  bulkLuminance = 0;
   private env: THREE.Texture | null = null;
   private customU: Vec4 | null = null;
   private frame = 0;
@@ -336,6 +341,7 @@ export class BlackHoleRenderer {
   constructor(renderer: THREE.WebGLRenderer, opts: BlackHoleRendererOptions = {}) {
     this.renderer = renderer;
     this.float = floatSupport(renderer);
+    if (opts.floatTargets === 'half') this.float.full = false;
     if (!this.float.half)
       throw new Error('This device cannot render to floating-point targets (WebGL2 EXT_color_buffer_half_float), which the black-hole ray tracer needs.');
     this.quality = { ...QUALITY[opts.quality ?? 'high'] };
@@ -349,7 +355,9 @@ export class BlackHoleRenderer {
     this.profileTex.minFilter = this.profileTex.magFilter = THREE.LinearFilter;
     this.profileTex.wrapS = this.profileTex.wrapT = THREE.ClampToEdgeWrapping;
 
-    const [dw, dh] = this.quality.diskTex;
+    // WebGL2 only guarantees 2048-texel textures.
+    const maxTex = renderer.capabilities.maxTextureSize;
+    const dw = Math.min(this.quality.diskTex[0], maxTex), dh = Math.min(this.quality.diskTex[1], maxTex);
     this.diskRT = new THREE.WebGLRenderTarget(dw, dh, {
       type: THREE.HalfFloatType,
       format: THREE.RGBAFormat,

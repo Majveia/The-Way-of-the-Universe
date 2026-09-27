@@ -36,6 +36,8 @@ const GEO_R = 42_164 / R_EARTH_KM;
  * We draw it ~40× dimmer so that the bloom stays a glare rather than a white-out (said in the UI).
  */
 const SUN_INTENSITY = 30;
+/** Apollo 8's Earthrise photograph (AS08-14-2383), UTC. */
+const APOLLO8_EARTHRISE = Date.UTC(1968, 11, 24, 16, 40, 7);
 const PBD_EXPOSURE = 260;
 
 type ViewId = 'dawn' | 'disk' | 'night' | 'iss' | 'moon' | 'eclipse' | 'voyager';
@@ -198,7 +200,7 @@ class EarthExperience implements Experience {
     };
     if (id !== 'iss' && this.warp === 1) this.setWarp(60);
     // Leaving a historical/future moment (Pale Blue Dot, eclipse) returns to the time we left from.
-    if (id !== 'voyager' && id !== 'eclipse' && this.prePbdMs !== null) {
+    if (id !== 'voyager' && id !== 'eclipse' && id !== 'moon' && this.prePbdMs !== null) {
       this.setTime(this.prePbdMs);
       this.prePbdMs = null;
     }
@@ -235,8 +237,16 @@ class EarthExperience implements Experience {
         this.ctx.ui.toast('Real time · 7.66 km/s · 92 minutes per orbit');
         break;
       case 'moon': {
-        // Earthrise, as from Apollo 8: low lunar orbit (~120 km), the Earth a few degrees above the
-        // lunar horizon, on the side of the Moon the Sun is lighting.
+        // Earthrise, at the moment of Apollo 8's photograph (AS08-14-2383, 24 December 1968, 16:40 UT;
+        // launch 12:51 UT on the 21st + 75 h 49 m): the Earth three-quarters lit, rising over the lit
+        // lunar terrain. (At a full Moon the Earth seen from the Moon is 'new', beside the Sun, over
+        // unlit ground — so the view keeps its own date, like the eclipse and the Pale Blue Dot.)
+        if (this.prePbdMs === null) this.prePbdMs = this.simMs;
+        this.setTime(APOLLO8_EARTHRISE);
+        this.setWarp(60);
+        this.ctx.ui.toast('Earthrise · Apollo 8 · 24 December 1968');
+        // Camera in lunar orbit (~900 km up), the Earth a few degrees above the lunar horizon, on the
+        // side of the Moon the Sun is lighting.
         const e = this.tmp2.copy(this.moonPos).negate().normalize();
         const p = this.tmp.copy(this.sunDir).addScaledVector(e, -this.sunDir.dot(e));
         if (p.length() < 0.25) p.set(0, 1, 0).addScaledVector(e, -e.y);

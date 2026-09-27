@@ -498,7 +498,9 @@ void main() {
     float rad = 46200.0 * (exp(c2 / 5772.0) - 1.0) / (exp(c2 / T) - 1.0);
     Lg += blackbody(T) * rad * uEmission * smoothstep(0.02, 0.2, s.emission);
 #else
-    float h = hash12(floor(gl_FragCoord.xy * 0.25));
+    // Per-place colour variation (sodium vs LED districts), keyed to the ground so it does not
+    // shimmer as the planet turns (a screen-space hash would re-roll as cities cross pixels).
+    float h = hash13(floor(d * 1300.0));
     vec3 lc = mix(uLightsColorA, uLightsColorB, clamp(s.emission * 3.0 + h * 0.2, 0.0, 1.0));
     Lg += lc * s.emission * uLights * exp(-daylight * 60.0);
 #endif
@@ -557,13 +559,16 @@ void main() {
   vec3 rd = rv / camDist;
   float tCam = -camDist;
   if (uPixelRadius < 1.0) discard;
-  // The surface pass owns rays that hit the ground. Test with the closest approach, biased by a few
-  // tens of metres toward "sky", so grazing rays are never dropped by both passes (float rounding of
-  // the two proxies differs); a hair-thin overlap is invisible, a hole is a black pixel.
+  // The surface pass owns rays that hit the ground. The two passes reconstruct each pixel's ray from
+  // different proxy meshes, so at grazing angles (the limb seen from low orbit) they can disagree by a
+  // fraction of a pixel; a pixel both passes dropped is a black hole in the limb. So leave the ground
+  // to the surface only a full pixel inside the limb: where the surface did draw, its depth already
+  // rejects this pass; where it missed, this pass fills in the limb glow.
   float tca = -dot(ro, rd);
   vec3 pca = ro + rd * tca;
   float b2 = dot(pca, pca);
-  if (b2 < 1.0 - 1e-5 && tca + sqrt(max(0.0, 1.0 - b2)) > tCam) discard;
+  float margin = max(1e-5, 2.0 * (tca - tCam) * uPixelAngle);
+  if (b2 < 1.0 - margin && tca + sqrt(max(0.0, 1.0 - b2)) > tCam) discard;
   vec2 top = raySphere(ro, rd, vec3(0.0), uTop);
   float t0 = max(top.x, tCam);
   float t1 = top.y;

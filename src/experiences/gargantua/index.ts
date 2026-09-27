@@ -31,6 +31,7 @@ import {
   MASS_PRESETS,
   VIEWS,
   exposureFactor,
+  highlightExposure,
   fovForDistance,
   type LookId,
   type MassPresetId,
@@ -42,6 +43,8 @@ const PC_M = 3.0857e16;
 /** Idle orbit: rad/s, after this many seconds without input. */
 const IDLE_ORBIT = 0.012;
 const IDLE_DELAY = 10;
+/** Linear radiance (post-exposure) the metered 80th-percentile cell may reach: midtones after ACES. */
+const BULK_LEVEL = 0.45;
 /** CPU time per frame given to the shadow-size readout's geodesics (ms). */
 const SHADOW_BUDGET_MS = 1.5;
 /** 95th-percentile disk luminance at the default view — the auto-exposure reference. */
@@ -78,6 +81,7 @@ class Gargantua implements Experience {
   private wasInside = false;
   private shadowWidth = NaN;
   private shadowKey = '';
+  private readonly readoutPos: Vec3 = [0, 0, 0];
   /** Shadow-size measurement in progress (one CPU geodesic per step, spread over frames). */
   private shadowJob: Generator<void, number, void> | null = null;
   /** Seconds since the last user input (drives the slow idle orbit). */
@@ -87,7 +91,7 @@ class Gargantua implements Experience {
   private readoutTimer = 0;
   private moodTimer = 0;
   private fovDeg = 32;
-  private baseExposure = 2.4;
+  private baseExposure = 1.9;
   private exposure = -1;
   private shotSig = '';
   private shotStill = 0;
@@ -113,7 +117,8 @@ class Gargantua implements Experience {
   mount(ctx: ExperienceContext): void {
     this.ctx = ctx;
     const tier = ctx.quality.tier as BlackHoleQuality;
-    this.bh = new BlackHoleRenderer(ctx.renderer, { quality: tier });
+    // `?bhfloat=half` (dev only) exercises the half-float lens map of devices without 32-bit targets.
+    this.bh = new BlackHoleRenderer(ctx.renderer, { quality: tier, floatTargets: ctx.params.get('bhfloat') === 'half' ? 'half' : 'auto' });
     ctx.progress(0.3, 'Bending light');
 
     // Background: the project's sky (Milky Way band; point stars are lensed analytically).
@@ -166,8 +171,11 @@ class Gargantua implements Experience {
     ctx.input.onKeyDown((e) => this.onKey(e));
 
     ctx.post.exposure = 1.0;
-    ctx.post.bloomStrength = 0.1;
-    ctx.post.bloomRadius = 0.85;
+    // A tight glow: the wide bloom mips (radius 0.85) filled the shadow with a grey haze (sRGB ~20–40
+    // at its centre); at 0.55 / 0.08 the photon ring and the beamed side still glow and the shadow
+    // stays black on OLED screens.
+    ctx.post.bloomStrength = 0.08;
+    ctx.post.bloomRadius = 0.55;
     ctx.post.tonemap = (ctx.params.get('tm') as typeof ctx.post.tonemap) ?? 'aces';
     ctx.post.saturation = 1.1;
     ctx.post.vignette = 0.22;
@@ -384,9 +392,8 @@ class Gargantua implements Experience {
       this.spinBeforeLook = null;
     }
     if (spin !== null) {
-      this.bh.setParams({ spin });
+      this.setParams({ spin }); // also rescales a custom inner edge to the new ISCO
       (this.controls.spin as Control<number> | undefined)?.set(spin);
-      this.shadowKey = '';
     }
     this.updateStaticInfo();
     if (toast) this.ctx.ui.toast(l.note, 4200);
@@ -433,6 +440,7 @@ class Gargantua implements Experience {
     if (!v) return;
     this.cancelPlunge();
     this.idle();
+    this.readoutTimer = 0; // refresh the readouts on the next frame
     this.view = id;
     this.viewButtons?.setActive((Object.keys(VIEWS) as ViewId[]).indexOf(id));
     const instant = seconds <= 0 || this.ctx.engine.shotMode;
@@ -601,8 +609,7 @@ class Gargantua implements Experience {
   /** Camera pose for the plunge: facing the hole, turning to look back once inside. */
   private plungePose(cam: THREE.PerspectiveCamera): void {
     const pl = this.plunge!;
-    const [x, y, z] = pl.pos;
-    this.camPos.set(x, z, -y);
+    this.camPos.set(pl.pos[0], pl.pos[2], -pl.pos[1]);
     const pos = this.camPos;
     this.v0.set(0, 0, 0);
     this.up.copy(this.yAxis);
@@ -684,8 +691,11 @@ class Gargantua implements Experience {
     if (f.frame % 6 === 0) this.bh.meter();
     const hl = this.bh.highlightLuminance;
     const s = Math.sin(this.plunge ? 0 : this.rig.pitch);
-    const auto = hl > 0 ? Math.min(1, Math.max(0.02, Math.pow(REF_HIGHLIGHT / hl, 0.75))) * (1 - 0.3 * s * s) : exposureFactor(this.rig.distance, this.rig.pitch);
-    const target = this.baseExposure * auto;
+    const auto = hl > 0 ? highlightExposure(hl / REF_HIGHLIGHT) * (1 - 0.3 * s * s) : exposureFactor(this.rig.distance, this.rig.pitch);
+    // When bright gas fills most of the frame (at the photon sphere the 80th-percentile cell is
+    // ~15× the default view's 95th), also keep that bulk in the tone curve's midtones.
+    const bulk = this.bh.bulkLuminance;
+    const target = bulk > 0 ? Math.min(this.baseExposure * auto, BULK_LEVEL / bulk) : this.baseExposure * auto;
     this.exposure = this.exposure < 0 || this.ctx.engine.shotMode ? target : this.exposure + (target - this.exposure) * (1 - Math.exp(-dt / 0.35));
     this.ctx.post.exposure = this.exposure;
     this.bh.setTime(this.time);
@@ -709,23 +719,36 @@ class Gargantua implements Experience {
   private stepShadow(): void {
     const job = this.shadowJob;
     if (!job) return;
+    // Headless screenshots finish the measurement at once, so their readouts are never stale.
+    const budget = this.ctx.engine.shotMode ? Infinity : SHADOW_BUDGET_MS;
     const t0 = performance.now();
     do {
       const r = job.next();
       if (r.done) {
         this.shadowJob = null;
         this.shadowWidth = r.value;
+        this.showShadow();
         return;
       }
-    } while (performance.now() - t0 < SHADOW_BUDGET_MS);
+    } while (performance.now() - t0 < budget);
   }
 
   private updateReadouts(): void {
     const a = this.bh.params.spin;
     const m = MASS_PRESETS[this.mass].mass;
     const rg = gravitationalRadius(m);
-    const cam = this.bh.camera;
-    const pos: Vec3 = cam ? cam.pos : [this.rig.position.x, -this.rig.position.z, this.rig.position.y];
+    // Where the camera is now (update() runs before render(), so the renderer's last camera would be
+    // a frame late — and after an instant view change, 0.2 s stale).
+    const pos = this.readoutPos;
+    if (this.plunge) {
+      pos[0] = this.plunge.pos[0];
+      pos[1] = this.plunge.pos[1];
+      pos[2] = this.plunge.pos[2];
+    } else {
+      pos[0] = this.rig.position.x;
+      pos[1] = -this.rig.position.z;
+      pos[2] = this.rig.position.y;
+    }
     const r = ksRadius(a, pos[0], pos[1], pos[2]);
     const cosT = pos[2] / Math.max(r, 1e-9);
     this.rDist.set(formatNumber(r, 3), `r_g · ${joinFormatted(formatDistance(r * rg, 3))}`);
@@ -757,6 +780,11 @@ class Gargantua implements Experience {
         this.shadowWidth = 2 * Math.asin(Math.min(1, horizonRadius(a) / r));
       }
     }
+    this.showShadow();
+  }
+
+  private showShadow(): void {
+    if (this.plunge) return;
     const w = this.shadowWidth / DEG;
     if (Number.isFinite(w)) this.rShadow.set(w >= 1 ? formatNumber(w, 3) : formatNumber(w * 60, 3), w >= 1 ? '° across' : '′ across');
     else this.rShadow.set('…', '');

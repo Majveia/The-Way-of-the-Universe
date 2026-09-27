@@ -43,7 +43,7 @@ import {
   stepLength,
 } from '../src/worlds/blackhole/kerr';
 import { traceFrag } from '../src/worlds/blackhole/shaders';
-import { exposureFactor, fovForDistance, MASS_PRESETS } from '../src/experiences/gargantua/presets';
+import { exposureFactor, fovForDistance, highlightExposure, MASS_PRESETS } from '../src/experiences/gargantua/presets';
 
 /** Static camera on the +x axis (optionally lifted to latitude `elev`) looking at the hole. */
 function camera(a: number, r: number, elev = 0) {
@@ -397,6 +397,20 @@ describe('camera helpers', () => {
     expect(exposureFactor(40, 0)).toBeCloseTo(1, 6);
     expect(exposureFactor(4, 0)).toBeLessThan(0.5);
     expect(exposureFactor(40, Math.PI / 2)).toBeCloseTo(0.65, 6);
+  });
+  it('highlight metering: partial adaptation up to 4× the reference, full beyond (no white-out)', () => {
+    expect(highlightExposure(0.5)).toBe(1);
+    expect(highlightExposure(1)).toBe(1);
+    expect(highlightExposure(2)).toBeCloseTo(Math.pow(2, -0.75), 12);
+    // continuous at the knee, then the displayed highlight stays at 4^¼ ≈ 1.41× the reference
+    expect(highlightExposure(4 - 1e-9)).toBeCloseTo(highlightExposure(4 + 1e-9), 6);
+    for (const r of [8, 30, 100]) expect(r * highlightExposure(r)).toBeCloseTo(Math.pow(4, 0.25), 6);
+    let prev = 1;
+    for (let r = 1; r < 500; r *= 1.3) {
+      const e = highlightExposure(r);
+      expect(e).toBeLessThanOrEqual(prev + 1e-12);
+      prev = e;
+    }
   });
   it('mass presets are ordered physical values', () => {
     expect(MASS_PRESETS.sgra.mass).toBeCloseTo(4.3e6, -4);

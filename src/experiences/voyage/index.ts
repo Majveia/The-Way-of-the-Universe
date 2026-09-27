@@ -1570,7 +1570,8 @@ class Voyage implements Experience {
     const po = this.proc?.opacity ?? 0;
     const so = Math.min(1, this.sol.opacity + po);
     this.postE = Math.exp(this.sol.opacity * Math.log(this.sol.exposure) + po * Math.log(this.proc?.exposure ?? 1));
-    if (this.sgra.weight > 0) this.postE = Math.exp(THREE.MathUtils.lerp(Math.log(this.postE), Math.log(this.sgra.meterExposure(this.dRg)), this.sgra.weight));
+    const wBH = this.sgra.visibleWeight;
+    if (wBH > 0) this.postE = Math.exp(THREE.MathUtils.lerp(Math.log(this.postE), Math.log(this.sgra.meterExposure(this.dRg)), wBH));
     this.ctx.post.exposure = this.postE;
     this.local.sky.exposure = THREE.MathUtils.lerp(e, Math.max(e, 0.8), so) / this.postE;
     this.ship.exposure = e / this.postE;
@@ -1639,7 +1640,7 @@ class Voyage implements Experience {
     this.local.renderSky(r, this.skyCam, eng.pixelRatio, eng.cssHeight);
     // 2. The cosmic web.
     const cz = this.cosmos;
-    const bhFull = this.sgra.weight >= 0.999 && !this.sgra.needsCapture;
+    const bhFull = this.sgra.visibleWeight >= 0.999;
     const dHome = this.navRoot.length();
     let dGal = Infinity;
     for (const g of cz.galaxies) dGal = Math.min(dGal, this.navRoot.distanceTo(g.frame.origin));
@@ -1701,7 +1702,7 @@ class Voyage implements Experience {
       this.proc.render(target);
     }
     // 5c. Sagittarius A*: the Kerr ray tracer redraws the view near the hole.
-    if (this.sgra.bh && this.sgra.weight > 0.001) {
+    if (this.sgra.bh && this.sgra.visibleWeight > 0.001) {
       const camRg = convertPoint(nav.position, nav.frame, this.sgra.frame, _v4);
       rootQuatToFrame(this.skyCam.quaternion, this.sgra.frame, _q2);
       this.sgra.render(target, _q2, this.skyCam.fov, camRg, this.postE, this.ctx.engine.frame);
@@ -1843,7 +1844,7 @@ class Voyage implements Experience {
     }
     // Galaxies and home (not while the lensed sky of Sgr A* fills the view).
     for (const g of this.cosmos.galaxies) {
-      if (this.sgra.weight > 0.5) break;
+      if (this.sgra.visibleWeight > 0.5) break;
       const gp = convertPoint(this.nav.position, this.nav.frame, g.frame, _v6);
       const r = gp.length();
       if (r < g.radius * 1.3 || (d.id === g.id || (d.id === 'milky-way' && g === this.cosmos.mwEntry) || (d.id === 'andromeda' && g === this.cosmos.m31Entry))) continue;

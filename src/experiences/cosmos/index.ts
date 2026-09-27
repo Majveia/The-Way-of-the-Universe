@@ -18,6 +18,7 @@ import { makeExpansion } from '../../worlds/cosmicweb/Simulation';
 import type { CosmoParams, HaloCatalog, SimConfig, SimInfo } from '../../worlds/cosmicweb/types';
 import { PLANCK_COSMO } from '../../worlds/cosmicweb/types';
 import type { StoredFrame } from '../../worlds/cosmicweb/SnapshotStore';
+import type { AccumMode, AtlasMode } from '../../worlds/cosmicweb/formats';
 import type { Expansion } from '../../physics/cosmosExpansion';
 import { cosmicCalendar } from '../../physics/cosmology';
 import { formatDuration, formatNumber, formatScientific } from '../../physics/units';
@@ -163,6 +164,8 @@ class CosmicWebExperience implements Experience {
   private ringSel!: HTMLElement;
   private selected = -1;
   private selectedFrame = -1;
+  /** The selection was made by the Cluster view (closed again when leaving it). */
+  private autoSelected = false;
   private hover = -1;
   private hoverClock = 0;
   private lastPointerMove = 0;
@@ -308,6 +311,11 @@ class CosmicWebExperience implements Experience {
       varDwarf: Math.max(0.5, info.sigmaMin2 - varR),
       varBright: Math.max(0.3, sig11 - varR),
       detail: this.ctx.quality.detail,
+      // Dev only (URL query): force the portable fallback formats, e.g. ?cwaccum=rgba8&cwatlas=rgba8.
+      formats: {
+        ...(this.ctx.params.get('cwaccum') ? { accum: this.ctx.params.get('cwaccum') as AccumMode } : {}),
+        ...(this.ctx.params.get('cwatlas') ? { atlas: this.ctx.params.get('cwatlas') as AtlasMode } : {}),
+      },
     };
     this.web = new WebRenderer(this.ctx.renderer, opts);
     this.web.pixelRatio = this.ctx.engine.pixelRatio;
@@ -632,6 +640,7 @@ class CosmicWebExperience implements Experience {
       const halos = this.currentHalos();
       const o = this.orbit;
       if (this.rigMode === 'fly' && id !== 'inside') this.setRig('orbit');
+      if (this.autoSelected && id !== 'cluster') this.select(-1);
       switch (id) {
         case 'volume':
           this.state.wrap = false;
@@ -658,7 +667,10 @@ class CosmicWebExperience implements Experience {
           }
           o.flyTo({ target, distance: dist, pitch: 0.25 }, 3);
           o.autoRotate = id === 'cluster' ? 0.06 : 0.035;
-          if (id === 'cluster' && halos && halos.count > 0) this.select(0);
+          if (id === 'cluster' && halos && halos.count > 0) {
+            this.select(0);
+            this.autoSelected = true;
+          }
           break;
         }
         case 'void': {
@@ -777,6 +789,7 @@ class CosmicWebExperience implements Experience {
   }
 
   private select(i: number): void {
+    this.autoSelected = false;
     const h = this.currentHalos();
     this.selected = h && i >= 0 && i < h.count ? i : -1;
     const f = this.frameNear();

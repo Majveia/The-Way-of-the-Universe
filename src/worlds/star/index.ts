@@ -159,23 +159,28 @@ uniform float uTime;
 uniform vec3 uCoronaColor;
 uniform vec3 uHalpha;
 uniform float uSeed;
+uniform float uExtent;
 void main() {
   float b = length(vQ);
-  if (b < 1.0) discard;
+  // Inside the disk the photosphere covers it; beyond uExtent the quad ends — fade to exactly zero
+  // before that (a hard cut would show the quad's square edges around a bright Sun).
+  if (b < 1.0 || b >= uExtent) discard;
   float ang = atan(vQ.y, vQ.x);
   vec2 cs = vec2(cos(ang), sin(ang));
   float h = b - 1.0;
   // K-corona: steep power law with helmet streamers (brighter at low latitudes) and polar plumes.
   float streamers = 0.55 + 0.45 * snoise(vec3(cs * 2.2, uSeed)) + 0.25 * snoise(vec3(cs * 7.0, uSeed + 3.0));
   streamers *= mix(0.6, 1.0, sqr(cs.x));
-  float corona = pow(b, -3.0) * max(streamers, 0.08) * uCorona;
-  // Prominences: Hα loops a few % of R above the limb.
-  float loops = snoise(vec3(cs * 9.0, uSeed + uTime * 0.2)) * 0.5 + 0.5;
-  float arch = abs(snoise(vec3(cs * 26.0, h * 14.0 + uSeed)));
-  float prom = smoothstep(0.72, 0.9, loops) * smoothstep(0.25, 0.0, arch) * exp(-h / 0.045) * smoothstep(0.0, 0.004, h);
-  // Spicule forest just above the chromosphere.
-  float spic = exp(-h / 0.006) * (0.5 + 0.5 * snoise(vec3(cs * 180.0, uTime * 3.0)));
-  vec3 col = uCoronaColor * corona * 0.004 + uHalpha * (prom * 0.08 * uActivity + spic * 0.015);
+  float corona = pow(b, -3.0) * max(streamers, 0.08) * uCorona * (1.0 - smoothstep(0.55 * uExtent, uExtent, b));
+  vec3 col = uCoronaColor * corona * 0.004;
+  // Prominences (Hα loops a few % of R above the limb) and the spicule forest: only near the limb.
+  if (h < 0.3) {
+    float loops = snoise(vec3(cs * 9.0, uSeed + uTime * 0.2)) * 0.5 + 0.5;
+    float arch = abs(snoise(vec3(cs * 26.0, h * 14.0 + uSeed)));
+    float prom = smoothstep(0.72, 0.9, loops) * smoothstep(0.25, 0.0, arch) * exp(-h / 0.045) * smoothstep(0.0, 0.004, h);
+    float spic = h < 0.06 ? exp(-h / 0.006) * (0.5 + 0.5 * snoise(vec3(cs * 180.0, uTime * 3.0))) : 0.0;
+    col += uHalpha * (prom * 0.08 * uActivity + spic * 0.015);
+  }
   outColor = vec4(col * uIntensity, 1.0);
 }`;
 

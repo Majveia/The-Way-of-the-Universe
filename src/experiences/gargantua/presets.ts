@@ -29,6 +29,20 @@ export function fovForDistance(d: number): number {
   return 64 + (26 - 64) * t;
 }
 
+/**
+ * Exposure multiplier from the metered highlights, `ratio` = 95th-percentile disk luminance relative
+ * to the default view's. Never brighter than the reference; up to 4× brighter scenes are only
+ * partially compensated (∝ ratio^−¾, so a close-up still reads as brighter), beyond that fully
+ * (∝ 1/ratio) — at the photon sphere the disk is ~30× brighter and ratio^−¾ alone left most of
+ * the frame (and the readouts over it) clipped to white.
+ */
+export function highlightExposure(ratio: number): number {
+  if (!(ratio > 1)) return 1;
+  const knee = 4;
+  const e = ratio <= knee ? Math.pow(ratio, -0.75) : Math.pow(knee, -0.75) * (knee / ratio);
+  return Math.max(0.004, e);
+}
+
 /** Fallback exposure multiplier (before the first metering) at distance d (r_g) and elevation `pitch` (radians). */
 export function exposureFactor(d: number, pitch: number): number {
   const near = Math.min(1, Math.max(0.3, Math.pow(d / 40, 0.45)));
@@ -86,6 +100,7 @@ export interface LookDef {
   params: Partial<BlackHoleParams>;
   spin?: number;
   saturation: number;
+  /** Post exposure at the reference view (the highlight meter adjusts it from there). */
   exposure: number;
 }
 
@@ -96,7 +111,7 @@ export const LOOKS: Record<LookId, LookDef> = {
     note: 'Physical: Doppler beaming and gravitational redshift on.',
     params: { doppler: true, gravitationalRedshift: true, peakTemperature: 8000, thickness: 0.014, turbulence: 0.85, diskOuter: 16, diskBrightness: 4 },
     saturation: 1.1,
-    exposure: 2.4,
+    exposure: 1.9,
   },
   interstellar: {
     label: 'Interstellar',
@@ -104,13 +119,13 @@ export const LOOKS: Record<LookId, LookDef> = {
     params: { doppler: false, gravitationalRedshift: false, peakTemperature: 4800, thickness: 0.01, turbulence: 0.9, diskOuter: 18, diskBrightness: 4 },
     spin: 0.6,
     saturation: 1.12,
-    exposure: 1.5,
+    exposure: 1.2,
   },
   hot: {
     label: 'Hot quasar disk',
     note: 'A disk near the Eddington limit, peaking in the ultraviolet: white-blue, beamed hard.',
     params: { doppler: true, gravitationalRedshift: true, peakTemperature: 30000, thickness: 0.02, turbulence: 0.7, diskOuter: 20, diskBrightness: 4 },
     saturation: 1.1,
-    exposure: 1.6,
+    exposure: 1.3,
   },
 };
