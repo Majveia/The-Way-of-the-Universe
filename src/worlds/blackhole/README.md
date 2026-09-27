@@ -18,6 +18,7 @@ const bh = new BlackHoleRenderer(renderer, { quality: 'high' });  // 'low' | 'me
 bh.setEnvironment(cubeRenderTarget.texture);                        // sky seen through the lens
 bh.setParams({ spin: 0.9, peakTemperature: 8000, doppler: true, time });   // Partial<BlackHoleParams>
 bh.setObserverVelocity(u | null);                                   // Kerr–Schild 4-velocity (e.g. a plunge)
+bh.resolutionScale = engine.renderScale;                            // each frame: trace follows dynamic resolution
 bh.render(hdrTarget, camera, camPosInRg);                           // full-screen linear HDR
 bh.meter(); bh.highlightLuminance;                                  // async auto-exposure metering
 bh.pick(ndcX, ndcY);                                                // CPU float64 trace of one pixel

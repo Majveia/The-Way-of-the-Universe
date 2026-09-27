@@ -42,7 +42,8 @@ import {
   shadowAngularWidth,
   stepLength,
 } from '../src/worlds/blackhole/kerr';
-import { traceFrag } from '../src/worlds/blackhole/shaders';
+import { COMPOSITE_FRAG, traceFrag } from '../src/worlds/blackhole/shaders';
+import { BLACKHOLE_QUALITY, traceEps, traceSizeFor } from '../src/worlds/blackhole/BlackHoleRenderer';
 import { exposureFactor, fovForDistance, highlightExposure, MASS_PRESETS } from '../src/experiences/gargantua/presets';
 
 /** Static camera on the +x axis (optionally lifted to latitude `elev`) looking at the hole. */
@@ -549,10 +550,12 @@ describe('GPU step law (shared with the CPU tracer)', () => {
   // Default view (40 r_g, 3.6° above the disk, 32° vertical field): trace a grid with each tier's
   // step and with 1/16 of it; errors in 1080p pixels (sky: asymptotic direction, disk: first
   // equatorial crossing seen from the camera).
+  // The eps under test is the renderer's own (a retune of the tiers must pass these budgets).
   const tiers: Array<[string, number, number, number]> = [
-    ['high', 0.1, 0.35, 1.5],
-    ['medium', 0.13, 0.8, 2.5],
-    ['low', 0.16, 1.6, 4],
+    ['ultra', BLACKHOLE_QUALITY.ultra.eps, 0.25, 1.2],
+    ['high', BLACKHOLE_QUALITY.high.eps, 0.35, 1.5],
+    ['medium', BLACKHOLE_QUALITY.medium.eps, 0.8, 2.5],
+    ['low', BLACKHOLE_QUALITY.low.eps, 1.6, 4],
   ];
   for (const [name, eps, skyTol, diskTol] of tiers) {
     it(`${name} tier (eps = ${eps}) keeps the lensed sky and the disk within budget`, () => {
@@ -582,6 +585,37 @@ describe('GPU step law (shared with the CPU tracer)', () => {
   }
 });
 
+describe('step accuracy close to the hole', () => {
+  it('high tier at the photon-sphere view (4.6 r_g, 60° field) stays within a few 1080p pixels', () => {
+    const a = 0.9;
+    const eps = traceEps(BLACKHOLE_QUALITY.high.eps, 4.6);
+    expect(eps).toBeLessThan(0.1 + 1e-9);
+    expect(traceEps(BLACKHOLE_QUALITY.high.eps, 40)).toBe(BLACKHOLE_QUALITY.high.eps);
+    const cam = viewCam(a, 4.6, (8 * Math.PI) / 180);
+    const tanY = Math.tan((60 * Math.PI) / 360), tanX = (tanY * 16) / 9;
+    const pix = (2 * tanY) / 1080;
+    const sky: number[] = [], disk: number[] = [];
+    for (let j = 0; j < 9; j++)
+      for (let i = 0; i < 16; i++) {
+        const k = rayMomentum(cam.tetrad, pixelDir(tanX, tanY, ((i + 0.5) / 16) * 2 - 1, ((j + 0.5) / 9) * 2 - 1));
+        const g = traceRay(a, cam.pos, k, { eps, maxSteps: BLACKHOLE_QUALITY.high.maxSteps });
+        const ref = traceRay(a, cam.pos, k, { eps: eps / 16, maxSteps: 40000 });
+        expect(g.fate).not.toBe('lost'); // the step cap is never the reason a ray ends
+        if (g.fate !== ref.fate) continue;
+        if (g.fate === 'escaped') sky.push(angleBetween(g.direction, ref.direction) / pix);
+        if (g.crossings.length && ref.crossings.length) {
+          const p = g.crossings[0].pos, q = ref.crossings[0].pos;
+          disk.push(Math.hypot(p[0] - q[0], p[1] - q[1]) / (4.6 * pix));
+        }
+      }
+    const p99 = (v: number[]) => v.sort((x, y) => x - y)[Math.floor(0.99 * (v.length - 1))];
+    expect(sky.length).toBeGreaterThan(8);
+    expect(disk.length).toBeGreaterThan(20);
+    expect(p99(sky)).toBeLessThan(3);
+    expect(p99(disk)).toBeLessThan(7);
+  });
+});
+
 describe('lens cache key', () => {
   it('is invariant under rotations about the spin axis and sensitive to anything else', () => {
     const rot = (v: Vec3, t: number): Vec3 => [v[0] * Math.cos(t) - v[1] * Math.sin(t), v[0] * Math.sin(t) + v[1] * Math.cos(t), v[2]];
@@ -600,5 +634,69 @@ describe('lens cache key', () => {
     let diff = 0;
     for (let i = 0; i < 11; i++) diff = Math.max(diff, Math.abs(k2[i] - k0[i]));
     expect(diff).toBeGreaterThan(1e-3);
+  });
+});
+
+// ————————————————————————————————————————————————————————————— review 2: GPU cost, tiers, portability
+
+describe('quality tiers and dynamic resolution', () => {
+  it('the trace follows the engine’s dynamic resolution (fixed trace/output ratio per native size)', () => {
+    // 3840 × 2160 native, high: capped at 500k traced pixels.
+    const q = BLACKHOLE_QUALITY.high;
+    const [w1, h1] = traceSizeFor(3840, 2160, q.traceScale, q.tracePixels, 1);
+    expect(w1 * h1).toBeLessThanOrEqual(q.tracePixels * 1.01);
+    expect(w1 * h1).toBeGreaterThan(q.tracePixels * 0.97);
+    // The engine drops to 0.6: the output has 0.36× the pixels, so must the trace (it used to stay
+    // at the cap, so the GPU-time controller could only blur the image, not make it cheaper).
+    const [w2, h2] = traceSizeFor(Math.round(3840 * 0.6), Math.round(2160 * 0.6), q.traceScale, q.tracePixels, 0.6);
+    expect((w2 * h2) / (w1 * h1)).toBeCloseTo(0.36, 2);
+    // Below the cap the trace is traceScale × output whatever the render scale.
+    const [w3, h3] = traceSizeFor(1280, 720, q.traceScale, q.tracePixels, 1);
+    expect(w3).toBe(Math.round(1280 * q.traceScale));
+    expect(h3).toBe(Math.round(720 * q.traceScale));
+    const [w4] = traceSizeFor(640, 360, q.traceScale, q.tracePixels, 0.5);
+    expect(w4).toBe(Math.round(640 * Math.min(q.traceScale, Math.sqrt(q.tracePixels / (1280 * 720)))));
+  });
+
+  it('tiers scale the cost: medium ≈ ½, low ≤ ~¼ of high at 1080p (engine start budgets)', () => {
+    // Cost model per frame (ALU units): traced px × steps × 600 + output px × (400 + 200 per star
+    // layer + 60 for Catmull–Rom) + disk texels × 200, steps ∝ 1/eps (27 mean at eps = 0.14).
+    const startPixels = { low: 1.2e6, medium: 2.4e6, high: 4.2e6, ultra: 9e6 } as const;
+    const cost = (tier: keyof typeof BLACKHOLE_QUALITY) => {
+      const q = BLACKHOLE_QUALITY[tier];
+      const out = Math.min(1920 * 1080, startPixels[tier]);
+      const rs = Math.sqrt(out / (1920 * 1080));
+      const [tw, th] = traceSizeFor(Math.round(1920 * rs), Math.round(1080 * rs), q.traceScale, q.tracePixels, rs);
+      const steps = (27 * 0.14) / q.eps;
+      return tw * th * steps * 600 + out * (400 + 200 * q.starLayers + (q.upsample ? 60 : 0)) + q.diskTex[0] * q.diskTex[1] * 200;
+    };
+    const high = cost('high');
+    expect(cost('medium') / high).toBeLessThan(0.6);
+    expect(cost('low') / high).toBeLessThan(0.3);
+    expect(cost('ultra')).toBeGreaterThan(high);
+    // Step caps leave room for the slowest rays at each tier's eps (≈ 150 steps at eps 0.1 near the
+    // photon sphere, ∝ 1/eps).
+    for (const q of Object.values(BLACKHOLE_QUALITY)) expect(q.maxSteps * q.eps).toBeGreaterThanOrEqual(28);
+  });
+
+  it('the composite’s star search has no constant-bound 3 × 3 loops and one colour lookup per pixel', () => {
+    // D3D compilers (ANGLE on Windows) unroll constant-bound loops and flatten their branches: the
+    // old 2 faces × 3 × 3 cells × 3 layers search executed ~54 hashes and ~108 Planck lookups per
+    // pixel there. The search must use data-dependent bounds.
+    expect(COMPOSITE_FRAG).not.toMatch(/for \(int j = -1; j <= 1; j\+\+\)/);
+    expect(COMPOSITE_FRAG).toMatch(/for \(int y = lo\.y; y <= hi\.y; y\+\+\)/);
+    const starFace = COMPOSITE_FRAG.slice(COMPOSITE_FRAG.indexOf('void starFace'), COMPOSITE_FRAG.indexOf('vec3 starColor'));
+    expect(starFace).not.toContain('planckS');
+    // flux 10^(−0.4 m) with m = ln(x)/k, k = 0.35 ln 10  ⇒  x^(−0.4/0.35)
+    const k = 0.35 * Math.LN10;
+    expect(Number(/pow\(e0 \+ h\.z \* \(e1 - e0\), (-[0-9.]+)\)/.exec(starFace)![1])).toBeCloseTo((-0.4 * Math.LN10) / k, 6);
+  });
+
+  it('float32 targets are only ever read with nearest filtering (no OES_texture_float_linear)', () => {
+    // Every linear-filtered texture of the renderer is half float; the float32 lens map is read with
+    // texelFetch. Guard the shader side: the lens map samplers are only used through texelFetch.
+    const trace = traceFrag(200, 10);
+    expect(trace).not.toMatch(/texture(Lod)?\(uSkyCache/);
+    expect(COMPOSITE_FRAG).not.toMatch(/texture(Lod|Grad)?\(uSky[,)]/);
   });
 });

@@ -84,10 +84,14 @@ uniform sampler2D uTransLUT;
 uniform sampler2D uMSLUT;
 uniform sampler2D uIrrLUT;
 
-vec3 transmittanceToTop(float r, float mu) { return lutDecode(texture(uTransLUT, transmittanceUV(r, mu)).rgb, uLutScale.x); }
+// Explicit LOD 0 (the tables have no mipmaps, so the result is identical): an implicit-derivative
+// texture() inside the ray-march loops is a gradient operation in divergent control flow, which the
+// D3D11 back end of ANGLE (Chrome/Edge on Windows) handles by unrolling or flattening the loops —
+// every iteration of every loop then runs for every pixel.
+vec3 transmittanceToTop(float r, float mu) { return lutDecode(textureLod(uTransLUT, transmittanceUV(r, mu), 0.0).rgb, uLutScale.x); }
 vec3 sunTransmittance(float r, float muS) { return transmittanceToTop(r, muS) * sunVisibility(r, muS); }
-vec3 msLookup(float r, float muS) { return lutDecode(texture(uMSLUT, msUV(r, muS)).rgb, uLutScale.y); }
-vec3 skyIrradiance(float r, float muS) { return lutDecode(texture(uIrrLUT, irrUV(r, muS)).rgb, uLutScale.z); }
+vec3 msLookup(float r, float muS) { return lutDecode(textureLod(uMSLUT, msUV(r, muS), 0.0).rgb, uLutScale.y); }
+vec3 skyIrradiance(float r, float muS) { return lutDecode(textureLod(uIrrLUT, irrUV(r, muS), 0.0).rgb, uLutScale.z); }
 `;
 
 /**
@@ -345,11 +349,11 @@ vec4 sampleEqui(sampler2D t, EquiUV e) { return textureGrad(t, e.uv, e.dx, e.dy)
 vec4 sampleEquiBias(sampler2D t, EquiUV e, float scale) { return textureGrad(t, e.uv, e.dx * scale, e.dy * scale); }
 
 // Tangent frame (east, north) on the unit sphere, spin axis +Y.
+// east = ∂n/∂lon of n = (cos lat cos lon, sin lat, −cos lat sin lon) = cos lat (−sin lon, 0, −cos lon)
+//      = (n.z, 0, −n.x); north = ∂n/∂lat = n × east. (Mirrored by tangentFrameRef in reference.ts.)
 void tangentFrame(vec3 n, out vec3 east, out vec3 north) {
-  east = normalize(vec3(-n.z, 0.0, -n.x) + vec3(1e-6, 0.0, 0.0));
-  // east = d/dlon of (cos lat cos lon, sin lat, −cos lat sin lon) ∝ (−sin lon, 0, −cos lon)
-  north = normalize(cross(east, n));
-  north = -north;
+  east = normalize(vec3(n.z, 0.0, -n.x) + vec3(1e-6, 0.0, 0.0));
+  north = cross(n, east);
 }
 
 float D_GGX(float NoH, float a) {
@@ -404,7 +408,7 @@ uniform float uRingOpacity;
 vec4 ringSample(float r) {
   if (r < uRingRange.x || r > uRingRange.y) return vec4(0.0);
   float x = (r - uRingRange.x) / (uRingRange.y - uRingRange.x);
-  vec4 s = texture(uRingTex, vec2(x, 0.5));
+  vec4 s = textureLod(uRingTex, vec2(x, 0.5), 0.0);   // no mipmaps; explicit LOD (see ATMO_LOOKUP_GLSL)
   s.r *= uRingOpacity;
   return s;
 }

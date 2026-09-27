@@ -100,8 +100,11 @@ void main() {
     dT += gDetail * (0.045 * (cell - 0.55) + 0.02 * (fine - 0.5));
   }
   float nDetail = smoothstep(4.0 / 22.0, 0.4 / 22.0, footprint);
-  vec2 sg = worley3(q * 22.0 + vec3(uSeed));
-  float network = 1.0 - smoothstep(0.0, 0.08, sg.y - sg.x);
+  float network = 0.0;
+  if (nDetail > 0.0) {   // 27-cell Worley search: skip it when the network is below the pixel scale
+    vec2 sg = worley3(q * 22.0 + vec3(uSeed));
+    network = 1.0 - smoothstep(0.0, 0.08, sg.y - sg.x);
+  }
 
   // Sunspots and faculae.
   float spot = 0.0, pen = 0.0, fac = 0.0;

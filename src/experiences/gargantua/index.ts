@@ -824,6 +824,7 @@ class Gargantua implements Experience {
       this.shotSig = sig;
       reuse = this.shotStill > 6;
     }
+    this.bh.resolutionScale = this.ctx.engine.renderScale;
     this.bh.render(target, cam, this.camPos, reuse);
     if (shot) this.bh.syncGPU();
   }

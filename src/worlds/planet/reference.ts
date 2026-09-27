@@ -23,6 +23,17 @@ export function raySphere(ro: V3, rd: V3, r: number): [number, number] | null {
   return [-b - s, -b + s];
 }
 
+/** tangentFrame (SURFACE_UTIL_GLSL): unit east and north on the unit sphere (spin axis +y). */
+export function tangentFrameRef(n: V3): { east: V3; north: V3 } {
+  const ex = n[2] + 1e-6;
+  const ez = -n[0];
+  const l = Math.hypot(ex, ez);
+  const east: V3 = [ex / l, 0, ez / l];
+  // north = n × east
+  const north: V3 = [n[1] * east[2] - n[2] * east[1], n[2] * east[0] - n[0] * east[2], n[0] * east[1] - n[1] * east[0]];
+  return { east, north };
+}
+
 // ——— AURORA_GLSL: shellPath / shellSample ———
 export interface ShellPath {
   a: number;

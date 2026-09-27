@@ -11,7 +11,7 @@ import { formatDistance, formatNumber } from '../../physics/units';
 import { EarthCamera, meanMotion, type OrbitFraming } from './camera';
 import { GALLERY, phaseFor, type GalleryWorld, type Lighting } from './gallery';
 import { Sunbeam } from './sunbeam';
-import { AU_RE, R_EARTH_KM, fovForDistance, moonOrientation, pbdProgress, smooth, voyagerGeocentricAU } from './math';
+import { AU_RE, R_EARTH_KM, fovForDistance, moonOrientation, nightGainText, pbdProgress, smooth, voyagerGeocentricAU } from './math';
 import { SunGlare } from './glare';
 
 /**
@@ -167,11 +167,15 @@ class EarthExperience implements Experience {
   private readonly moonOccluders = [{ position: new THREE.Vector3(), radius: 1.012, umbraLight: new THREE.Color(0.012, 0.0035, 0.0009) }];
   private readonly astro = { x: 0, y: 0, z: 0 };
   private readonly bodies: DepthLayer[] = [];
-  /** Depth layers reused every frame: Sun, Moon, Earth (1.075 R⊕ encloses the aurora shell), gallery. */
+  /**
+   * Depth layers reused every frame: Sun, Moon, Earth, gallery. Each radius encloses the body's proxy
+   * meshes: 1.08 R⊕ the aurora shell (420 km, ×1.004 proxy inflation); 1.045 R☾ the Moon's surface proxy,
+   * which PlanetRenderer inflates by up to 3.5 % when the body is small on screen (uProxyScale).
+   */
   private readonly layerSlots: [DepthLayer, DepthLayer, DepthLayer, DepthLayer] = [
     { scene: this.sunScene, centre: this.sunPos, radius: SUN_R * 6.5, dist: 0 },
-    { scene: this.moonScene, centre: this.moonPos, radius: MOON_R * 1.01, dist: 0 },
-    { scene: this.earthScene, centre: this.origin, radius: 1.075, dist: 0 },
+    { scene: this.moonScene, centre: this.moonPos, radius: MOON_R * 1.045, dist: 0 },
+    { scene: this.earthScene, centre: this.origin, radius: 1.08, dist: 0 },
     { scene: this.galleryScene, centre: this.origin, radius: 1.2, dist: 0 },
   ];
   /** UTC start of the simulated year (cached: recomputed only when the year changes). */
@@ -728,7 +732,7 @@ class EarthExperience implements Experience {
     lay.toggle({ label: 'Aurora & airglow', value: true, onChange: (v) => this.setLayer('aurora', v) });
     lay.toggle({ label: 'The Moon', value: true, onChange: (v) => this.setLayer('moon', v) });
     lay.slider({ label: 'Relief', min: 0, max: 12, value: 6, format: (v) => `×${v.toFixed(1)}`, onChange: (v) => this.earth.setOptions({ relief: v }), help: 'Vertical exaggeration of GEBCO terrain shading' });
-    lay.text('Night lights are shown ~10⁴× brighter than a daylight exposure would record them, as in every night image of Earth.');
+    lay.text(`Night lights, aurora and airglow are shown ~${nightGainText()}× brighter than a daylight exposure would record them, as in every night image of Earth.`);
 
     const wsec = ui.section('Other worlds');
     this.worldCtl = wsec.select({

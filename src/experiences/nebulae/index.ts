@@ -15,6 +15,7 @@ import {
   NEBULA_LINES,
   paletteLineColours,
   pulsarExposure,
+  shellVelocityKmS,
   stromgrenRadiusPc,
   type Palette,
 } from '../../physics/nebulae';
@@ -98,6 +99,11 @@ class Nebulae implements Experience {
   private readSize!: Readout;
   private readView!: Readout;
   private readonly tmpV = new THREE.Vector3();
+  private lastAge = NaN;
+  private lastRate = NaN;
+  private lastR = NaN;
+  private lastVel = NaN;
+  private lastCam = NaN;
 
   async mount(ctx: ExperienceContext): Promise<void> {
     this.ctx = ctx;
@@ -149,6 +155,8 @@ class Nebulae implements Experience {
     await this.volume.bake(ctx.renderer, (f) => ctx.progress(f, 'Ionizing the gas'));
     if (!ctx.params.has('nometer')) await this.volume.calibrate(ctx.renderer);
     ctx.ui.hint('Drag to orbit · Scroll to zoom · Tap for a spectrum · 1–8 nebulae · C palette · G fly · Space time');
+    // Never go silently black: say so if this GPU cannot render half-float targets.
+    if (!NebulaVolume.supported(ctx.renderer)) ctx.ui.toast('This GPU cannot render floating-point targets: the nebula volume is unavailable (stars only).');
     ctx.signalReady();
   }
 
@@ -607,7 +615,7 @@ class Nebulae implements Experience {
     // Swap in a freshly baked nebula.
     if (this.pending) {
       const pv = this.pending.volume;
-      pv.bakeStep(this.ctx.renderer, 40);
+      pv.bakeStep(this.ctx.renderer, 24);
       if (pv.ready && !pv.metered) void pv.calibrate(this.ctx.renderer);
       if (pv.ready && pv.metered) {
         if (this.outgoing) {
@@ -657,16 +665,31 @@ class Nebulae implements Experience {
 
     // Readouts.
     const p = v.preset;
-    this.readAge.set(fmtYears(this.age), this.playing ? `▶ ${formatNumber(p.timeRate * this.rateMul, 3)} yr/s` : '');
+    // Readouts: re-format only when a value changed (no per-frame string churn).
+    const rate = this.playing ? p.timeRate * this.rateMul : 0;
+    if (this.age !== this.lastAge || rate !== this.lastRate) {
+      this.lastAge = this.age;
+      this.lastRate = rate;
+      this.readAge.set(fmtYears(this.age), this.playing ? `▶ ${formatNumber(rate, 3)} yr/s` : '');
+    }
     if (p.expansionKmS > 0) {
       const R = p.shellRadius * v.expansion;
-      const vel = p.variant === 'veil' ? p.expansionKmS * Math.pow(Math.max(this.age, 1) / p.ageYears, -0.6) : p.expansionKmS * (R / p.shellRadius) * (p.ageYears / Math.max(this.age, 1));
-      this.readSize.set(`${fmtPc(R)}`, `· ${formatNumber(vel, 3)} km/s`);
-    } else {
+      const vel = shellVelocityKmS(p.variant === 'veil', p.expansionKmS, this.age, p.ageYears);
+      if (R !== this.lastR || vel !== this.lastVel) {
+        this.lastR = R;
+        this.lastVel = vel;
+        this.readSize.set(`${fmtPc(R)}`, `· ${formatNumber(vel, 3)} km/s`);
+      }
+    } else if (this.lastR !== -p.half) {
+      this.lastR = -p.half;
       this.readSize.set(fmtPc(p.half * 2), 'across');
     }
     const cam = this.mode === 'orbit' ? this.orbit.position : this.fly.position;
-    this.readView.set(fmtPc(cam.length()), 'from centre');
+    const d = Math.round(cam.length() * 1000) / 1000;
+    if (d !== this.lastCam) {
+      this.lastCam = d;
+      this.readView.set(fmtPc(d), 'from centre');
+    }
   }
 
   render(target: THREE.WebGLRenderTarget): void {

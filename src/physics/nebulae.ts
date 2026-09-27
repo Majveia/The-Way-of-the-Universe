@@ -385,6 +385,18 @@ export function sedovVelocityKmS(E: number, n: number, tYears: number): number {
 /** Radius (pc) reached after t years at constant speed v (km/s): free or homologous expansion. */
 export const coastRadiusPc = (vKmS: number, tYears: number) => (vKmS * 1e3 * tYears * YEAR) / PC;
 
+/**
+ * Present expansion speed (km/s) of a shell whose speed today (age t₀) is v₀, at age t:
+ * homologous/free expansion keeps v = v₀ (R ∝ t); a Sedov–Taylor remnant decelerates as
+ * v ∝ t^{−3/5} (R ∝ t^{2/5}). Ages below 5 % of t₀ are clamped exactly as the renderer's
+ * expansion factor is, so the speed and the drawn radius always agree.
+ */
+export function shellVelocityKmS(sedov: boolean, v0: number, tYears: number, t0Years: number): number {
+  if (!sedov) return v0;
+  const t = Math.max(tYears, 0.05 * t0Years);
+  return v0 * Math.pow(t / t0Years, -0.6);
+}
+
 /** Kinematic age (yr) of a shell of radius r (pc) expanding at v (km/s). */
 export const kinematicAgeYears = (rPc: number, vKmS: number) => (rPc * PC) / (vKmS * 1e3) / YEAR;
 

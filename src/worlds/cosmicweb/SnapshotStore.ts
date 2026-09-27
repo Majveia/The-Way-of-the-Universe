@@ -102,6 +102,12 @@ export class SnapshotStore {
   private encoder: KeyframeEncoder | null = null;
   /** Incremental decode in progress (see prefetch). */
   private job: { index: number; src: Uint16Array; out: Uint16Array; i: number } | null = null;
+  /**
+   * Decode buffers evicted from the cache, reused for the next decode: a 128³ frame is 12.6 MB,
+   * and allocating one per keyframe crossing drives the garbage collector (external memory).
+   * I-frame buffers are cached as-is (read-only) and never recycled.
+   */
+  private pool: Uint16Array[] = [];
   bytes = 0;
 
   constructor(count: number) {
@@ -161,12 +167,12 @@ export class SnapshotStore {
     if (!job || job.index !== index) {
       const fr = this.frames[index];
       if (fr.full) {
-        this.put(index, fr.full.slice());
+        this.put(index, fr.full);
         return true;
       }
       const src = this.cache.get(index - 1);
       if (!src) return false;
-      job = this.job = { index, src, out: new Uint16Array(src.length), i: 0 };
+      job = this.job = { index, src, out: this.alloc(src.length), i: 0 };
     }
     const d = this.frames[index].delta!;
     const { src, out } = job;
@@ -197,16 +203,24 @@ export class SnapshotStore {
       return hit;
     }
     if (this.job && this.job.index === index) this.job = null;
+    if (this.frames[index].full) {
+      // I-frames are cached as stored (callers never modify cached positions).
+      this.put(index, this.frames[index].full!);
+      return this.frames[index].full!;
+    }
     // Find the nearest decodable start: a cached frame or the preceding I-frame.
     let start = index;
     while (start > 0 && !this.frames[start].full && !this.cache.has(start - 1)) start--;
     let cur: Uint16Array;
     let from: number;
     if (this.frames[start].full) {
-      cur = this.frames[start].full!.slice();
+      cur = this.alloc(this.frames[start].full!.length);
+      cur.set(this.frames[start].full!);
       from = start + 1;
     } else {
-      cur = this.cache.get(start - 1)!.slice();
+      const src = this.cache.get(start - 1)!;
+      cur = this.alloc(src.length);
+      cur.set(src);
       from = start;
     }
     for (let f = from; f <= index; f++) this.applyDelta(cur, this.frames[f]);
@@ -239,12 +253,27 @@ export class SnapshotStore {
     this.cacheOrder.push(index);
   }
 
+  /** Is keyframe `index` decodable incrementally right now (an I-frame, or its predecessor is cached)? */
+  canPrefetch(index: number): boolean {
+    if (index < 0 || index >= this.frames.length) return false;
+    return this.cache.has(index) || !!this.frames[index].full || this.cache.has(index - 1);
+  }
+
+  private alloc(n: number): Uint16Array {
+    const b = this.pool.pop();
+    return b && b.length === n ? b : new Uint16Array(n);
+  }
+
   private put(index: number, v: Uint16Array): void {
     this.cache.set(index, v);
     this.touch(index);
     while (this.cacheOrder.length > this.cacheSize) {
       const old = this.cacheOrder.shift()!;
+      const buf = this.cache.get(old);
       this.cache.delete(old);
+      const fr = this.frames[old];
+      // Recycle decode buffers (never an I-frame's stored array, nor one still cached or being decoded from).
+      if (buf && (!fr || fr.full !== buf) && buf !== this.job?.src && this.pool.length < 2) this.pool.push(buf);
     }
   }
 
@@ -268,6 +297,7 @@ export class SnapshotStore {
     this.cacheOrder = [];
     this.encoder = null;
     this.job = null;
+    this.pool = [];
     this.bytes = 0;
   }
 }

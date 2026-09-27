@@ -116,8 +116,10 @@ void main() {
   float u2 = r + 0.5 * h;
   float n1 = nAt(uSource + w * u1);
   float n2 = nAt(uSource + w * u2);
-  float Cx = Cin + uK * n1 * n1 * u1 * u1 * (r - ra);
-  float Cout = Cx + uK * n2 * n2 * u2 * u2 * h;
+  // Exact shell integrals ∫u² du = (b³ − a³)/3 over the two half-voxel segments (a midpoint
+  // u²·Δu underestimates the innermost voxels by up to 25 %; the star sits in one of them).
+  float Cx = Cin + uK * n1 * n1 * (r * r * r - ra * ra * ra) / 3.0;
+  float Cout = Cx + uK * n2 * n2 * (rb * rb * rb - r * r * r) / 3.0;
   float ionX = uK > 0.0 ? step(Cx, 1.0) : 0.0;
   tau += n1 * D.y * (r - ra) * mix(1.0, uIonDust, ionX);
   float xi = uK > 0.0 ? log(max(Cx, 1e-9)) : 30.0;
@@ -128,4 +130,42 @@ void main() {
   }
   // x carries the dust-bearing column (n × dust modifier): the only use of n at render time is extinction.
   outColor = vec4(min(nx * D.y, 6.0e4), clamp(xi, -30.0, 30.0), min(sqrt(max(g2, 0.0)), 6.0e4), min(tau * uKappa, 6.0e4));
+}`;
+
+/**
+ * Coarse occupancy grid for empty-space skipping (one layer). A coarse cell is B³ field voxels;
+ * it is marked occupied if any voxel that a trilinear lookup inside the cell can touch (the
+ * block dilated by one voxel) carries dust or ionized gas. Where a cell is empty the march
+ * skips the whole medium evaluation — exactly, since emission ∝ n_eff² and extinction and
+ * scattering ∝ the dust column all vanish there (the sub-voxel turbulence only multiplies).
+ */
+export const OCC_FRAGMENT = /* glsl */ `
+precision highp float;
+precision highp sampler3D;
+uniform sampler3D uField;
+uniform int uN;        // field voxels per axis
+uniform int uB;        // voxels per coarse cell
+uniform int uLayer;
+uniform float uEps;    // cm⁻³: below this nothing is visible
+out vec4 outColor;
+void main() {
+  ivec3 c = ivec3(ivec2(gl_FragCoord.xy), uLayer);
+  ivec3 lo = max(c * uB - 1, ivec3(0));
+  ivec3 hi = min(c * uB + uB, ivec3(uN - 1));
+  float m = 0.0;
+  for (int z = 0; z < 8; z++) {
+    int zz = lo.z + z;
+    if (zz > hi.z) break;
+    for (int y = 0; y < 8; y++) {
+      int yy = lo.y + y;
+      if (yy > hi.y) break;
+      for (int x = 0; x < 8; x++) {
+        int xx = lo.x + x;
+        if (xx > hi.x) break;
+        vec4 F = texelFetch(uField, ivec3(xx, yy, zz), 0);
+        m = max(m, max(F.x, F.z));
+      }
+    }
+  }
+  outColor = vec4(m > uEps ? 1.0 : 0.0, 0.0, 0.0, 1.0);
 }`;

@@ -638,3 +638,82 @@ describe('review — Pale Blue Dot, seasons, stars, sprites', () => {
     }
   });
 });
+
+describe('review 2 — shading frames, GPU portability of the shader source, night-glow wording', () => {
+  it('tangentFrame: east = ∂n/∂lon and north = ∂n/∂lat, both unit and tangent (relief shading direction)', async () => {
+    const { tangentFrameRef } = await import('../src/worlds/planet/reference');
+    const nAt = (lat: number, lon: number): V3 => [Math.cos(lat) * Math.cos(lon), Math.sin(lat), -Math.cos(lat) * Math.sin(lon)];
+    const h = 1e-6;
+    for (const [latD, lonD] of [[0, 0], [30, 40], [-50, 130], [10, -100], [70, -160], [-20, 179]]) {
+      const lat = latD * DEG, lon = lonD * DEG;
+      const n = nAt(lat, lon);
+      const { east, north } = tangentFrameRef(n);
+      const dl = nAt(lat, lon + h), dp = nAt(lat + h, lon);
+      const eRef: V3 = [(dl[0] - n[0]) / h, (dl[1] - n[1]) / h, (dl[2] - n[2]) / h];
+      const nRef: V3 = [(dp[0] - n[0]) / h, (dp[1] - n[1]) / h, (dp[2] - n[2]) / h];
+      const le = Math.hypot(...eRef), ln = Math.hypot(...nRef);
+      for (let k = 0; k < 3; k++) {
+        expect(east[k]).toBeCloseTo(eRef[k] / le, 4);
+        expect(north[k]).toBeCloseTo(nRef[k] / ln, 4);
+      }
+      expect(Math.abs(n[0] * east[0] + n[1] * east[1] + n[2] * east[2])).toBeLessThan(1e-5);
+    }
+    // The GLSL is the same expression (the old one, (−n.z, 0, −n.x), was tangent only on four meridians).
+    const { SURFACE_UTIL_GLSL } = await import('../src/worlds/planet/glsl');
+    expect(SURFACE_UTIL_GLSL.replace(/\s+/g, '')).toContain('east=normalize(vec3(n.z,0.0,-n.x)+vec3(1e-6,0.0,0.0));north=cross(n,east);');
+  });
+
+  it('no implicit-derivative texture() inside the ray-march code (D3D11/ANGLE unrolls or flattens such loops)', async () => {
+    const g = await import('../src/worlds/planet/glsl');
+    const s = await import('../src/worlds/planet/shaders');
+    const re = /\btexture\s*\(/;
+    const implicit = { test: (src: string) => re.test(src.replace(/\/\/[^\n]*/g, '')) };
+    for (const src of [g.ATMO_LOOKUP_GLSL, g.ATMO_INTEGRATE_GLSL, g.AURORA_GLSL, g.RING_TAU_GLSL]) expect(implicit.test(src)).toBe(false);
+    // cloudCover runs inside the limb pass's segment loop (via cloudSlab): its fetches carry an explicit LOD.
+    const cc = s.SURFACE_FRAG.slice(s.SURFACE_FRAG.indexOf('float cloudCover('), s.SURFACE_FRAG.indexOf('float cloudTau('));
+    expect(cc.length).toBeGreaterThan(100);
+    expect(implicit.test(cc)).toBe(false);
+  });
+
+  it('runtime surface detail is band-limited per octave (fbmAA), not fbm3 gated on its base frequency only', async () => {
+    const s = await import('../src/worlds/planet/shaders');
+    // The planet's own code (after the shared noise/atmosphere libraries).
+    const body = s.SURFACE_FRAG.slice(s.SURFACE_FRAG.indexOf('float nyquist(')).replace(/\/\/[^\n]*/g, '');
+    expect(body).not.toMatch(/\bfbm3\s*\(/);
+    expect((body.match(/\bfbmAA\s*\(/g) ?? []).length).toBeGreaterThanOrEqual(6);
+  });
+
+  it('the night-vision gain is ~10⁵ and the Earth panel says so (it said 10⁴)', async () => {
+    const { nightGainText } = await import('../src/experiences/earth/math');
+    expect(Math.round(Math.log10(NIGHT_GAIN))).toBe(5);
+    expect(nightGainText()).toBe('10⁵');
+    expect(nightGainText(2.3e4)).toBe('10⁴');
+  });
+});
+
+describe('review 2 — depth brackets hold the whole proxy mesh of an off-axis body', () => {
+  it('EarthCamera.bracket: every point of the sphere lies between near and far, even 20° off-axis', async () => {
+    const { EarthCamera } = await import('../src/experiences/earth/camera');
+    const noop = () => () => undefined;
+    const input = { onDrag: noop, onWheel: noop, onPinch: noop } as unknown as ConstructorParameters<typeof EarthCamera>[0];
+    const cam = new EarthCamera(input, { focus: () => new THREE.Vector3(), fov: 30 });
+    const c = cam.camera;
+    // Earthrise geometry: the Earth 60 R⊕ away, a few degrees above the view axis (the old bracket cut a
+    // hole in its middle), plus a strongly off-axis case.
+    for (const [dist, offDeg, r] of [[60, 2.4, 1.08], [60, 20, 1.08], [4, 15, 1.08], [1.2, 30, 1.08]] as const) {
+      c.position.set(0, 0, 0);
+      c.quaternion.identity();
+      c.updateMatrixWorld(true);
+      const centre = new THREE.Vector3(0, Math.sin(offDeg * DEG), -Math.cos(offDeg * DEG)).multiplyScalar(dist);
+      cam.bracket(centre, r);
+      // View depth of the sphere's nearest and farthest points along the axis.
+      const zc = -centre.z;
+      if (zc - r > 0) expect(c.near).toBeLessThanOrEqual(zc - r + 1e-9);
+      expect(c.far).toBeGreaterThanOrEqual(zc + r - 1e-9);
+      // The surface proxy (≤ 1.0015 × 1.035 R) clears the near plane where it faces the camera.
+      const toCam = centre.clone().negate().normalize();
+      const front = centre.clone().addScaledVector(toCam, 1.0015 * 1.035);
+      expect(-front.z).toBeGreaterThan(c.near);
+    }
+  });
+});

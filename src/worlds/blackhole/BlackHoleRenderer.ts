@@ -126,7 +126,7 @@ export interface BlackHoleRendererOptions {
   floatTargets?: 'auto' | 'half';
 }
 
-interface QualitySettings {
+export interface QualitySettings {
   /** Trace resolution relative to the output target (upper bound). */
   traceScale: number;
   /**
@@ -144,25 +144,53 @@ interface QualitySettings {
   diskOct: number;
   /** Anisotropic filtering of the disk texture (grazing views). */
   aniso: number;
-  /** Analytic star layers drawn in the composite (the faintest is dropped on low). */
+  /** Analytic star layers drawn in the composite (the faintest is dropped on low and medium). */
   starLayers: number;
+  /** Catmull–Rom (9 taps) instead of bilinear upsampling of the disk light. */
+  upsample: boolean;
 }
 
 /**
- * Tiers, sized with a GPU cost model (ALU slots; ~1.25e12/s on a 2.5-TFLOPS laptop GPU):
- *  - trace: pixels × (RK4 steps × ~500 + disk samples × ~190). Measured at the default view
- *    (warp-max over 8 × 4 tiles): 37 / 29 / 23 steps and 3.7 / 4.0 / 4.1 samples per pixel for
- *    high / medium / low → ≈ 19k / 15k / 12k slots. While the camera only orbits the spin axis
- *    (the idle view) the lens cache traces ~30 % of those pixels again.
- *  - disk texture: texels × ~250 (the noise is baked once); composite: output pixels × ~900.
- * High at 1080p: trace 500k px ≈ 10 ms when everything moves, ≈ 3 ms idle; + ~2 ms composite.
+ * Tiers. Cost model (reviewed against a real-GPU benchmark: an RTX 3060 laptop drew the default view
+ * at 3840 × 2160 in 37 ms, most of it the full-resolution composite; SwiftShader per-pass timings
+ * give the split): cost ≈ trace pixels × (RK4 steps × ~600 ALU + disk samples × ~200)
+ *   + output pixels × ~1000 ALU (lens-map reconstruction, Milky Way, 2–3 star layers)
+ *   + disk texels × ~200.
+ * Measured at the default view (40 r_g): 27 / 23 / 19 mean RK4 steps and ≈ 3.7 disk samples per
+ * ray for high / medium / low; the eps values keep the lensed sky within 0.3 / 0.5 / 1.5 1080p
+ * pixels (p99) of a 16× finer integration (tests/gargantua.test.ts). `tracePixels` caps the trace
+ * at NATIVE resolution; under dynamic resolution the trace shrinks with the target (see
+ * `resolutionScale`), so the engine's GPU-time controller governs every pass.
+ * Relative cost per frame at 1080p (high = 1): medium ≈ 0.5, low ≈ 0.25.
  */
-const QUALITY: Record<BlackHoleQuality, QualitySettings> = {
-  low: { traceScale: 0.5, tracePixels: 150e3, maxSteps: 170, eps: 0.16, diskSamples: 8, diskTex: [1024, 256], diskOct: 3, aniso: 4, starLayers: 2 },
-  medium: { traceScale: 0.6, tracePixels: 300e3, maxSteps: 220, eps: 0.13, diskSamples: 12, diskTex: [1536, 384], diskOct: 4, aniso: 8, starLayers: 3 },
-  high: { traceScale: 0.72, tracePixels: 500e3, maxSteps: 280, eps: 0.1, diskSamples: 14, diskTex: [2048, 512], diskOct: 5, aniso: 16, starLayers: 3 },
-  ultra: { traceScale: 1, tracePixels: 1.6e6, maxSteps: 400, eps: 0.08, diskSamples: 20, diskTex: [3072, 768], diskOct: 6, aniso: 16, starLayers: 3 },
+export const BLACKHOLE_QUALITY: Record<BlackHoleQuality, QualitySettings> = {
+  low: { traceScale: 0.5, tracePixels: 120e3, maxSteps: 150, eps: 0.2, diskSamples: 8, diskTex: [1024, 256], diskOct: 3, aniso: 4, starLayers: 2, upsample: false },
+  medium: { traceScale: 0.55, tracePixels: 250e3, maxSteps: 200, eps: 0.16, diskSamples: 10, diskTex: [1536, 384], diskOct: 4, aniso: 8, starLayers: 2, upsample: true },
+  high: { traceScale: 0.72, tracePixels: 500e3, maxSteps: 240, eps: 0.14, diskSamples: 14, diskTex: [2048, 512], diskOct: 5, aniso: 16, starLayers: 3, upsample: true },
+  ultra: { traceScale: 1, tracePixels: 1.6e6, maxSteps: 360, eps: 0.1, diskSamples: 20, diskTex: [3072, 768], diskOct: 6, aniso: 16, starLayers: 3, upsample: true },
 };
+const QUALITY = BLACKHOLE_QUALITY;
+
+/**
+ * Trace-target size for an output of w × h pixels rendered at dynamic scale `resolutionScale` of its
+ * native size: `traceScale` × output, but never more than `tracePixels` at native resolution — so
+ * the trace/output ratio is fixed by the native size and the trace follows the dynamic scale.
+ */
+export function traceSizeFor(w: number, h: number, traceScale: number, tracePixels: number, resolutionScale = 1): [number, number] {
+  const rs = Math.min(1, Math.max(0.1, resolutionScale));
+  const native = Math.max(1, (w * h) / (rs * rs));
+  const s = Math.min(traceScale, Math.sqrt(tracePixels / native));
+  return [Math.max(2, Math.round(w * s)), Math.max(2, Math.round(h * s))];
+}
+
+/**
+ * RK4 step parameter for a camera at radius rCam: the tier's eps, tightened inside 15 r_g — close to
+ * the hole most rays skim the photon orbits, where the error grows fastest (at 4.6 r_g, eps 0.14
+ * leaves p99 errors of ~6 1080p pixels on the sky and ~13 on the disk; 0.1 about 2 and 5).
+ */
+export function traceEps(eps: number, rCam: number): number {
+  return eps * Math.min(1, Math.max(0.7, rCam / 15));
+}
 
 /** Star layers: cells per cube-face edge and magnitude ranges (dN/dm ∝ 10^{0.35 m}). */
 const STAR_LAYERS = [
@@ -493,8 +521,8 @@ export class BlackHoleRenderer {
         uSigmaSrc: { value: 1.2e-4 },
         uLayerN: { value: new THREE.Vector3(...STAR_LAYERS.map((l) => l.n)) },
         uLayerMean: { value: new THREE.Vector3(...means) },
-        uMagLo: { value: new THREE.Vector4(...STAR_LAYERS.map((l) => l.mLo), 0) },
-        uMagHi: { value: new THREE.Vector4(...STAR_LAYERS.map((l) => l.mHi), 0) },
+        uLayerE0: { value: new THREE.Vector3(...STAR_LAYERS.map((l) => Math.exp(k * l.mLo))) },
+        uLayerE1: { value: new THREE.Vector3(...STAR_LAYERS.map((l) => Math.exp(k * l.mHi))) },
         uAvgStarColor: { value: new THREE.Vector3(...avg) },
         uPlanck: { value: this.planckTex },
         uPlanckMap: { value: new THREE.Vector2(Math.log(PLANCK_T_MIN), 1 / Math.log(PLANCK_T_MAX / PLANCK_T_MIN)) },
@@ -502,7 +530,7 @@ export class BlackHoleRenderer {
         uCTMap: { value: new THREE.Vector2(this.ctRange.qMin, 1 / (this.ctRange.qMax - this.ctRange.qMin)) },
         uSkyShift: { value: 1 },
         uDbg: { value: 0 },
-        uUpsample: { value: 1 },
+        uUpsample: { value: this.quality.upsample ? 1 : 0 },
       },
     });
   }
@@ -572,10 +600,17 @@ export class BlackHoleRenderer {
     return p.diskInner > 0 ? p.diskInner : iscoRadius(p.spin);
   }
 
-  /** Trace-target size for an output of w × h: traceScale × output, capped at tracePixels. */
+  /**
+   * Dynamic resolution of the output target relative to its native size (the engine's
+   * `renderScale`). The trace-pixel cap is a cap at native resolution, so when the engine lowers the
+   * resolution to meet its GPU budget the trace shrinks in proportion — otherwise a capped trace
+   * would cost the same at every render scale and the controller could only soften the image.
+   */
+  resolutionScale = 1;
+
+  /** Trace-target size for an output of w × h: traceScale × output, capped at tracePixels (native). */
   traceSize(w: number, h: number): [number, number] {
-    const s = Math.min(this.traceScale, Math.sqrt(this.tracePixels / Math.max(1, w * h)));
-    return [Math.max(2, Math.round(w * s)), Math.max(2, Math.round(h * s))];
+    return traceSizeFor(w, h, this.traceScale, this.tracePixels, this.resolutionScale);
   }
 
   private ensureTargets(w: number, h: number): void {
@@ -874,7 +909,7 @@ export class BlackHoleRenderer {
     t.uHorizon.value = rh;
     t.uInside.value = rCam < rh && lensing ? 1 : 0;
     t.uEscR.value = escR;
-    t.uEps.value = this.quality.eps;
+    t.uEps.value = traceEps(this.quality.eps, rCam);
     (t.uKsToCam.value as THREE.Matrix3).copy(this.ksToCam);
     t.uFrame.value = this.frame % 64;
     t.uCached.value = cached ? 1 : 0;

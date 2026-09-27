@@ -73,7 +73,7 @@ export function atlasSpec(m: AtlasMode): TargetSpec {
 
 /** Pixel budget of the light accumulator per quality tier (the sprite fill scales with it). */
 export function accumBudget(detail: number): number {
-  return detail >= 1.5 ? 2.2e6 : detail >= 1 ? 1.3e6 : detail >= 0.6 ? 0.7e6 : 0.45e6;
+  return detail >= 1.5 ? 2.2e6 : detail >= 1 ? 1.3e6 : detail >= 0.6 ? 0.7e6 : 0.46e6;
 }
 
 /**

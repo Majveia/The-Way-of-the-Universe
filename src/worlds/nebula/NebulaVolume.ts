@@ -17,7 +17,7 @@ import {
   DUST_HG_G,
   type Palette,
 } from '../../physics/nebulae';
-import { DETAIL_FRAGMENT, LIGHT_FRAGMENT } from './glsl/bake';
+import { DETAIL_FRAGMENT, LIGHT_FRAGMENT, OCC_FRAGMENT } from './glsl/bake';
 import { densityFragment } from './glsl/density';
 import { marchFragment } from './glsl/march';
 import { COMPOSITE_ADD_FRAGMENT, COMPOSITE_MUL_FRAGMENT, RESOLVE_FRAGMENT } from './glsl/resolve';
@@ -63,11 +63,35 @@ interface QualitySettings {
   maxLowPixels: number;
 }
 
-function qualityFor(detail: number): QualitySettings {
-  if (detail < 0.5) return { N: 64, detailN: 48, steps: 40, scale: 0.34, lightStep: 1.0, maxLowPixels: 0.35e6 };
-  if (detail < 0.85) return { N: 96, detailN: 64, steps: 60, scale: 0.42, lightStep: 0.85, maxLowPixels: 0.7e6 };
-  if (detail < 1.3) return { N: 128, detailN: 64, steps: 84, scale: 0.5, lightStep: 0.75, maxLowPixels: 1.1e6 };
-  return { N: 160, detailN: 96, steps: 120, scale: 0.6, lightStep: 0.7, maxLowPixels: 1.8e6 };
+/**
+ * Quality tiers. The ray march dominates the frame: its cost is (low-res pixels) × steps, so
+ * each tier fixes both the fraction of the HDR target it marches at and a hard cap on the
+ * march pixels (the TAAU resolve reconstructs full resolution from jittered history; the
+ * volume itself is band-limited by its N³ lighting grid, so marching at more than ~3 low-res
+ * pixels per projected voxel buys nothing). Samples per frame at 1920×1080, high tier:
+ * 0.33 MP × 56 = 18.6 M (was 0.52 MP × 84 = 44 M); low is ≈ 1/7 of high. On a 4K target the
+ * cap (0.55 MP) keeps the march cost fixed so dynamic resolution can keep the display sharp.
+ */
+export function qualityFor(detail: number): QualitySettings {
+  if (detail < 0.5) return { N: 64, detailN: 48, steps: 28, scale: 0.28, lightStep: 1.0, maxLowPixels: 0.15e6 };
+  if (detail < 0.85) return { N: 96, detailN: 64, steps: 40, scale: 0.34, lightStep: 0.85, maxLowPixels: 0.3e6 };
+  if (detail < 1.3) return { N: 128, detailN: 64, steps: 56, scale: 0.4, lightStep: 0.75, maxLowPixels: 0.55e6 };
+  return { N: 160, detailN: 96, steps: 96, scale: 0.5, lightStep: 0.7, maxLowPixels: 1.2e6 };
+}
+
+/**
+ * Pixel type for the tiny readbacks (auto-exposure, spectrograph). RGBA32F is renderable and
+ * readable only with EXT_color_buffer_float; some mobile GPUs expose just
+ * EXT_color_buffer_half_float, so fall back to RGBA16F read as HALF_FLOAT.
+ */
+function readbackType(renderer: THREE.WebGLRenderer): THREE.TextureDataType {
+  return renderer.extensions.has('EXT_color_buffer_float') ? THREE.FloatType : THREE.HalfFloatType;
+}
+function readbackBuffer(type: THREE.TextureDataType, n: number): Float32Array | Uint16Array {
+  return type === THREE.FloatType ? new Float32Array(n) : new Uint16Array(n);
+}
+function readbackValue(buf: Float32Array | Uint16Array, i: number): number {
+  return buf instanceof Float32Array ? buf[i] : THREE.DataUtils.fromHalfFloat(buf[i]);
 }
 
 const halton = (i: number, b: number) => {
@@ -85,6 +109,9 @@ const halton = (i: number, b: number) => {
 const HBETA_I_PER_EM = (HBETA_EMISSIVITY / (4 * Math.PI)) * PC_CM;
 /** Flux (erg s⁻¹ cm⁻²) of 1 L☉ at 1 pc, expressed in Hβ emission-measure units. */
 export const LSUN_AT_1PC_EM = (L_SUN * 1e7) / (4 * Math.PI * PC_CM * PC_CM) / HBETA_I_PER_EM;
+
+/** Field voxels per coarse occupancy cell (N is a multiple of this on every tier). */
+const OCC_BLOCK = 4;
 
 type Stage = 'detail' | 'density' | 'light' | 'done';
 
@@ -136,6 +163,9 @@ export class NebulaVolume {
   private fields: [THREE.WebGL3DRenderTarget, THREE.WebGL3DRenderTarget];
   private front = 0;
   private detailRT: THREE.WebGL3DRenderTarget;
+  /** Coarse occupancy grid (N/OCC_BLOCK per axis) for empty-space skipping in the march. */
+  private occRT: THREE.WebGL3DRenderTarget;
+  private matOcc: THREE.ShaderMaterial;
   private stage: Stage = 'detail';
   private layer = 0;
   private hasField = false;
@@ -149,6 +179,19 @@ export class NebulaVolume {
   private matResolve: THREE.ShaderMaterial;
   private matMul: THREE.ShaderMaterial;
   private matAdd: THREE.ShaderMaterial;
+  private matCopy = new THREE.ShaderMaterial({
+    vertexShader: FULLSCREEN_VERT,
+    fragmentShader: /* glsl */ `
+precision highp float;
+uniform sampler2D uSrc;
+in vec2 vUv;
+out vec4 outColor;
+void main() { outColor = texture(uSrc, vUv); }`,
+    glslVersion: THREE.GLSL3,
+    depthTest: false,
+    depthWrite: false,
+    uniforms: { uSrc: { value: null } },
+  });
   private lowRT: THREE.WebGLRenderTarget | null = null;
   private hist: THREE.WebGLRenderTarget[] = [];
   private histIdx = 0;
@@ -203,6 +246,19 @@ export class NebulaVolume {
     this.detailRT = new THREE.WebGL3DRenderTarget(dn, dn, dn, opts3(THREE.UnsignedByteType, THREE.RepeatWrapping));
     // (wrapR is not a RenderTarget option; set it on the 3D textures directly.)
     this.detailRT.texture.wrapR = THREE.RepeatWrapping;
+    const nc = N / OCC_BLOCK;
+    this.occRT = new THREE.WebGL3DRenderTarget(nc, nc, nc, {
+      type: THREE.UnsignedByteType,
+      format: THREE.RGBAFormat,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      wrapS: THREE.ClampToEdgeWrapping,
+      wrapT: THREE.ClampToEdgeWrapping,
+      depthBuffer: false,
+      stencilBuffer: false,
+      generateMipmaps: false,
+    });
+    this.occRT.texture.wrapR = THREE.ClampToEdgeWrapping;
     for (const t of [this.dens, ...this.fields]) t.texture.wrapR = THREE.ClampToEdgeWrapping;
 
     const base = { vertexShader: FULLSCREEN_VERT, glslVersion: THREE.GLSL3, depthTest: false, depthWrite: false };
@@ -238,6 +294,11 @@ export class NebulaVolume {
         uStepVox: { value: this.quality.lightStep },
       },
     });
+    this.matOcc = new THREE.ShaderMaterial({
+      ...base,
+      fragmentShader: OCC_FRAGMENT,
+      uniforms: { uField: { value: null }, uN: { value: N }, uB: { value: OCC_BLOCK }, uLayer: { value: 0 }, uEps: { value: 1e-3 } },
+    });
     this.matMarch = new THREE.ShaderMaterial({
       ...base,
       fragmentShader: marchFragment({ layout: this.preset.layout, synchrotron: this.preset.variant === 'crab' }),
@@ -258,12 +319,13 @@ export class NebulaVolume {
         uCamLocal: { value: this.camLocal },
         uPrevVP: { value: this.prevVP },
         uAlpha: { value: 1 },
+        uAlphaSlow: { value: 1 / 12 },
         uClip: { value: 1 },
         uHasHist: { value: 0 },
         // The low tier marches few steps: reconstruct fully with the Gaussian so its step noise
         // never shows as a lattice (or as shimmer while the camera drifts).
-        uSharp: { value: this.quality.steps < 50 ? 0.8 : 1.1 },
-        uDenoise: { value: this.quality.steps < 50 ? 1 : 0.85 },
+        uSharp: { value: this.quality.steps < 36 ? 0.8 : 1.1 },
+        uDenoise: { value: this.quality.steps < 36 ? 1 : 0.85 },
         uStill: { value: 0 },
       },
     });
@@ -392,10 +454,19 @@ export class NebulaVolume {
     }
   }
 
+  /**
+   * True when this device can render the volume: its lighting grid and march targets are
+   * RGBA16F render targets (WebGL2 needs EXT_color_buffer_float or EXT_color_buffer_half_float).
+   */
+  static supported(renderer: THREE.WebGLRenderer): boolean {
+    return renderer.extensions.has('EXT_color_buffer_float') || renderer.extensions.has('EXT_color_buffer_half_float');
+  }
+
   private async meter(renderer: THREE.WebGLRenderer, target: number): Promise<void> {
     const W = 96;
     const H = 54;
-    const rt = (this.calibRT = new THREE.WebGLRenderTarget(W, H, { count: 2, type: THREE.FloatType, depthBuffer: false }));
+    const type = readbackType(renderer);
+    const rt = (this.calibRT = new THREE.WebGLRenderTarget(W, H, { count: 2, type, depthBuffer: false }));
     const v = this.preset.views.default;
     const cam = new THREE.PerspectiveCamera(42, W / H, 1e-4, 1e4);
     const t = new THREE.Vector3(...(v.target ?? [0, 0, 0]));
@@ -424,7 +495,7 @@ export class NebulaVolume {
     mu.uGain.value = saved.g;
     mu.uEmission.value = saved.e;
     this.jitter.set(saved.jx, saved.jy);
-    const px = new Float32Array(W * H * 4);
+    const px = readbackBuffer(type, W * H * 4);
     try {
       await renderer.readRenderTargetPixelsAsync(rt, 0, 0, W, H, px, undefined, 0);
     } catch {
@@ -435,7 +506,7 @@ export class NebulaVolume {
     }
     const lum: number[] = [];
     for (let i = 0; i < W * H; i++) {
-      const l = 0.2126 * px[i * 4] + 0.7152 * px[i * 4 + 1] + 0.0722 * px[i * 4 + 2];
+      const l = 0.2126 * readbackValue(px, i * 4) + 0.7152 * readbackValue(px, i * 4 + 1) + 0.0722 * readbackValue(px, i * 4 + 2);
       if (Number.isFinite(l) && l > 0) lum.push(l);
     }
     if (lum.length < 20) return;
@@ -507,6 +578,7 @@ export class NebulaVolume {
           this.front = 1 - this.front;
           this.hasField = true;
           this.matMarch.uniforms.uField.value = this.fields[this.front].texture;
+          this.bakeOccupancy(renderer);
           this.stage = 'done';
           this.layer = 0;
           this.paramsVersion++;
@@ -531,7 +603,7 @@ export class NebulaVolume {
     }
     const w = target ? target.width : renderer.domElement.width;
     const h = target ? target.height : renderer.domElement.height;
-    this.ensureTargets(w, h);
+    this.ensureTargets(renderer, w, h);
     const lowRT = this.lowRT!;
 
     // Camera in nebula-local coordinates.
@@ -593,6 +665,8 @@ export class NebulaVolume {
     ru.uFullSize.value.set(dst.width, dst.height);
     (ru.uProjInv.value as THREE.Matrix4).copy((camera as THREE.PerspectiveCamera).projectionMatrixInverse);
     ru.uAlpha.value = alpha;
+    // Sub-pixel drift (auto-rotation) keeps accumulating; parameter changes and cuts do not.
+    ru.uAlphaSlow.value = moved && !changed && !cut ? (o.animating || this.animating ? 1 / 8 : 1 / 12) : alpha;
     ru.uClip.value = clip;
     ru.uHasHist.value = cut ? 0 : 1;
     ru.uStill.value = moved ? 0 : 1;
@@ -638,7 +712,7 @@ export class NebulaVolume {
     this.probeBusy = true;
     try {
       if (!this.probeRT) {
-        this.probeRT = new THREE.WebGLRenderTarget(1, 1, { count: 3, type: THREE.FloatType, depthBuffer: false });
+        this.probeRT = new THREE.WebGLRenderTarget(1, 1, { count: 3, type: readbackType(renderer), depthBuffer: false });
         this.matProbe = new THREE.ShaderMaterial({
           vertexShader: FULLSCREEN_VERT,
           fragmentShader: marchFragment({ layout: this.preset.layout, synchrotron: this.preset.variant === 'crab', probe: true }),
@@ -660,20 +734,24 @@ export class NebulaVolume {
       mp.uniforms.uProjInv.value = (camera as THREE.PerspectiveCamera).projectionMatrixInverse.clone();
       mp.uniforms.uProbeNdc.value = new THREE.Vector2(ndcX, ndcY);
       mp.uniforms.uSteps.value = 200;
+      const scale = this.baseGain > 0 && Number.isFinite(this.baseGain) ? this.baseGain : 1;
+      mp.uniforms.uProbeScale.value = scale;
       const prev = renderer.getRenderTarget();
       this.quad.material = mp;
       renderer.setRenderTarget(this.probeRT);
       renderer.render(this.quad.scene, this.quad.camera);
       renderer.setRenderTarget(prev);
-      const a = new Float32Array(4);
-      const b = new Float32Array(4);
-      const c = new Float32Array(4);
+      const t = this.probeRT.texture.type;
+      const a = readbackBuffer(t, 4);
+      const b = readbackBuffer(t, 4);
+      const c = readbackBuffer(t, 4);
       await renderer.readRenderTargetPixelsAsync(this.probeRT, 0, 0, 1, 1, a, undefined, 0);
       await renderer.readRenderTargetPixelsAsync(this.probeRT, 0, 0, 1, 1, b, undefined, 1);
       await renderer.readRenderTargetPixelsAsync(this.probeRT, 0, 0, 1, 1, c, undefined, 2);
+      const g = (buf: Float32Array | Uint16Array, i: number) => readbackValue(buf, i) / scale;
       const lines: Record<string, number> = {};
-      NEBULA_LINES.forEach((l, i) => (lines[l.id] = i < 4 ? a[i] : b[i - 4]));
-      return { lines, continuum: [c[0], c[1], c[2]], tauV: c[3] };
+      NEBULA_LINES.forEach((l, i) => (lines[l.id] = i < 4 ? g(a, i) : g(b, i - 4)));
+      return { lines, continuum: [g(c, 0), g(c, 1), g(c, 2)], tauV: readbackValue(c, 3) };
     } catch {
       return null;
     } finally {
@@ -686,6 +764,8 @@ export class NebulaVolume {
     this.fields[0].dispose();
     this.fields[1].dispose();
     this.detailRT.dispose();
+    this.occRT.dispose();
+    this.matOcc.dispose();
     this.lowRT?.dispose();
     for (const h of this.hist) h.dispose();
     this.probeRT?.dispose();
@@ -698,9 +778,23 @@ export class NebulaVolume {
     this.matResolve.dispose();
     this.matMul.dispose();
     this.matAdd.dispose();
+    this.matCopy.dispose();
   }
 
   // ——— internals ——————————————————————————————————————————————————————————————
+
+  /** Rebuild the coarse occupancy grid from the current front field (N/4 tiny layers). */
+  private bakeOccupancy(renderer: THREE.WebGLRenderer): void {
+    const u = this.matOcc.uniforms;
+    u.uField.value = this.fields[this.front].texture;
+    this.quad.material = this.matOcc;
+    const nc = this.N / OCC_BLOCK;
+    for (let l = 0; l < nc; l++) {
+      u.uLayer.value = l;
+      renderer.setRenderTarget(this.occRT, l);
+      renderer.render(this.quad.scene, this.quad.camera);
+    }
+  }
 
   private nextStage(s: Stage): void {
     this.stage = s;
@@ -743,6 +837,7 @@ export class NebulaVolume {
     const u: Record<string, THREE.IUniform> = {
       uField: { value: this.fields[this.front].texture },
       uDetail: { value: this.detailRT.texture },
+      uOcc: { value: this.occRT.texture },
       uRes: { value: new THREE.Vector2(1, 1) },
       uJitter: { value: this.jitter },
       uFrame: { value: 0 },
@@ -792,6 +887,7 @@ export class NebulaVolume {
     };
     if (probe) {
       u.uProbeNdc = { value: new THREE.Vector2() };
+      u.uProbeScale = { value: 1 };
     } else {
       u.uColA = { value: Array.from({ length: 4 }, () => new THREE.Vector3()) };
       u.uColB = { value: Array.from({ length: 4 }, () => new THREE.Vector3()) };
@@ -814,7 +910,7 @@ export class NebulaVolume {
     (mu.uDrift2.value as THREE.Vector3).set(-0.42 * d * f.y, 0.51 * d * f.y, 0.3 * d * f.y);
   }
 
-  private ensureTargets(w: number, h: number): void {
+  private ensureTargets(renderer: THREE.WebGLRenderer, w: number, h: number): void {
     const q = this.quality;
     let lw = Math.max(1, Math.round(w * q.scale));
     let lh = Math.max(1, Math.round(h * q.scale));
@@ -835,10 +931,11 @@ export class NebulaVolume {
         depthBuffer: false,
         stencilBuffer: false,
       });
-      this.hasHistory = false;
+      // (The history is full resolution and stays valid when only the march size changes.)
     }
     if (!this.hist.length || this.hist[0].width !== w || this.hist[0].height !== h) {
-      for (const t of this.hist) t.dispose();
+      const old = this.hasHistory ? this.hist[this.histIdx] : null;
+      const stale = this.hist;
       this.hist = [0, 1].map(
         () =>
           new THREE.WebGLRenderTarget(w, h, {
@@ -850,7 +947,15 @@ export class NebulaVolume {
             stencilBuffer: false,
           }),
       );
-      this.hasHistory = false;
+      if (old) {
+        // Dynamic resolution changes the target every few seconds on real GPUs: carry the
+        // converged history over (bilinear resample) instead of restarting from one noisy frame.
+        this.matCopy.uniforms.uSrc.value = old.texture;
+        this.quad.material = this.matCopy;
+        renderer.setRenderTarget(this.hist[this.histIdx]);
+        renderer.render(this.quad.scene, this.quad.camera);
+      } else this.hasHistory = false;
+      for (const t of stale) t.dispose();
     }
   }
 }
