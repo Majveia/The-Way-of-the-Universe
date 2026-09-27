@@ -54,6 +54,7 @@ uniform float uNoiseTile;
 uniform float uGain;
 uniform float uNearCut;    // emission closer than this (pc) is drawn as individual stars instead
 uniform int uDebug;
+uniform float uEncode;     // > 0 only without float render targets: store y = xE / (1 + xE) in 8 bits
 uniform int uMask;         // component bits: 1 disk, 2 thick, 4 bulge, 8 bar, 16 young, 32 HII, 64 scattering, 128 dust
 
 float sech2(float x) { float c = cosh(clamp(x, -30.0, 30.0)); return 1.0 / (c * c); }
@@ -219,20 +220,30 @@ void main() {
   bool ok = (outL.r >= 0.0 || outL.r < 0.0) && (outL.g >= 0.0 || outL.g < 0.0) && (outL.b >= 0.0 || outL.b < 0.0) && (outT >= 0.0 || outT < 0.0);
   if (!ok) { outL = vec3(0.0); outT = 1.0; }
   outL = min(max(outL, vec3(0.0)), vec3(6.0e4));
+  if (uEncode > 0.0) outL = outL * uEncode / (1.0 + outL * uEncode);
   outColor = vec4(outL, outT);
 }
 `;
 
-/** Upsample + composite: dst = volume.rgb + dst × volume.a (blend ONE, SRC_ALPHA). */
+/**
+ * Upsample + composite: dst = volume.rgb + stars_lo.rgb + dst × volume.a (blend ONE, SRC_ALPHA).
+ * `tStars` holds the wide (smooth) star sprites splatted at reduced resolution (see STAR_VERT uPass);
+ * they are added after the volume's transmittance, exactly as if drawn additively on top.
+ */
 export const VOLUME_COMPOSITE_FRAG = /* glsl */ `
 precision highp float;
 in vec2 vUv;
 out vec4 outColor;
 uniform sampler2D tVol;
 uniform vec2 uTexel;
-// 9-tap Catmull–Rom via 4 bilinear fetches (smooth, sharper than bilinear on dust lanes).
-vec4 sampleBicubic(vec2 uv) {
-  vec2 p = uv / uTexel - 0.5;
+uniform sampler2D tStars;
+uniform vec2 uStarTexel;
+uniform float uHasVol;
+uniform float uHasStars;
+uniform float uDecode;   // > 0: the volume is stored tone-compressed (8-bit fallback), L = y / (1 − y) / uDecode
+// 9-tap Catmull–Rom via 5 bilinear fetches (smooth, sharper than bilinear on dust lanes).
+vec4 sampleBicubic(sampler2D tex, vec2 uv, vec2 texel) {
+  vec2 p = uv / texel - 0.5;
   vec2 f = fract(p);
   vec2 i = floor(p);
   vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
@@ -241,18 +252,21 @@ vec4 sampleBicubic(vec2 uv) {
   vec2 w3 = f * f * (-0.5 + 0.5 * f);
   vec2 w12 = w1 + w2;
   vec2 o12 = w2 / w12;
-  vec2 t0 = (i - 0.5) * uTexel;
-  vec2 t3 = (i + 2.5) * uTexel;
-  vec2 t12 = (i + 0.5 + o12) * uTexel;
-  vec4 c = texture(tVol, vec2(t12.x, t0.y)) * w12.x * w0.y
-         + texture(tVol, vec2(t0.x, t12.y)) * w0.x * w12.y
-         + texture(tVol, vec2(t12.x, t12.y)) * w12.x * w12.y
-         + texture(tVol, vec2(t3.x, t12.y)) * w3.x * w12.y
-         + texture(tVol, vec2(t12.x, t3.y)) * w12.x * w3.y;
+  vec2 t0 = (i - 0.5) * texel;
+  vec2 t3 = (i + 2.5) * texel;
+  vec2 t12 = (i + 0.5 + o12) * texel;
+  vec4 c = texture(tex, vec2(t12.x, t0.y)) * w12.x * w0.y
+         + texture(tex, vec2(t0.x, t12.y)) * w0.x * w12.y
+         + texture(tex, vec2(t12.x, t12.y)) * w12.x * w12.y
+         + texture(tex, vec2(t3.x, t12.y)) * w3.x * w12.y
+         + texture(tex, vec2(t12.x, t3.y)) * w12.x * w3.y;
   return c / (w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y);
 }
 void main() {
-  vec4 c = sampleBicubic(vUv);
-  outColor = vec4(max(c.rgb, vec3(0.0)), clamp(c.a, 0.0, 1.0));
+  vec4 c = uHasVol > 0.5 ? sampleBicubic(tVol, vUv, uTexel) : vec4(0.0, 0.0, 0.0, 1.0);
+  vec3 rgb = max(c.rgb, vec3(0.0));
+  if (uDecode > 0.0) rgb = rgb / max(1.0 - rgb, vec3(1e-3)) / uDecode;
+  if (uHasStars > 0.5) rgb += max(sampleBicubic(tStars, vUv, uStarTexel).rgb, vec3(0.0));
+  outColor = vec4(rgb, clamp(c.a, 0.0, 1.0));
 }
 `;

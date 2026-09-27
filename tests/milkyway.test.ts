@@ -291,3 +291,100 @@ describe('GalaxyModel facade', () => {
     expect(g.potential.vcKms(8200)).toBeGreaterThan(220);
   });
 });
+
+// ——— Review additions: conventions, GPU/CPU mirrors, and the Sun's place in the Galaxy ———————————
+import { VIS_EFF_COEFFS } from '../src/physics/galaxyStars';
+import { GALAXY_COMMON_GLSL } from '../src/worlds/galaxy/shaders/galaxyGlsl';
+
+describe('review: frames and conventions', () => {
+  it('the Sun sits at render (−8200, +20.8, 0) pc: GC at the origin, north Galactic pole along +y', () => {
+    const p = milkyWay(1);
+    const k = new Kinematics(p);
+    const s = p.sun!;
+    const o = { x: 0, y: 0, z: 0 };
+    k.toRender(s.R * Math.cos(s.phi), s.R * Math.sin(s.phi), s.z, o);
+    expect(o.x).toBeCloseTo(-8200, 6);
+    expect(o.y).toBeCloseTo(20.8, 6); // Bennett & Bovy (2019): the Sun is north of the plane
+    expect(Math.abs(o.z)).toBeLessThan(1e-6);
+    const back = k.fromRender(o.x, o.y, o.z, { x: 0, y: 0, z: 0 });
+    expect(back.x).toBeCloseTo(s.R * Math.cos(s.phi), 6);
+    expect(back.y).toBeCloseTo(s.R * Math.sin(s.phi), 6);
+    expect(back.z).toBeCloseTo(s.z, 6);
+  });
+
+  it('the Milky Way rotates clockwise seen from the north Galactic pole (L_y < 0 in the render frame)', () => {
+    const p = milkyWay(1);
+    const g = generateParticles(p, 20000);
+    const k = new Kinematics(p);
+    const a: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+    const b: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+    let Ly = 0;
+    let n = 0;
+    for (let i = 0; i < g.count; i++) {
+      if (g.data[i * STRIDE] !== KIND_DISK) continue;
+      particleState(k, g.data, i, 10, a);
+      particleState(k, g.data, i, 10.5, b);
+      // L_y = z·v_x − x·v_z (y-component of r × v).
+      Ly += a.z * (b.x - a.x) - a.x * (b.z - a.z);
+      n++;
+    }
+    expect(n).toBeGreaterThan(1000);
+    expect(Ly).toBeLessThan(0);
+  });
+
+  it('GLSL visual efficacy uses exactly the CPU fit coefficients (no silent drift)', () => {
+    const m = GALAXY_COMMON_GLSL.match(/pow\(10\.0,\s*([-\d.e]+)\s*\+\s*x\s*\*\s*\(([-\d.e]+)\s*\+\s*x\s*\*\s*\(([-\d.e]+)\s*\+\s*x\s*\*\s*\(([-\d.e]+)\s*\+\s*x\s*\*\s*([-\d.e]+)\)/);
+    expect(m).not.toBeNull();
+    const c = m!.slice(1, 6).map(Number);
+    c.forEach((v, i) => expect(v).toBeCloseTo(VIS_EFF_COEFFS[i], 9));
+    expect(visualEfficacyFit(5772)).toBeGreaterThan(0.97);
+    expect(visualEfficacyFit(5772)).toBeLessThan(1.03);
+  });
+});
+
+describe('review: the Sun in the Galaxy', () => {
+  it("Sun's angular speed (v_c + V⊙)/R⊙ ≈ 30.3 km/s/kpc (Sgr A* proper motion, Reid & Brunthaler 2020)", () => {
+    const p = milkyWay(1);
+    const pot = new GalaxyPotential(milkyWayComponents());
+    const w = (pot.vcKms(p.sun!.R) + p.sun!.V) / (p.sun!.R / 1000);
+    expect(w).toBeGreaterThan(29.2);
+    expect(w).toBeLessThan(31.4);
+  });
+
+  it('spiral corotation lies outside the Sun but inside the disk edge (Ω_p = 25 km/s/kpc → R_CR ≈ 9 kpc)', () => {
+    const p = milkyWay(1);
+    const pot = new GalaxyPotential(milkyWayComponents());
+    const cr = pot.resonance(radMyrFromKmsKpc(p.spiral.patternSpeed), 'CR');
+    expect(cr).toBeGreaterThan(8200);
+    expect(cr).toBeLessThan(11000);
+    // The Sun moves faster than the pattern: arms drift backwards past it (Ω⊙ > Ω_p).
+    expect(kmsKpcFromRadMyr(pot.omega(8200))).toBeGreaterThan(p.spiral.patternSpeed);
+  });
+
+  it('arms at the Sun’s azimuth today: Sagittarius–Carina inside, Orion Spur at the Sun, Perseus outside (Reid et al. 2019)', () => {
+    const p = milkyWay(1);
+    const arms = p.spiral.armList!;
+    const crossing = (name: string, lo: number, hi: number): number => {
+      const a = arms.find((x) => (x.name ?? '').startsWith(name))!;
+      let best = NaN;
+      let bestD = Infinity;
+      for (let R = lo; R <= hi; R += 5) {
+        const d = Math.abs(wrapPi(armPhi(a, R) - p.sun!.phi));
+        if (d < bestD) {
+          bestD = d;
+          best = R;
+        }
+      }
+      expect(bestD).toBeLessThan(0.01);
+      return best;
+    };
+    const sgr = crossing('Sagittarius', 5000, 8000);
+    const orion = crossing('Orion', 7400, 9800);
+    const per = crossing('Perseus', 8500, 12500);
+    expect(sgr).toBeGreaterThan(5800);
+    expect(sgr).toBeLessThan(7600);
+    expect(Math.abs(orion - p.sun!.R)).toBeLessThan(500);
+    expect(per).toBeGreaterThan(9200);
+    expect(per).toBeLessThan(11200);
+  });
+});

@@ -1,0 +1,32 @@
+import { chromium } from 'playwright-core';
+const args = process.argv.slice(2);
+const opt = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : d; };
+const q = opt('quality', 'high'), w = +opt('w', 960), h = +opt('h', 540), view = opt('view', 'default');
+const browser = await chromium.launch({ headless: true, args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--enable-webgl', '--disable-dev-shm-usage'] });
+const page = await browser.newPage({ viewport: { width: w, height: h }, deviceScaleFactor: 1 });
+const errs = [];
+page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') errs.push(m.type() + ': ' + m.text()); });
+page.on('pageerror', (e) => errs.push(String(e)));
+await page.goto(`http://127.0.0.1:5226/?shot=1&quality=${q}#milkyway`, { timeout: 300000 });
+await page.waitForFunction(() => window.__universe?.ready && window.__universe.framesSinceReady >= 3, null, { timeout: 600000, polling: 500 });
+await page.evaluate((v) => window.__universe.experience.setView(v, 0), view);
+const wait = async (n) => { const f0 = await page.evaluate(() => window.__universe.frames); await page.waitForFunction((n) => window.__universe.frames >= n, f0 + n, { timeout: 600000, polling: 250 }); };
+await wait(3);
+const res = await page.evaluate(async () => {
+  const U = window.__universe, r = U.app.engine.renderer, L = U.experience.galaxy;
+  const frame = () => new Promise((res) => { const f0 = U.frames; const t = () => (U.frames > f0 ? res() : setTimeout(t, 50)); t(); });
+  r.info.autoReset = false; r.info.reset(); await frame(); await frame();
+  const info = { ...r.info.render, programs: r.info.programs?.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries };
+  r.info.autoReset = true;
+  const ext = ['EXT_color_buffer_float', 'EXT_color_buffer_half_float', 'OES_texture_float_linear', 'EXT_float_blend'].map((e) => e + '=' + r.extensions.has(e));
+  U.experience.debug({ vol: 4 }); L.resetHistory();
+  await frame(); await frame();
+  const rt = L.volRT; const W = rt.width, H = rt.height; const buf = new Uint16Array(W * H * 4);
+  r.readRenderTargetPixels(rt, 0, 0, W, H, buf);
+  const f16 = (x) => { const e = (x >> 10) & 31, m = x & 1023; return e === 0 ? m / 1024 / 16384 : Math.pow(2, e - 15) * (1 + m / 1024); };
+  let s = 0, hit = 0, max = 0; for (let i = 0; i < W * H; i++) { const v = f16(buf[i * 4]); s += v; if (v > 0) hit++; if (v > 0.99) max++; }
+  U.experience.debug({ vol: 0 });
+  return { info, ext, vol: { W, H, maxSteps: L.volMat.uniforms.uMaxSteps.value, meanStepFrac: s / (W * H), meanStepsHit: s / Math.max(1, hit) * L.volMat.uniforms.uMaxSteps.value, hitFrac: hit / (W * H), capFrac: max / (W * H) }, target: [U.app.engine.hdr.width, U.app.engine.hdr.height], particles: L.particles?.count, localActive: L.localActive };
+});
+console.log(JSON.stringify({ q, w, h, view, ...res, errs: errs.slice(0, 10) }, null, 1));
+await browser.close();

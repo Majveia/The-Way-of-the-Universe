@@ -89,6 +89,7 @@ class MilkyWay implements Experience {
   private readonly v1 = new THREE.Vector3();
   private readonly v2 = new THREE.Vector3();
   private readonly sunPos = new THREE.Vector3();
+  private readonly renderOpts = { exposure: 1, frame: 0 };
   private readonly plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
   private cursorR = NaN;
   private pointerSeen = false;
@@ -175,12 +176,12 @@ class MilkyWay implements Experience {
   }
 
   private setSunPosition(): void {
-    const s = this.layer.params.sun;
-    if (!s) return;
-    // The Sun's guiding centre moves at Ω(R⊙); the Sun itself keeps its place in the
-    // rotating frame to first order. Render frame: x = X, y = H, z = −spin·Y.
-    const phi = s.phi + this.layer.kin.potential.omega(s.R) * this.layer.time;
-    this.layer.kin.toRender(s.R * Math.cos(phi), s.R * Math.sin(phi), s.z, this.sunPos);
+    // The Sun's guiding centre moves at Ω(R⊙) of the equilibrium (with-halo) galaxy — the same
+    // position the layer uses for the Local Bubble and nearby clouds, also while the halo is off.
+    // Render frame: x = X, y = H, z = −spin·Y.
+    const m = this.layer.sunModel(this.v2);
+    if (!m) return;
+    this.layer.kin.toRender(m.x, m.y, m.z, this.sunPos);
   }
 
   // ——— UI ——————————————————————————————————————————————————————————————————————
@@ -596,7 +597,9 @@ class MilkyWay implements Experience {
     if (this.flying && this.fly) this.fly.applyTo(this.camera);
     else this.orbit.applyTo(this.camera);
     r.setRenderTarget(target);
-    this.layer.render(r, this.camera, target, { exposure: this.ctx.post.exposure, frame: this.frame });
+    this.renderOpts.exposure = this.ctx.post.exposure;
+    this.renderOpts.frame = this.frame;
+    this.layer.render(r, this.camera, target, this.renderOpts);
     // Headless capture on a CPU rasteriser: keep rAF from running ahead of the GPU process
     // (otherwise seconds-long frames queue up behind the screenshot). Never in normal use.
     if (this.shotMode) r.getContext().finish();

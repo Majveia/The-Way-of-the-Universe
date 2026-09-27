@@ -37,6 +37,37 @@ export const MAX_ACTIVE = 3;
 const AGES = 40;
 const BETAS = 16;
 const ION_N = 32;
+
+/**
+ * Fill-rate model for the splats (all additive into an RGBA16F target). A splat of full-resolution
+ * size `sizeFull` px costs size² fragments; with a reduced-resolution pass (`k` px per full-res px)
+ * splats larger than `split` px are drawn there instead (cross-faded over split … 1.6 split, when
+ * both passes draw it). `msaa` weights full-resolution fragments, which blend into every sample
+ * of the multisampled HDR target. Returns the expected fragment cost of one splat.
+ */
+export function splatCost(sizeFull: number, maxSize: number, k: number, split: number, msaa = 1.5): number {
+  const sN = Math.min(Math.max(sizeFull, 3), maxSize);
+  if (k >= 1) return sN * sN * msaa;
+  const t = Math.min(1, Math.max(0, (sizeFull - split) / (0.6 * split)));
+  const w = t * t * (3 - 2 * t);
+  const sL = Math.min(Math.max(sizeFull * k, 3), maxSize);
+  return (1 - w) * sN * sN * msaa + w * sL * sL;
+}
+
+/**
+ * Number of splats to draw so that `meanCost` × n fits `budget` fragments, never fewer than
+ * `minFrac` of the population (the tail must keep its shape) and never more than `nMax`.
+ * Splats are an i.i.d. sample, so any prefix is an unbiased, flux-renormalised subsample.
+ */
+export function splatDrawCount(nMax: number, meanCost: number, budget: number, minFrac = 0.1): number {
+  if (!(meanCost > 0)) return nMax;
+  return Math.min(nMax, Math.max(nMax * minFrac, budget / meanCost));
+}
+
+/** Reduced-resolution pass: pixels per full-resolution pixel, and the split size (full-res px). */
+export const TAIL_LOW_RES = 0.25;
+export const TAIL_SPLIT_PX = 6 / TAIL_LOW_RES;
+const COST_SAMPLES = 32;
 const AGE_POW = 1.7;
 const KM_AU = 1 / 149_597_870.7;
 
@@ -63,27 +94,44 @@ const SPLAT_COMMON = /* glsl */ `
 ${OCCLUDE_GLSL}
 uniform vec3 uNucleus;      // camera-relative nucleus (three axes, AU)
 uniform vec3 uSunRel;       // camera-relative Sun
-uniform float uPixelAngle;  // rad per device px
+uniform float uPixelAngle;  // rad per device px of the full-resolution target
 uniform float uMaxSize;
 uniform float uBright;      // display scale (÷ exposure)
+// Cost control (see CometTails): particles with index ≥ uDrawN are skipped (the last one fades in
+// fractionally, so the sum of weights is exactly uDrawN = the flux normalisation uCount).
+// uPass 0 = everything at full resolution; 1 = full-res pass, small splats only; 2 = reduced-
+// resolution pass (uResScale px per full-res px), large splats only, cross-faded over uSplit..1.6 uSplit.
+uniform float uDrawN;
+uniform float uPass;
+uniform float uSplit;
+uniform float uResScale;
 out vec3 vColor;
+void cull() { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vColor = vec3(0.0); }
 // Place a splat: world position p (camera-relative), world σ (AU) and world flux (radiance × AU²).
 // Peak radiance = F / (2π σ_w²) — independent of distance, as surface brightness must be; when the
 // sprite hits its size limits the pixel flux F / (d·pixelAngle)² is conserved instead.
 void splat(vec3 p, float sigmaW, vec3 flux) {
-  if (occlusion(p) > 0.5) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vColor = vec3(0.0); return; }
+  float wIdx = clamp(uDrawN - float(gl_VertexID), 0.0, 1.0);
+  if (wIdx <= 0.0) { cull(); return; }
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
+  if (-mv.z <= 0.0) { cull(); return; }
+  float d = -mv.z;
+  float sizeFull = 6.0 * sigmaW / (d * uPixelAngle);
+  float wLow = uPass < 0.5 ? 0.0 : smoothstep(uSplit, uSplit * 1.6, sizeFull);
+  float wPass = (uPass > 1.5 ? wLow : 1.0 - wLow) * wIdx;
+  if (wPass <= 0.0) { cull(); return; }
+  if (occlusion(p) > 0.5) { cull(); return; }
   gl_Position = projectionMatrix * mv;
-  float d = max(-mv.z, 1e-12);
-  float sigPx = sigmaW / (d * uPixelAngle);
+  // Pixel angle of the pass being drawn.
+  float pa = uPass > 1.5 ? uPixelAngle / uResScale : uPixelAngle;
+  float sigPx = sigmaW / (d * pa);
   // Sprite radius = 3σ, at least 1.5 px, at most the hardware limit.
   float size = clamp(6.0 * sigPx, 3.0, uMaxSize);
   gl_PointSize = size;
   float s = size / 6.0;
   // Energy normalisation of the truncated Gaussian: ∫ = 2π s² (1 − e^{-4.5}) ≈ 2π s² · 0.95.
-  float dp = d * uPixelAngle;
-  vColor = flux / (dp * dp) * uBright / (6.2832 * s * s * 0.95);
-  if (-mv.z <= 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; }
+  float dp = d * pa;
+  vColor = flux * wPass / (dp * dp) * uBright / (6.2832 * s * s * 0.95);
 }
 // Henyey–Greenstein phase (normalised to 1 at 90°), mixed with isotropic.
 float hgPhase(vec3 p, float g) {
@@ -132,6 +180,7 @@ vec4 grid(float fj, float fi) {
 }
 
 void main() {
+  if (float(gl_VertexID) >= uDrawN) { cull(); return; }
   // Age uniform in time (steady release, weighted by production below), β log-uniform.
   float ageF = aRand.x;
   float age = uMaxAge * ageF;
@@ -183,6 +232,7 @@ uniform float uNorm;
 uniform vec3 uTint;
 
 void main() {
+  if (float(gl_VertexID) >= uDrawN) { cull(); return; }
   float ageF = aRand.x;
   float age = ${ION_MAX_AGE.toFixed(2)} * ageF;
   float fi = float(${ION_N - 1}) * pow(ageF, 1.0 / ${AGE_POW.toFixed(2)});
@@ -223,6 +273,7 @@ uniform vec3 uSunDir;
 uniform vec3 uGas;
 uniform vec3 uDust;
 void main() {
+  if (float(gl_VertexID) >= uDrawN) { cull(); return; }
   // Isotropic outflow at speed v for time t, pushed anti-sunward by a = v²/(2 R_apex):
   // r(t) = v t n̂ − ½ a t² ŝ. Uniform t ⇒ column density ∝ 1/ρ (Haser without decay).
   float t = aRand.x * 3.0;            // in units of R_apex / v
@@ -306,6 +357,11 @@ export interface CometFrame {
   exposure: number;
   selected: SolarBody | null;
   occ: Record<string, THREE.IUniform>;
+  /** Camera view matrix (camera-relative frame) and tan of the half field of view (x, y), so the
+   *  fill-rate estimate ignores splats that are off screen. Optional. */
+  view?: THREE.Matrix4;
+  tanX?: number;
+  tanY?: number;
 }
 
 export interface CometCandidate {
@@ -331,11 +387,25 @@ export class CometTails {
   private geos: THREE.BufferGeometry[] = [];
   /** Brightness multiplier (display). */
   brightness = 1;
+  /**
+   * Fill-rate budget (fragments per frame, all comets) and whether the large splats go to the
+   * reduced-resolution pass (set by the layer, which owns that target).
+   */
+  budget = 4e6;
+  lowRes = false;
+  private nDust: number;
+  private nIon: number;
+  private nComa: number;
+  private mats: THREE.ShaderMaterial[] = [];
+  private activeSlots = 0;
 
   constructor(detail: number, shared: Record<string, THREE.IUniform>) {
     const nDust = Math.round(26000 * detail);
     const nIon = Math.round(12000 * detail);
     const nComa = Math.round(9000 * detail);
+    this.nDust = nDust;
+    this.nIon = nIon;
+    this.nComa = nComa;
     const dustGeo = randomGeometry(nDust, 17);
     const ionGeo = ionGeometry(nIon, 29);
     const comaGeo = randomGeometry(nComa, 43);
@@ -347,6 +417,10 @@ export class CometTails {
       uMaxSize: { value: 64 },
       uBright: { value: 1 },
       uFlux: { value: 0 },
+      uDrawN: { value: 0 },
+      uPass: { value: 0 },
+      uSplit: { value: TAIL_SPLIT_PX },
+      uResScale: { value: TAIL_LOW_RES },
       ...shared,
     });
     const mk = (vert: string, uniforms: Record<string, THREE.IUniform>) =>
@@ -407,6 +481,7 @@ export class CometTails {
         uGas: { value: GAS_RGB.clone() },
         uDust: { value: DUST_RGB.clone() },
       });
+      this.mats.push(dustMat, ionMat, comaMat);
       const dust = new THREE.Points(dustGeo, dustMat);
       const ion = new THREE.Points(ionGeo, ionMat);
       const coma = new THREE.Points(comaGeo, comaMat);
@@ -433,6 +508,22 @@ export class CometTails {
     }
   }
 
+  /**
+   * Select the pass: 0 = everything at full resolution (no reduced-resolution target), 1 = the
+   * full-resolution part, 2 = the reduced-resolution part (`resScale` = its pixels per full-res px).
+   */
+  setPass(pass: 0 | 1 | 2, resScale = TAIL_LOW_RES): void {
+    for (const m of this.mats) {
+      m.uniforms.uPass.value = pass;
+      m.uniforms.uResScale.value = resScale;
+    }
+  }
+
+  /** Any comet drawing this frame? */
+  get active(): boolean {
+    return this.activeSlots > 0;
+  }
+
   /** Choose which comets get tails this frame and update them. */
   update(cands: CometCandidate[], n: number, f: CometFrame): void {
     const list = this.cands;
@@ -450,6 +541,7 @@ export class CometTails {
     }
     list.sort((a, b) => b.score - a.score);
     const chosen = list.length > MAX_ACTIVE ? MAX_ACTIVE : list.length;
+    this.activeSlots = chosen;
     // Keep assignments stable: comets already in a slot stay there.
     for (const s of this.slots) {
       let keep = false;
@@ -458,12 +550,13 @@ export class CometTails {
     }
     for (let i = 0; i < chosen; i++) {
       const c = list[i].c;
-      let slot = this.slots.find((s) => s.body === c.body);
+      let slot: Slot | null = null;
+      for (const s of this.slots) if (s.body === c.body) slot = s;
       if (!slot) {
-        slot = this.slots.find((s) => s.body === null)!;
-        slot.body = c.body;
+        for (const s of this.slots) if (!slot && s.body === null) slot = s;
+        slot!.body = c.body;
       }
-      this.updateSlot(slot, c, f);
+      this.updateSlot(slot!, c, f, this.budget / chosen);
     }
     for (const s of this.slots) {
       const on = s.body !== null;
@@ -474,7 +567,39 @@ export class CometTails {
     }
   }
 
-  private updateSlot(s: Slot, c: CometCandidate, f: CometFrame): void {
+  private setCommon(m: THREE.ShaderMaterial, nuc: THREE.Vector3, f: CometFrame, bright: number): void {
+    const u = m.uniforms;
+    (u.uNucleus.value as THREE.Vector3).copy(nuc);
+    (u.uSunRel.value as THREE.Vector3).copy(f.sunRel);
+    u.uPixelAngle.value = f.pixelAngle;
+    u.uMaxSize.value = f.maxPointSize;
+    u.uBright.value = bright;
+  }
+
+  /** Fragment cost of one splat of σ = sigmaW (AU) at camera-relative (x, y, z) (AU); 0 off screen. */
+  private cost(sigmaW: number, x: number, y: number, z: number, f: CometFrame): number {
+    let d = Math.hypot(x, y, z);
+    if (f.view && f.tanX !== undefined && f.tanY !== undefined) {
+      const e = f.view.elements;
+      const vx = e[0] * x + e[4] * y + e[8] * z;
+      const vy = e[1] * x + e[5] * y + e[9] * z;
+      const vz = -(e[2] * x + e[6] * y + e[10] * z);
+      if (vz <= 0) return 0;
+      d = vz;
+      const half = (3 * sigmaW) / vz; // sprite half-width, radians
+      if (Math.abs(vx) / vz - half > f.tanX || Math.abs(vy) / vz - half > f.tanY) return 0;
+    }
+    const size = (6 * sigmaW) / (Math.max(d, 1e-12) * f.pixelAngle);
+    return splatCost(size, f.maxPointSize, this.lowRes ? TAIL_LOW_RES : 1, TAIL_SPLIT_PX);
+  }
+
+  /** Draw `n` of a population (flux renormalised to n). */
+  private setCount(m: THREE.ShaderMaterial, n: number): void {
+    m.uniforms.uDrawN.value = n;
+    m.uniforms.uCount.value = Math.max(n, 1);
+  }
+
+  private updateSlot(s: Slot, c: CometCandidate, f: CometFrame, budget: number): void {
     const b = c.body;
     const cp = b.def.comet!;
     const el = b.conic!;
@@ -531,18 +656,10 @@ export class CometTails {
     const tailLen = Math.hypot(g.dust[(AGES - 1) * BETAS * 3 + (BETAS - 1) * 3], g.dust[(AGES - 1) * BETAS * 3 + (BETAS - 1) * 3 + 1], g.dust[(AGES - 1) * BETAS * 3 + (BETAS - 1) * 3 + 2]);
     const ionLen = Math.hypot(g.ion[(ION_N - 1) * 3], g.ion[(ION_N - 1) * 3 + 1], g.ion[(ION_N - 1) * 3 + 2]);
 
-    const setCommon = (m: THREE.ShaderMaterial) => {
-      const u = m.uniforms;
-      (u.uNucleus.value as THREE.Vector3).copy(nuc);
-      (u.uSunRel.value as THREE.Vector3).copy(f.sunRel);
-      u.uPixelAngle.value = f.pixelAngle;
-      u.uMaxSize.value = f.maxPointSize;
-      u.uBright.value = bright;
-    };
     // Dust.
     {
       const m = s.dustMat;
-      setCommon(m);
+      this.setCommon(m, nuc, f, bright);
       const u = m.uniforms;
       u.uMaxAge.value = maxAge;
       u.uRN.value = r;
@@ -559,7 +676,7 @@ export class CometTails {
     // Ions.
     {
       const m = s.ionMat;
-      setCommon(m);
+      this.setCommon(m, nuc, f, bright);
       const u = m.uniforms;
       (u.uE1.value as THREE.Vector3).copy(_e1);
       (u.uE2.value as THREE.Vector3).copy(_e2);
@@ -578,13 +695,47 @@ export class CometTails {
     // Coma.
     {
       const m = s.comaMat;
-      setCommon(m);
+      this.setCommon(m, nuc, f, bright);
       const u = m.uniforms;
       u.uApex.value = apex;
       (u.uSunDir.value as THREE.Vector3).copy(sunDir);
       u.uFlux.value = 5 * Adisp * Math.PI * 4 * apex * apex;
       s.coma.visible = true;
     }
+
+    // Fill-rate budget. Close to a great comet every splat covers thousands of pixels (NEOWISE
+    // from 0.1 AU: ~170 additive fragments per screen pixel at 720p). Estimate the mean cost per
+    // splat from the same grid the GPU samples (stratified in age and β), then draw only as many
+    // splats as the budget allows — overlap stays high enough (≳ 40 per pixel) that the thinned
+    // sample still reads as a smooth sheet.
+    const nx = nuc.x, ny = nuc.y, nz = nuc.z;
+    const dNuc = Math.max(nuc.length(), 1e-12);
+    const shrink = Math.max(0, 1 - 0.5 * apex / dNuc); // coma samples sit around the nucleus
+    let cDust = 0, cIon = 0, cComa = 0;
+    const sizeDust = s.dustMat.uniforms.uSizeW.value as number;
+    const sizeIon = s.ionMat.uniforms.uSizeW.value as number;
+    for (let q = 0; q < COST_SAMPLES; q++) {
+      const ageF = (q + 0.5) / COST_SAMPLES;
+      const ia = Math.min(AGES - 1, Math.round((AGES - 1) * Math.pow(ageF, 1 / AGE_POW)));
+      const jb = (q * 7) % BETAS;
+      const t = (ia * BETAS + jb) * 4;
+      cDust += this.cost(sizeDust * (0.5 + 5 * ageF), nx + td[t], ny + td[t + 1], nz + td[t + 2], f);
+      const ii = Math.min(ION_N - 1, Math.round((ION_N - 1) * Math.pow(ageF, 1 / AGE_POW)));
+      cIon += this.cost(sizeIon * (0.35 + 2.5 * ageF), nx + g.ion[ii * 3], ny + g.ion[ii * 3 + 2], nz - g.ion[ii * 3 + 1], f);
+      cComa += this.cost(apex * (0.06 + 0.22 * ageF), nx * shrink, ny * shrink, nz * shrink, f);
+    }
+    cDust /= COST_SAMPLES;
+    cIon /= COST_SAMPLES;
+    cComa /= COST_SAMPLES;
+    // Split the budget by how much each component is on screen (dust usually dominates).
+    const wd = s.dust.visible ? 0.55 : 0;
+    const wi = s.ion.visible ? 0.25 : 0;
+    const wc = 0.2;
+    const wsum = wd + wi + wc;
+    // Floors: the plasma tail's few narrow rays need more of their splats than the broad dust fan.
+    this.setCount(s.dustMat, splatDrawCount(this.nDust, cDust, (budget * wd) / wsum, 0.15));
+    this.setCount(s.ionMat, splatDrawCount(this.nIon, cIon, (budget * wi) / wsum, 0.35));
+    this.setCount(s.comaMat, splatDrawCount(this.nComa, cComa, (budget * wc) / wsum, 0.25));
   }
 
   dispose(): void {

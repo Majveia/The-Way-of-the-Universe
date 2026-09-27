@@ -690,7 +690,7 @@ class EarthExperience implements Experience {
     const time = ui.section('Time');
     this.pauseBtn = time.button({ label: 'Pause', onClick: () => this.setPaused(!this.paused) });
     time.buttons([
-      { label: 'Now', onClick: () => this.setTime(Date.now()) },
+      { label: 'Now', onClick: () => this.goNow() },
       { label: 'Solstice', onClick: () => this.jumpSeason(5, 21) },
       { label: 'Equinox', onClick: () => this.jumpSeason(8, 23) },
     ]);
@@ -779,7 +779,7 @@ class EarthExperience implements Experience {
         i = THREE.MathUtils.clamp(i + (k === 'BracketRight' ? 1 : -1), 0, WARPS.length - 1);
         this.setWarp(WARPS[i]);
         this.ctx.ui.toast(`Time warp ${warpLabel(WARPS[i])}`);
-      } else if (k === 'KeyN') this.setTime(Date.now());
+      } else if (k === 'KeyN') this.goNow();
     });
   }
 
@@ -804,6 +804,12 @@ class EarthExperience implements Experience {
     this.rSun = ui.readout('Sun overhead');
     this.rMoon = ui.readout('Moon');
     this.readouts.push(this.rAlt, this.rUtc, this.rSun, this.rMoon);
+  }
+
+  /** Back to the present: also forget a historical view's saved time, so leaving it does not jump back. */
+  private goNow(): void {
+    this.prePbdMs = null;
+    this.setTime(Date.now());
   }
 
   private jumpSeason(month: number, day: number): void {

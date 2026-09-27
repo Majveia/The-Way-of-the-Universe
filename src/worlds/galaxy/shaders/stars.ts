@@ -42,6 +42,13 @@ uniform vec2 uPopGain;       // (old populations, young) brightness multipliers
 uniform float uPxPerRad;     // target pixels per radian
 uniform vec4 uSmooth;        // particle surface density Σ₀ (pc⁻²) and R_d of the thin and thick disks
 uniform float uSmoothBar;    // bar particles per pc²
+// Two-resolution splatting (fill rate): 0 = draw everything here; 1 = only the sharp (point-like)
+// part; 2 = only the smooth part (wide aggregate sprites), into a target uLoScale × the size.
+// A sprite of PSF width σ (full-resolution px) goes to the smooth pass with weight
+// smoothstep(uSplit.x, uSplit.y, σ); its radiance is unchanged, only the pixel grid differs.
+uniform int uPass;
+uniform vec2 uSplit;
+uniform float uLoScale;
 
 // Physical extent of an aggregate particle: the mean spacing of its population (a particle is
 // thousands of unresolved stars, not one super-luminous star). Young stars are single stars.
@@ -65,6 +72,14 @@ float smoothingLength(float kind, vec4 a1, float a2x, vec3 P) {
 out vec3 vColor;
 out float vSize;
 out float vK;
+
+void cullStar() {
+  gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+  gl_PointSize = 0.0;
+  vColor = vec3(0.0);
+  vSize = 0.0;
+  vK = 0.0;
+}
 
 void main() {
   vec3 P;
@@ -103,33 +118,33 @@ void main() {
     vK = 0.0;
     return;
   }
-  float tau = dustColumn(uCamModel, P, uExtSamples);
-  vec3 trans = exp(-tau * uExtRGB);
+  // Projected extent of the particle (px), before extinction: lets each pass skip the dust column
+  // for sprites that belong entirely to the other pass.
+  float hpx = 0.75 * smoothingLength(a0.x, a1, a2.x, P) * uPxPerRad / sqrt(d2);
+  float fYoung = young && uYoungMult > 1.5 ? smoothstep(1.5, 6.0, hpx) : 0.0;
+  // Close enough to resolve the association: show the particle's own star as a point and let
+  // its k − 1 companions go (their light is a small part of what surrounds the viewer).
+  hpx *= 1.0 - fYoung;
   vec3 c = blackbody(T);
   float lc = dot(c, vec3(0.2126, 0.7152, 0.0722));
   c = max(vec3(lc) + uSaturation * (c - vec3(lc)), 0.0);
+  if (uPass == 1 && min(hpx, 2.0) >= uSplit.y) { cullStar(); return; }
+  if (uPass == 2) {
+    // Upper bound of σ (no extinction): wholly sharp sprites never reach the smooth pass.
+    float lumUB = dot(c, vec3(0.2126, 0.7152, 0.0722)) * rad;
+    float psfUB = clamp(2.6 + 1.1 * log2(1.0 + lumUB / uSizeRef), 2.6, uMaxSize) / 6.0;
+    if (min(sqrt(psfUB * psfUB + hpx * hpx), max(psfUB, 2.0)) <= uSplit.x) { cullStar(); return; }
+  }
+  float tau = dustColumn(uCamModel, P, uExtSamples);
+  vec3 trans = exp(-tau * uExtRGB);
   vec3 col = c * rad * trans;
   float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
-  if (lum < uMinRad) {
-    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-    gl_PointSize = 0.0;
-    vColor = vec3(0.0);
-    vSize = 0.0;
-    vK = 0.0;
-    return;
-  }
+  if (lum < uMinRad) { cullStar(); return; }
   // Sprite diameter grows slowly with brightness (the visible wings of a bright PSF), combined in
   // quadrature with the particle's own projected extent. When that exceeds 12 px the particle fades
   // out: up close its light belongs to the smooth volume, not to a fake point star.
   float psf = clamp(2.6 + 1.1 * log2(1.0 + lum / uSizeRef), 2.6, uMaxSize) / 6.0;
-  float hpx = 0.75 * smoothingLength(a0.x, a1, a2.x, P) * uPxPerRad / sqrt(d2);
-  if (young && uYoungMult > 1.5) {
-    // Close enough to resolve the association: show the particle's own star as a point and let
-    // its k − 1 companions go (their light is a small part of what surrounds the viewer).
-    float f = smoothstep(1.5, 6.0, hpx);
-    col *= mix(1.0, 1.0 / uYoungMult, f);
-    hpx *= 1.0 - f;
-  }
+  col *= mix(1.0, 1.0 / uYoungMult, fYoung);
   float sigma = sqrt(psf * psf + hpx * hpx);
   // Aggregate particles never exceed a 12 px sprite (fill rate: an elliptical is ~10⁶ of them);
   // only a genuinely bright point source may spread its PSF wider.
@@ -138,12 +153,20 @@ void main() {
     float k = sMax / sigma;
     col *= k * k * k;
     sigma = sMax;
-    if (dot(col, vec3(0.2126, 0.7152, 0.0722)) < uMinRad * 0.1) {
-      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-      gl_PointSize = 0.0;
-      vColor = vec3(0.0);
-      vSize = 0.0;
-      vK = 0.0;
+    if (dot(col, vec3(0.2126, 0.7152, 0.0722)) < uMinRad * 0.1) { cullStar(); return; }
+  }
+  if (uPass != 0) {
+    float w = smoothstep(uSplit.x, uSplit.y, sigma);
+    col *= uPass == 2 ? w : 1.0 - w;
+    if (uPass == 1 ? w >= 1.0 : w <= 0.0) { cullStar(); return; }
+    if (uPass == 2) {
+      // Same radiance, coarser pixels: the PSF is σ·s pixels wide there.
+      float sl = sigma * uLoScale;
+      gl_PointSize = 6.0 * sl;
+      vSize = 6.0 * sl;
+      vK = 1.0 / (2.0 * sl * sl);
+      vColor = col / (6.2831853 * sigma * sigma);
+      gl_Position = projectionMatrix * mv;
       return;
     }
   }
