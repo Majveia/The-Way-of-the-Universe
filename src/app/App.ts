@@ -168,7 +168,7 @@ export class App {
     post.fade = 0;
     this.engine.post.settings = post;
     this.engine.dynamicResolution = !this.engine.shotMode;
-    this.engine.setRenderScale(1);
+    this.engine.resetRenderScale();
     try {
       const mod = await def.load();
       if (token !== this.nav) return;
