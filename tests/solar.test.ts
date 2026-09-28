@@ -12,7 +12,7 @@ import { iauRotation } from '../src/worlds/solar/ephem/rotation';
 import { SATELLITE_FITS } from '../src/worlds/solar/data/moons';
 import { calendarToJD, jdToCalendar, deltaT, formatUTC, utcToTT, ttToUTC } from '../src/worlds/solar/time';
 import { toThree, fromThree, raDecToThree } from '../src/worlds/solar/frames';
-import { SolarSystemModel } from '../src/worlds/solar/SolarSystemModel';
+import { SolarSystemModel, makeOrbitGeometry } from '../src/worlds/solar/SolarSystemModel';
 import { RESONANCES, sampleMainBelt, sampleTrojans, sampleHildas, sampleKuiper, particlePosition, mainBeltDensity, BELT_EPOCH } from '../src/worlds/solar/belts';
 
 // JPL Horizons (DE441) heliocentric J2000-ecliptic positions, AU. [JD TDB, x, y, z]. Retrieved 2026-09-22.
@@ -487,5 +487,194 @@ describe('curated views', () => {
     const lit = (1 + Math.cos(alpha)) / 2;
     expect(lit).toBeGreaterThan(0.3);
     expect(lit).toBeLessThan(0.9);
+  });
+});
+
+// ————————————————————————————————————————————— review additions (GPU mirrors, orbit lines, fill rate)
+describe('GPU mirrors', () => {
+  // Float32 mirror of KEPLER_GLSL.solveKeplerE (render/glsl.ts): 8 Newton steps from M + e sin M
+  // (e < 0.8) or ±0.85π. Every sampled population must converge to < 1e-4 of its semi-major axis.
+  const f32 = Math.fround;
+  const solveGpu = (M: number, e: number) => {
+    let E = e < 0.8 ? f32(M + f32(e * Math.sin(M))) : (M >= 0 ? 3.14159265 : -3.14159265) * 0.85;
+    for (let k = 0; k < 8; k++) {
+      const fx = f32(E - f32(e * Math.sin(E)) - M);
+      E = f32(E - f32(fx / f32(1 - e * Math.cos(E))));
+    }
+    return E;
+  };
+  it('the vertex-shader Kepler solver converges for every belt population (e up to ~0.97)', async () => {
+    const { sampleNEAs, sampleOort } = await import('../src/worlds/solar/belts');
+    const pops = [sampleMainBelt(4000), sampleHildas(1000), sampleTrojans(2000), sampleNEAs(1500), sampleKuiper(6000), sampleOort(4000)];
+    let worst = 0;
+    for (const p of pops) {
+      for (let k = 0; k < p.count; k++) {
+        const e = p.orbitA[k * 4 + 1];
+        for (let j = 0; j < 24; j++) {
+          const M = -Math.PI + ((j + 0.5) / 24) * 2 * Math.PI * (j % 5 === 0 ? 0.002 : 1);
+          const E = solveGpu(M, e);
+          // Position error (units of a) ≈ |residual| · |dr/dE| / |dM/dE| ≤ res (1 + e) / (1 − e cos E).
+          const err = (Math.abs(E - e * Math.sin(E) - M) * (1 + e)) / Math.max(1 - e * Math.cos(E), 1e-6);
+          worst = Math.max(worst, err);
+        }
+      }
+    }
+    expect(worst).toBeLessThan(1e-4);
+  });
+});
+
+describe('orbit lines', () => {
+  // OrbitLines draws each conic from its (P, Q, a, b, anomaly) *relative to the body*; the curve is
+  // only honest if those elements put the body where the ephemeris does.
+  const m = new SolarSystemModel();
+  const jd = utcToTT(calendarToJD(2026, 9, 27));
+  m.update(jd);
+  const g = makeOrbitGeometry();
+  const onConic = (out: THREE.Vector3, E: number) =>
+    g.hyperbolic
+      ? out.copy(g.P).multiplyScalar(g.a * (g.e - Math.cosh(E))).addScaledVector(g.Q, g.b * Math.sinh(E))
+      : out.copy(g.P).multiplyScalar(g.a * (Math.cos(E) - g.e)).addScaledVector(g.Q, g.b * Math.sin(E));
+  it('the orbit geometry of every body passes through the body itself', () => {
+    let n = 0;
+    const p = new THREE.Vector3();
+    const bad: string[] = [];
+    const charon = m.get('charon')!;
+    for (const b of m.bodies) {
+      if (!b.parent || !m.orbitGeometry(b, g)) continue;
+      onConic(p, g.anomaly);
+      // Pluto's small moons orbit the Pluto–Charon barycentre (their conic's focus), 2 100 km from Pluto.
+      const o = b.def.orbit as { barycentric?: boolean };
+      const local = b.local.clone();
+      if (o.barycentric) local.addScaledVector(charon.local, -(m as unknown as { charonRatio: number }).charonRatio);
+      // Earth: the line is the Earth–Moon barycentre's orbit (4 670 km off Earth's centre).
+      const tol = b.id === 'earth' ? 5e-5 : 1e-6;
+      const err = p.distanceTo(local) / local.length();
+      if (!(err < tol)) bad.push(`${b.id}: ${err.toExponential(2)}`);
+      n++;
+    }
+    expect(bad).toEqual([]);
+    expect(n).toBeGreaterThan(40);
+  });
+  it('the cancellation-free difference formulas hold in float32 (Phobos, Neptune, Voyager 1)', () => {
+    const f32 = Math.fround;
+    const exact = new THREE.Vector3();
+    const base = new THREE.Vector3();
+    for (const id of ['phobos', 'neptune', 'voyager-1']) {
+      const b = m.get(id)!;
+      expect(m.orbitGeometry(b, g), id).toBe(true);
+      const Eb = g.anomaly;
+      onConic(base, Eb);
+      for (const d of [1e-6, 1e-3, 0.3]) {
+        const h = d / 2;
+        // Shader (float32): off = P (−2a S(Eb+h) s(h)) + Q (2b C(Eb+h) s(h)).
+        const s = g.hyperbolic ? f32(Math.sinh(h)) : f32(Math.sin(h));
+        const kP = g.hyperbolic ? f32(-2 * g.a * f32(Math.sinh(f32(Eb) + h)) * s) : f32(-2 * g.a * f32(Math.sin(f32(Eb) + h)) * s);
+        const kQ = g.hyperbolic ? f32(2 * g.b * f32(Math.cosh(f32(Eb) + h)) * s) : f32(2 * g.b * f32(Math.cos(f32(Eb) + h)) * s);
+        const off = new THREE.Vector3().copy(g.P).multiplyScalar(kP).addScaledVector(g.Q, kQ);
+        onConic(exact, Eb + d).sub(base);
+        expect(off.distanceTo(exact) / Math.max(exact.length(), 1e-30), `${id} Δ=${d}`).toBeLessThan(1e-4);
+      }
+    }
+  });
+});
+
+describe('comet tail fill rate', () => {
+  it('large splats move to the quarter-resolution pass (≥ 10× cheaper) without a jump at the split', async () => {
+    const { splatCost, TAIL_LOW_RES, TAIL_SPLIT_PX } = await import('../src/worlds/solar/render/CometTails');
+    const full = (s: number) => splatCost(s, 128, 1, TAIL_SPLIT_PX);
+    const split = (s: number) => splatCost(s, 128, TAIL_LOW_RES, TAIL_SPLIT_PX);
+    expect(split(8)).toBeCloseTo(full(8), 9); // small splats stay full resolution
+    expect(full(100) / split(100)).toBeGreaterThan(10);
+    // Continuous across the cross-fade band.
+    for (let s = TAIL_SPLIT_PX * 0.9; s < TAIL_SPLIT_PX * 1.8; s += 0.25) expect(Math.abs(split(s + 0.25) - split(s))).toBeLessThan(0.05 * full(s) + 1);
+  });
+  it('the draw count honours the budget, the floor and the population size', async () => {
+    const { splatDrawCount } = await import('../src/worlds/solar/render/CometTails');
+    expect(splatDrawCount(26000, 100, 1e9)).toBe(26000);
+    expect(splatDrawCount(26000, 1000, 1e6, 0.01)).toBeCloseTo(1000, 6);
+    expect(splatDrawCount(26000, 1e5, 1e6, 0.15)).toBeCloseTo(3900, 6);
+    expect(splatDrawCount(26000, 0, 1e6)).toBe(26000);
+  });
+});
+
+describe('readouts', () => {
+  it('light-time: 1 AU is 8 min 19 s; Neptune ~4 h', async () => {
+    const { formatLightTime } = await import('../src/experiences/solar/info');
+    expect(formatLightTime(1)).toBe('8 min 19 s');
+    expect(formatLightTime(30.07)).toBe('4 h 10 min');
+  });
+});
+
+// ————————————————————————————————————————————— review 2: dated events, GPU/CPU frame agreement
+describe('dated events (geometry a physicist can check)', () => {
+  const m = new SolarSystemModel();
+  const sep = (a: THREE.Vector3, b: THREE.Vector3, from: THREE.Vector3) => {
+    const u = a.clone().sub(from).normalize();
+    const v = b.clone().sub(from).normalize();
+    return Math.acos(THREE.MathUtils.clamp(u.dot(v), -1, 1)) / (Math.PI / 180);
+  };
+  it('Great Conjunction 2020 Dec 21 18h UTC: Jupiter–Saturn 0.10° apart from Earth (observed 6.1′)', () => {
+    m.update(utcToTT(calendarToJD(2020, 12, 21.75)));
+    const s = sep(m.get('jupiter')!.position, m.get('saturn')!.position, m.get('earth')!.position);
+    // Standish Table 1 is good to ~1′ (Jupiter) and ~10′ (Saturn).
+    expect(s).toBeGreaterThan(0.02);
+    expect(s).toBeLessThan(0.25);
+  });
+  it('Total solar eclipse 2027 Aug 2 (greatest 10:07 UT): the Moon covers the Sun as seen from Earth', () => {
+    m.update(utcToTT(calendarToJD(2027, 8, 2 + (10 + 7 / 60) / 24)));
+    const e = m.get('earth')!.position;
+    const moon = m.get('moon')!;
+    const s = sep(m.sun.position, moon.position, e);
+    // Geocentric separation at greatest eclipse is ~0.3 × the Moon's radius plus parallax (< 1°).
+    expect(s).toBeLessThan(0.6);
+    // Total: the Moon's apparent radius exceeds the Sun's (perigee Moon, aphelion-ish Earth).
+    const rMoon = moon.radius / moon.position.distanceTo(e);
+    const rSun = m.sun.radius / e.length();
+    expect(rMoon / rSun).toBeGreaterThan(1.0);
+    expect(rMoon / rSun).toBeLessThan(1.1);
+  });
+  it('Family Portrait 1990 Feb 14: Voyager 1 is ~40 AU out, well above the ecliptic', () => {
+    m.update(utcToTT(calendarToJD(1990, 2, 14.2)));
+    const v = m.get('voyager-1')!.position;
+    expect(v.length()).toBeGreaterThan(39.5);
+    expect(v.length()).toBeLessThan(40.8);
+    // Ecliptic latitude ~ +32° (three.js y is ecliptic north).
+    const lat = Math.asin(v.y / v.length()) / (Math.PI / 180);
+    expect(lat).toBeGreaterThan(28);
+    expect(lat).toBeLessThan(36);
+  });
+});
+
+describe('GPU orbit placement mirrors the CPU (frames and axes)', () => {
+  // GLSL orbitPoint() returns three.js axes (x, z, −y) of the astro-frame ellipse point; the CPU
+  // particlePosition() returns astro axes. They must agree through toThree().
+  const orbitPointGLSL = (a: number, e: number, inc: number, node: number, peri: number, E: number) => {
+    const xp = a * (Math.cos(E) - e);
+    const yp = a * Math.sqrt(Math.max(1 - e * e, 0)) * Math.sin(E);
+    const cO = Math.cos(node), sO = Math.sin(node), ci = Math.cos(inc), si = Math.sin(inc), cw = Math.cos(peri), sw = Math.sin(peri);
+    const x = (cO * cw - sO * sw * ci) * xp + (-cO * sw - sO * cw * ci) * yp;
+    const y = (sO * cw + cO * sw * ci) * xp + (-sO * sw + cO * cw * ci) * yp;
+    const z = sw * si * xp + cw * si * yp;
+    return new THREE.Vector3(x, z, -y);
+  };
+  it('belt members land where the CPU ephemeris puts them', () => {
+    const p = sampleTrojans(300);
+    const jd = BELT_EPOCH + 1234.5;
+    const out = { x: 0, y: 0, z: 0 };
+    const cpu = new THREE.Vector3();
+    for (let k = 0; k < p.count; k++) {
+      particlePosition(p, k, jd, out);
+      toThree(out.x, out.y, out.z, cpu);
+      const t = jd - BELT_EPOCH;
+      let M = p.M0[k] + p.n[k] * t;
+      const amp = p.orbitB[k * 4 + 3];
+      if (amp) M += amp * Math.sin(p.libPhase[k] + p.libOmega * t);
+      M = M - 2 * Math.PI * Math.floor((M + Math.PI) / (2 * Math.PI));
+      const e = p.orbitA[k * 4 + 1];
+      let E = M;
+      for (let i = 0; i < 12; i++) E -= (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+      const gpu = orbitPointGLSL(p.orbitA[k * 4], e, p.orbitA[k * 4 + 2], p.orbitA[k * 4 + 3], p.orbitB[k * 4], E);
+      expect(gpu.distanceTo(cpu)).toBeLessThan(1e-9);
+    }
   });
 });

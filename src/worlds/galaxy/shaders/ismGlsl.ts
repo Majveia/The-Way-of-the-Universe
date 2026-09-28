@@ -23,23 +23,24 @@ uniform vec4 uBubble;        // Local Bubble centre (model frame) + radius (w); 
 uniform int uCloudCount;
 uniform vec4 uClouds[8];     // local dust clouds: model-frame centre (xyz) + radius (w)
 uniform float uCloudTau[8];  // peak optical depth through the centre
+uniform vec2 uBarCS;         // cos, sin of the bar angle at uTime (set on the CPU once per frame)
 #endif
 `;
 
 export const ISM_GLSL = /* glsl */ `
 #ifndef TWU_ISM
 #define TWU_ISM
+vec4 mapAtPolar(float R, float phi) {
+  float u = (log(max(R, uMapGeom.z)) - uMapGeom.x) * uMapGeom.y;
+  return texture(uMap, vec2(u, (phi - uOmegaP * uTime) * (1.0 / TAU_G)));
+}
 vec4 mapAt(vec2 XY) {
-  float R = max(length(XY), uMapGeom.z);
-  float phi = atan(XY.y, XY.x) - uOmegaP * uTime;
-  float u = (log(R) - uMapGeom.x) * uMapGeom.y;
-  return texture(uMap, vec2(u, phi * (1.0 / TAU_G)));
+  return mapAtPolar(length(XY), atan(XY.y, XY.x));
 }
 
 // Bar-frame coordinates of a model-frame point.
 vec2 barFrame(vec2 XY) {
-  float ang = uBarAngle0 + uOmegaB * uTime;
-  float c = cos(ang), s = sin(ang);
+  float c = uBarCS.x, s = uBarCS.y; // angle uBarAngle0 + uOmegaB · uTime
   return vec2(XY.x * c + XY.y * s, -XY.x * s + XY.y * c);
 }
 

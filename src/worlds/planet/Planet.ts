@@ -155,6 +155,7 @@ export class Planet implements PlanetRenderer {
   private bodyU: Record<string, THREE.IUniform>;
   private common: Record<string, THREE.IUniform>;
   private ellipsoid: THREE.Vector3;
+  private readonly anisotropy: number;
 
   constructor(spec: PlanetSpec) {
     this.spec = spec;
@@ -167,6 +168,8 @@ export class Planet implements PlanetRenderer {
     this.object.name = `planet:${spec.kind}`;
 
     const detail = spec.detail ?? 1;
+    // Anisotropic taps per imagery fetch scale with the tier (8 of them per fetch at grazing angles).
+    this.anisotropy = detail >= 0.9 ? 8 : detail >= 0.5 ? 4 : 2;
     const kind = spec.kind;
     this.usesEarth = kind === 'earth';
     this.usesMoon = spec.texture === 'moon' && !this.usesEarth;
@@ -351,7 +354,9 @@ export class Planet implements PlanetRenderer {
           glslVersion: THREE.GLSL3,
           vertexShader: PROXY_VERT,
           fragmentShader: ATMO_FRAG,
-          uniforms: surfU,
+          // Same uniform objects as the surface, except the proxy inflation: the shell's silhouette is
+          // far outside the ground limb already, and inflating it would push it past callers' depth brackets.
+          uniforms: { ...surfU, uProxyScale: { value: 1 } },
           defines: transmit ? { ...defines, TRANSMIT: '' } : defines,
           side: THREE.BackSide,
           transparent: true,
@@ -401,7 +406,7 @@ export class Planet implements PlanetRenderer {
     if (this.usesEarth) {
       this.surface.visible = false;
       const maxWidth = detail >= 0.9 ? 4096 : 2048;
-      this.ready = acquireEarthImagery({ anisotropy: 8, maxWidth }).then(async (img) => {
+      this.ready = acquireEarthImagery({ anisotropy: this.anisotropy, maxWidth }).then(async (img) => {
         if (this.disposed) return;
         this.earth = img;
         this.surfaceMat.uniforms.uNight.value = img.night;
@@ -412,7 +417,7 @@ export class Planet implements PlanetRenderer {
       });
     } else if (this.usesMoon) {
       this.surface.visible = false;
-      this.ready = acquireMoonImagery({ anisotropy: 8, maxWidth: detail >= 0.9 ? 4096 : 2048 }).then((m) => {
+      this.ready = acquireMoonImagery({ anisotropy: this.anisotropy, maxWidth: detail >= 0.9 ? 4096 : 2048 }).then((m) => {
         if (this.disposed) return;
         this.surfaceMat.uniforms.uMoonColor.value = m.color;
         this.surfaceMat.uniforms.uMoonHeight.value = m.height;
@@ -438,7 +443,7 @@ export class Planet implements PlanetRenderer {
       u.uCubeC.value = this.baked.clouds?.texture ?? this.baked.albedo?.texture ?? null;
     }
     this.renderer = renderer;
-    const aniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    const aniso = Math.max(1, Math.min(this.anisotropy, renderer.capabilities.getMaxAnisotropy()));
     if (this.earth) {
       // Upload (and build mipmaps) now rather than inside the first frame that draws the planet.
       for (const t of [this.earth.night, this.earth.clouds, this.earth.topo]) {
@@ -469,8 +474,10 @@ export class Planet implements PlanetRenderer {
     const dist = tmpV.setFromMatrixPosition(camera.matrixWorld).distanceTo(tmpV2);
     const pxR = perspective ? (worldR / Math.max(dist, 1e-12)) * p11 * 0.5 * h : 1000;
     this.common.uPixelRadius.value = pxR;
-    // Keep the proxies' silhouettes ≥ 2.5 px outside the limb (see PROXY_VERT).
-    this.common.uProxyScale.value = 1 + Math.min(0.05, 2.5 / Math.max(pxR, 1));
+    // Keep the surface proxy's silhouette ~2 px outside the limb (see PROXY_VERT), but within 1.0015 × 1.035
+    // ≈ 1.037 radii: callers bracket each body's depth range with a few % of margin, and the atmosphere
+    // proxy (not inflated) must still enclose the surface proxy.
+    this.common.uProxyScale.value = 1 + Math.min(0.035, 2 / Math.max(pxR, 1));
     const caps = renderer.capabilities as unknown as { reverseDepthBuffer?: boolean; logarithmicDepthBuffer?: boolean };
     if (caps.logarithmicDepthBuffer) {
       this.common.uDepthMode.value = 2;

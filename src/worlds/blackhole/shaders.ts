@@ -344,8 +344,9 @@ void diskChord(vec3 a, vec3 b, float N, float ptS, float kphiS, float jit, float
   float sinInc = abs(D.z) / max(length(D), 1e-9);
   float segL = len / float(n);
   dbgSamples += 1000;          // one chord (profiling: chords × 1000 + samples)
-  for (int j = 0; j < DISK_SAMPLES; j++) {
-    if (j >= n) break;
+  // Data-dependent bound: D3D compilers unroll a constant-bound loop and may flatten the break,
+  // running all DISK_SAMPLES samples for every chord.
+  for (int j = 0; j < n; j++) {
     dbgSamples++;
     float sa = s0 + (s1 - s0) * float(j) / float(n);
     float sb = s0 + (s1 - s0) * float(j + 1) / float(n);
@@ -479,6 +480,9 @@ void main() {
     // the horizon anything inside uCapR is captured whatever its (numerically fragile) direction.
     if (uInside > 0.5 ? (vr < 0.0 && r < uHorizon * 1.0005) : r < uCapR) { fate = 2.0; break; }
     if (vr > 0.0 && r > uEscR * 0.9995) { fate = 1.0; break; }
+    // Re-tracing with a cached lens map needs only the disk light: an outgoing ray beyond the disk
+    // (and so beyond every photon orbit, where no outgoing ray can turn back) meets nothing more.
+    if (uCached > 0.5 && vr > 0.0 && r > uDiskR.y * 1.03 + 1.0) { fate = 1.0; break; }
     float speed = length(v1) + 1e-9;
     float grow = 1.0 + ${f(STEP_LAW.growK)} * smoothstep(${f(STEP_LAW.growR0)}, ${f(STEP_LAW.growR1)}, r);
     float hc = uEps * r * min(grow * kb, ${f(STEP_LAW.cap)});   // coordinate length of this step
@@ -615,7 +619,7 @@ uniform float uSigmaPix;     // star PSF in output pixels
 uniform float uSigmaSrc;     // intrinsic source size (rad) — regularises caustics
 uniform vec3 uLayerN;        // cells per cube-face edge
 uniform vec3 uLayerMean;     // mean flux per cell (for the unresolved limit)
-uniform vec4 uMagLo, uMagHi; // per layer magnitude range
+uniform vec3 uLayerE0, uLayerE1; // per layer e^{k m} at the bright and faint magnitude limits
 uniform vec3 uAvgStarColor;
 uniform sampler2D uPlanck;
 uniform vec2 uPlanckMap;
@@ -718,56 +722,51 @@ vec4 cellHash(vec2 c, float face, float seed) {
   return vec4(h) * (1.0 / 4294967296.0);
 }
 
-// Sum of lensed point stars of one layer near D. "reach" is the PSF's extent in the source plane
-// (radians, ≈ 4.2 σ along its major axis): cells whose star region (the middle 70 % of the cell)
-// lies further than that are skipped before hashing — in unlensed sky that is every neighbour, so
-// the 3 × 3 search costs one hash instead of nine.
-vec3 starLayer(vec3 D, vec3 t1, vec3 t2, mat2 Spix, float N, float mLo, float mHi, float seed, float dens, float g, float shiftOn, float reach) {
-  vec3 acc = vec3(0.0);
-  float k = 0.806; // 0.35 ln 10 : dN/dm ∝ 10^{0.35 m}
-  float e0 = exp(k * mLo), e1 = exp(k * mHi);
-  float det = Spix[0][0] * Spix[1][1] - Spix[0][1] * Spix[1][0];
-  for (int f = 0; f < 2; f++) {
-    vec3 fu = faceOf(D, f);
-    if (f == 1 && max(abs(fu.y), abs(fu.z)) > 1.0 + 3.0 / N) break;   // far from any edge
-    vec2 cp = (fu.yz * 0.5 + 0.5) * N;
-    vec2 cell = floor(cp);
-    vec2 fr = cp - cell;
-    // Gnomonic face coordinates stretch by up to (1 + u² + v²) per radian; one cell is 2/N in uv.
-    float rc = reach * (1.0 + dot(fu.yz, fu.yz)) * 0.5 * N;
-    float rc2 = rc * rc;
-    for (int j = -1; j <= 1; j++) {
-      float dy = j == 0 ? max(max(0.15 - fr.y, fr.y - 0.85), 0.0) : (j < 0 ? fr.y + 0.15 : 1.15 - fr.y);
-      if (dy * dy > rc2) continue;
-      for (int i = -1; i <= 1; i++) {
-        float dx = i == 0 ? max(max(0.15 - fr.x, fr.x - 0.85), 0.0) : (i < 0 ? fr.x + 0.15 : 1.15 - fr.x);
-        if (dx * dx + dy * dy > rc2) continue;
-        vec2 c = cell + vec2(float(i), float(j));
-        if (c.x < 0.0 || c.y < 0.0 || c.x >= N || c.y >= N) continue;
-        vec4 h = cellHash(c, fu.x, seed);
-        if (h.w > dens) continue;
-        vec2 suv = ((c + 0.15 + 0.7 * h.xy) / N) * 2.0 - 1.0;
-        vec3 S = normalize(cubeDir(fu.x, suv));
-        vec3 dd = S - D;
-        vec2 delta = vec2(dot(dd, t1), dot(dd, t2));
-        float q = (Spix[1][1] * delta.x * delta.x - 2.0 * Spix[0][1] * delta.x * delta.y + Spix[0][0] * delta.y * delta.y) / det;
-        if (q > 18.0) continue;
-        float m = log(e0 + h.z * (e1 - e0)) / k;
-        float flux = exp2(-1.3288 * m);            // 10^{−0.4 m}
-        float T = starTemp(fract(h.w * 7.31 + h.x));
-        vec3 col;
-        if (shiftOn > 0.5) {
-          vec4 a = planckS(T);
-          vec4 b = planckS(T * g);
-          col = b.rgb * exp2(b.a - a.a);
-        } else col = planckS(T).rgb;
-        float l = luma(col);
-        col = max(vec3(l) + 1.2 * (col - vec3(l)), 0.0);
-        acc += col * flux * exp(-0.5 * q) / (6.2831853 * sqrt(det));
-      }
+// Lensed point stars of one layer on one cube face near D, accumulated as (Σw, Σw·ln T): the
+// flux-weighted colour temperature becomes a colour once per pixel (stars overlapping within one
+// PSF — rare — then share a hue; fluxes are exact). "reach" is the PSF's extent in the source plane
+// (radians, ≈ 4.2 σ along its major axis). Only cells whose star region (the middle 70 % of the
+// cell) lies within reach are visited — a dynamic range, one cell or none in unlensed sky — so a
+// pixel costs about one hash per layer. (With constant 3 × 3 bounds, D3D shader compilers unroll
+// and flatten the search into dozens of copies that all execute.)
+void starFace(vec3 D, vec3 fu, vec3 t1, vec3 t2, mat2 Sinv, float N, float e0, float e1, float seed, float dens, float reach, inout vec2 acc) {
+  vec2 cp = (fu.yz * 0.5 + 0.5) * N;
+  vec2 cell = floor(cp);
+  // Gnomonic face coordinates stretch by up to (1 + u² + v²) per radian; one cell is 2/N in uv.
+  float rc = reach * (1.0 + dot(fu.yz, fu.yz)) * 0.5 * N;
+  float rc2 = rc * rc;
+  ivec2 lo = ivec2(max(ceil(cp - rc - 0.85), max(cell - 1.0, vec2(0.0))));
+  ivec2 hi = ivec2(min(floor(cp + rc - 0.15), min(cell + 1.0, vec2(N - 1.0))));
+  for (int y = lo.y; y <= hi.y; y++) {
+    for (int x = lo.x; x <= hi.x; x++) {
+      vec2 c = vec2(float(x), float(y));
+      vec2 dq = max(max(c + 0.15 - cp, cp - c - 0.85), vec2(0.0));
+      if (dot(dq, dq) > rc2) continue;
+      vec4 h = cellHash(c, fu.x, seed);
+      if (h.w > dens) continue;
+      vec2 suv = ((c + 0.15 + 0.7 * h.xy) / N) * 2.0 - 1.0;
+      vec3 dd = normalize(cubeDir(fu.x, suv)) - D;
+      vec2 delta = vec2(dot(dd, t1), dot(dd, t2));
+      float q = dot(delta, Sinv * delta);
+      if (q > 18.0) continue;
+      // Magnitude by inverse CDF of dN/dm ∝ e^{k m} (k = 0.35 ln 10): m = ln(x)/k with
+      // x = e0 + h.z (e1 − e0); flux 10^{−0.4 m} = x^{−0.4 ln 10 / k} = x^{−8/7}.
+      float w = pow(e0 + h.z * (e1 - e0), -1.1428571) * exp(-0.5 * q);
+      acc += vec2(w, w * log(starTemp(fract(h.w * 7.31 + h.x))));
     }
   }
-  return acc;
+}
+
+// Colour of thermal starlight at T, shifted by g (luminance 1 at g = 1), slightly saturated.
+vec3 starColor(float T, float g, float shiftOn) {
+  vec3 col;
+  if (shiftOn > 0.5) {
+    vec4 a = planckS(T);
+    vec4 b = planckS(T * g);
+    col = b.rgb * exp2(b.a - a.a);
+  } else col = planckS(T).rgb;
+  float l = luma(col);
+  return max(vec3(l) + 1.2 * (col - vec3(l)), 0.0);
 }
 
 vec3 stars(vec3 D, vec3 Dx, vec3 Dy, float g, float shiftOn, float galDens) {
@@ -779,18 +778,32 @@ vec3 stars(vec3 D, vec3 Dx, vec3 Dy, float g, float shiftOn, float galDens) {
   float ss2 = uSigmaSrc * uSigmaSrc;
   mat2 Spix = JJ * sp2 + mat2(ss2, 0.0, 0.0, ss2);
   float tr = Spix[0][0] + Spix[1][1];
-  float dt = Spix[0][0] * Spix[1][1] - Spix[0][1] * Spix[1][0];
-  float lmax = 0.5 * tr + sqrt(max(0.25 * tr * tr - dt, 0.0));
+  float det = Spix[0][0] * Spix[1][1] - Spix[0][1] * Spix[1][0];
+  mat2 Sinv = mat2(Spix[1][1], -Spix[0][1], -Spix[1][0], Spix[0][0]) / det;
+  float lmax = 0.5 * tr + sqrt(max(0.25 * tr * tr - det, 0.0));
   float foot = sqrt(lmax);
+  vec3 fu = faceOf(D, 0);
+  // Is D close enough to a cube edge for stars across it to matter? On the neighbouring face its
+  // largest coordinate is 1/s; that face is searched when 1/s < 1 + 3/N (within 1.5 cells).
+  float s = max(abs(fu.y), abs(fu.z));
+  vec3 fu2 = s > 0.8 ? faceOf(D, 1) : fu;
+  vec2 acc = vec2(0.0);
   vec3 total = vec3(0.0);
   for (int L = 0; L < STAR_LAYERS; L++) {
     float N = uLayerN[L];
     float cellAng = 2.0 / N;
     float wPoint = 1.0 - smoothstep(0.22, 0.45, foot / cellAng);
     float dens = L == 0 ? 0.85 : clamp(0.55 + 0.45 * galDens * float(L), 0.0, 1.0);
-    if (wPoint > 0.0) total += wPoint * starLayer(D, t1, t2, Spix, N, uMagLo[L], uMagHi[L], float(L) * 17.0 + 3.0, dens, g, shiftOn, 4.25 * foot);
+    if (wPoint > 0.0) {
+      vec2 a = vec2(0.0);
+      float seed = float(L) * 17.0 + 3.0;
+      starFace(D, fu, t1, t2, Sinv, N, uLayerE0[L], uLayerE1[L], seed, dens, 4.25 * foot, a);
+      if (s * (1.0 + 3.0 / N) > 1.0) starFace(D, fu2, t1, t2, Sinv, N, uLayerE0[L], uLayerE1[L], seed, dens, 4.25 * foot, a);
+      acc += wPoint * a;
+    }
     if (wPoint < 1.0) total += (1.0 - wPoint) * uAvgStarColor * dens * uLayerMean[L] / (cellAng * cellAng);
   }
+  if (acc.x > 0.0) total += starColor(exp(acc.y / acc.x), g, shiftOn) * (acc.x / (6.2831853 * sqrt(det)));
   return total;
 }
 

@@ -81,6 +81,8 @@ export class EarthCamera {
   private q1 = new THREE.Quaternion();
   private e = new THREE.Euler();
   private readonly up = new THREE.Vector3(0, 1, 0);
+  private readonly fwd = new THREE.Vector3();
+  private readonly rel = new THREE.Vector3();
   private dragVel = { x: 0, y: 0 };
   private aspect = 16 / 9;
 
@@ -239,12 +241,19 @@ export class EarthCamera {
     return c;
   }
 
-  /** Set near/far to bracket a sphere of radius `r` at `centre` and update the projection. */
+  /**
+   * Set near/far to bracket a sphere of radius `r` at `centre` and update the projection. The planes
+   * are perpendicular to the view axis, so the bracket uses the sphere centre's depth along it, not its
+   * distance: with the body off-axis (framing offsets, Earthrise's Earth above the lunar horizon) a
+   * near plane at distance − r cuts the sphere's nearest cap — the Earth seen from the Moon had a hole
+   * in its middle.
+   */
   bracket(centre: THREE.Vector3, r: number): void {
     const c = this.camera;
     const d = c.position.distanceTo(centre);
-    c.near = Math.max(d - r, d * 2e-6, 1e-5);
-    c.far = Math.max(d + r, c.near * 4);
+    const z = this.fwd.set(0, 0, -1).applyQuaternion(c.quaternion).dot(this.rel.copy(centre).sub(c.position));
+    c.near = Math.max(z - r, d * 2e-6, 1e-5);
+    c.far = Math.max(z + r, c.near * 4);
     c.updateProjectionMatrix();
   }
 }

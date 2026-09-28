@@ -89,7 +89,15 @@ class MilkyWay implements Experience {
   private readonly v1 = new THREE.Vector3();
   private readonly v2 = new THREE.Vector3();
   private readonly sunPos = new THREE.Vector3();
+  private readonly renderOpts = { exposure: 1, frame: 0 };
   private readonly plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  /**
+   * Sun-centred views ride along with the Sun: it moves at 230 km/s (≈ 470 pc per second at the
+   * default warp), so a fixed camera would lose it within a fraction of a second. The rig is
+   * co-rotated about the Galactic Centre by the Sun's change in azimuth every frame.
+   */
+  private followSun = false;
+  private sunAz = NaN;
   private cursorR = NaN;
   private pointerSeen = false;
   private shotMode = false;
@@ -140,9 +148,11 @@ class MilkyWay implements Experience {
     if (Number.isFinite(lum) && lum > 0) {
       // Looking at a galaxy: adapt to the bright parts it is made of.
       const outside = base * THREE.MathUtils.clamp(Math.pow(1.08 / lum, 0.7), 0.25, 1.1);
-      // Surrounded by sky (inside the disk): keep the typical background dark (scene ≈ 0.05) so the
-      // band glows and the stars stand out, as in an unprocessed dark-site photograph.
-      const inside = Number.isFinite(sky) && sky > 0 ? THREE.MathUtils.clamp(0.05 / sky, 0.1 * base, 1.5 * base) : outside;
+      // Surrounded by sky (inside the disk): keep the typical background dark (scene ≈ 0.02, ≈ 8 %
+      // grey after the tone curve) so the band glows and the stars stand out, as in an unprocessed
+      // dark-site photograph; brighter than that the whole OLED frame turns into a grey-brown haze
+      // (the diffuse light at |b| ≈ 30° really is ~⅓ of the band's, so it cannot be black).
+      const inside = Number.isFinite(sky) && sky > 0 ? THREE.MathUtils.clamp(0.02 / sky, 0.1 * base, 1.5 * base) : outside;
       target = THREE.MathUtils.lerp(outside, inside, THREE.MathUtils.smoothstep(lit, 0.85, 0.99));
     }
     const tau = this.shotMode ? 0.12 : 1.1;
@@ -174,13 +184,36 @@ class MilkyWay implements Experience {
     return p.id === 'milkyway' ? 25000 : Math.min(40000, Math.max(10000, p.rMax));
   }
 
-  private setSunPosition(): void {
+  /** The Sun (render frame) at time t, Myr: its guiding centre turns at Ω(R⊙) of the equilibrium galaxy. */
+  private sunAt(t: number, out: THREE.Vector3): THREE.Vector3 {
     const s = this.layer.params.sun;
-    if (!s) return;
-    // The Sun's guiding centre moves at Ω(R⊙); the Sun itself keeps its place in the
-    // rotating frame to first order. Render frame: x = X, y = H, z = −spin·Y.
-    const phi = s.phi + this.layer.kin.potential.omega(s.R) * this.layer.time;
-    this.layer.kin.toRender(s.R * Math.cos(phi), s.R * Math.sin(phi), s.z, this.sunPos);
+    if (!s) return out.set(0, 0, 0);
+    const phi = s.phi + this.layer.kin.potential.omega(s.R, true) * t;
+    this.layer.kin.toRender(s.R * Math.cos(phi), s.R * Math.sin(phi), s.z, out);
+    return out;
+  }
+
+  /** Co-rotate the orbit rig about the Galactic Centre by the Sun's change of azimuth. */
+  private followTheSun(): void {
+    const az = Math.atan2(this.sunPos.x, this.sunPos.z);
+    let d = Number.isFinite(this.sunAz) ? az - this.sunAz : 0;
+    this.sunAz = az;
+    if (!this.followSun || this.flying || this.orbit.animating || !this.layer.params.sun) return;
+    d -= 2 * Math.PI * Math.round(d / (2 * Math.PI));
+    if (d === 0) return;
+    rotateY(this.orbit.target, d);
+    rotateY(this.orbit.goal.target, d);
+    this.orbit.yaw += d;
+    this.orbit.goal.yaw += d;
+  }
+
+  private setSunPosition(): void {
+    // The Sun's guiding centre moves at Ω(R⊙) of the equilibrium (with-halo) galaxy — the same
+    // position the layer uses for the Local Bubble and nearby clouds, also while the halo is off.
+    // Render frame: x = X, y = H, z = −spin·Y.
+    const m = this.layer.sunModel(this.v2);
+    if (!m) return;
+    this.layer.kin.toRender(m.x, m.y, m.z, this.sunPos);
   }
 
   // ——— UI ——————————————————————————————————————————————————————————————————————
@@ -439,12 +472,16 @@ class MilkyWay implements Experience {
       this.controls.fly?.set(false);
     }
     this.setSunPosition();
-    const target = v.target === 'sun' ? this.sunPos.clone() : new THREE.Vector3(...(v.target ?? [0, 0, 0]));
+    this.followSun = v.target === 'sun';
+    let target: THREE.Vector3;
     let yaw = v.yaw;
     if (v.target === 'sun') {
-      // Look from behind the Sun toward the Galactic Centre (the Sun's azimuth moves with time).
-      yaw = Math.atan2(this.sunPos.x, this.sunPos.z) + (name === 'neighbourhood' ? -0.55 : 0);
-    }
+      // Aim where the Sun will be when the flight ends (it keeps orbiting meanwhile), from behind
+      // it toward the Galactic Centre; from then on the rig follows it (see followTheSun).
+      const tEnd = this.layer.time + (this.paused ? 0 : this.warp * duration);
+      target = this.sunAt(tEnd, new THREE.Vector3());
+      yaw = Math.atan2(target.x, target.z) + (name === 'neighbourhood' ? -0.55 : 0);
+    } else target = new THREE.Vector3(...(v.target ?? [0, 0, 0]));
     const to = { target, distance: this.viewDistance(v, this.layer.params), yaw, pitch: v.pitch };
     this.fovGoal = v.fov ?? 50;
     if (duration > 0) this.orbit.flyTo(to, duration);
@@ -578,14 +615,15 @@ class MilkyWay implements Experience {
 
   update(f: FrameInfo): void {
     this.frame = f.frame;
+    if (!this.paused) this.layer.advance(this.warp * f.dt);
+    this.setSunPosition();
+    this.followTheSun();
     if (this.flying && this.fly) this.fly.update(f.dt);
     else this.orbit.update(f.dt);
     this.fov += (this.fovGoal - this.fov) * (1 - Math.exp(-f.dt / 0.5));
     if (!this.exposureLocked) this.adaptExposure(f.dt);
-    if (!this.paused) this.layer.advance(this.warp * f.dt);
     this.fadeIn = Math.min(1, this.fadeIn + f.dt / 0.8);
     this.layer.radianceScale = this.fadeIn * this.fadeIn * (3 - 2 * this.fadeIn);
-    this.setSunPosition();
   }
 
   render(target: THREE.WebGLRenderTarget): void {
@@ -596,11 +634,28 @@ class MilkyWay implements Experience {
     if (this.flying && this.fly) this.fly.applyTo(this.camera);
     else this.orbit.applyTo(this.camera);
     r.setRenderTarget(target);
-    this.layer.render(r, this.camera, target, { exposure: this.ctx.post.exposure, frame: this.frame });
+    this.renderOpts.exposure = this.ctx.post.exposure;
+    this.renderOpts.frame = this.frame;
+    this.layer.render(r, this.camera, target, this.renderOpts);
     // Headless capture on a CPU rasteriser: keep rAF from running ahead of the GPU process
     // (otherwise seconds-long frames queue up behind the screenshot). Never in normal use.
     if (this.shotMode) r.getContext().finish();
     this.updateOverlay();
+  }
+
+  /** Place a screen marker over a render-frame point (hidden behind the camera or off-screen). */
+  private placeMark(el: HTMLElement, p: THREE.Vector3, visible: boolean, minDist: number, w: number, h: number): void {
+    const cam = this.camera;
+    const v = this.v1.copy(p).project(cam);
+    const d = cam.position.distanceTo(p);
+    const on = visible && v.z < 1 && Math.abs(v.x) < 1.1 && Math.abs(v.y) < 1.1 && d > minDist;
+    const op = on ? '1' : '0';
+    if (el.style.opacity !== op) el.style.opacity = op;
+    if (!on) return;
+    const x = (v.x + 1) * 0.5 * w;
+    // Caption on the side with room for it (narrow screens: whichever half has more space).
+    el.classList.toggle('is-left', w < 720 ? x > 0.5 * w : x > w - 230);
+    el.style.transform = `translate(${x.toFixed(1)}px, ${((1 - v.y) * 0.5 * h).toFixed(1)}px)`;
   }
 
   private updateOverlay(): void {
@@ -611,27 +666,19 @@ class MilkyWay implements Experience {
     const params = this.layer.params;
 
     // Sun and Sgr A* markers.
-    const place = (el: HTMLElement, p: THREE.Vector3, visible: boolean, minDist = 0) => {
-      const v = this.v1.copy(p).project(cam);
-      const d = camPos.distanceTo(p);
-      const on = visible && v.z < 1 && Math.abs(v.x) < 1.1 && Math.abs(v.y) < 1.1 && d > minDist;
-      el.style.opacity = on ? '1' : '0';
-      if (!on) return;
-      const x = (v.x + 1) * 0.5 * w;
-      el.classList.toggle('is-left', x > w - 230);
-      el.style.transform = `translate(${x.toFixed(1)}px, ${((1 - v.y) * 0.5 * h).toFixed(1)}px)`;
-    };
     // With the halo removed the orbits are integrated, so the analytic Sun and arm loci no longer apply.
     const dm = this.layer.darkMatter;
-    place(this.sunMark, this.sunPos, this.showSun && !!params.sun && dm, 20);
+    this.placeMark(this.sunMark, this.sunPos, this.showSun && !!params.sun && dm, 20, w, h);
     this.v2.set(0, 0, 0);
     const dGC = camPos.length();
-    place(this.bhMark, this.v2, this.showLabels && params.id === 'milkyway' && dGC > 300 && dGC < 16000 && (Math.abs(camPos.y) > 800 || dGC < 3000));
+    this.placeMark(this.bhMark, this.v2, this.showLabels && params.id === 'milkyway' && dGC > 300 && dGC < 16000 && (Math.abs(camPos.y) > 800 || dGC < 3000), 0, w, h);
 
     // Arm names (Milky Way), riding with the pattern.
     const k = this.layer.kin;
     const list = params.spiral.armList;
-    const labelsOn = this.showLabels && dm && !!list && w > 720 && camPos.length() > 9000 && camPos.length() < 120000;
+    // Arm names lie in the plane: seen nearly edge-on they collapse onto one line, so hide them.
+    const elev = Math.abs(camPos.y) / Math.max(camPos.length(), 1);
+    const labelsOn = this.showLabels && dm && !!list && w > 720 && elev > 0.2 && camPos.length() > 9000 && camPos.length() < 120000;
     if (labelsOn && Math.abs(this.layer.time - this.labelsPlacedAt) > 40) this.placeArmLabels();
     for (const a of this.armLabels) {
       if (!labelsOn || !list) {
@@ -690,6 +737,14 @@ class MilkyWay implements Experience {
     for (const a of this.armLabels) a.el.remove();
     this.armLabels = [];
   }
+}
+
+/** Rotate v about the y axis (the Galactic pole) by a radians: azimuth atan2(x, z) grows by a. */
+function rotateY(v: THREE.Vector3, a: number): void {
+  const c = Math.cos(a), s = Math.sin(a);
+  const x = v.x, z = v.z;
+  v.x = x * c + z * s;
+  v.z = -x * s + z * c;
 }
 
 export default () => new MilkyWay();

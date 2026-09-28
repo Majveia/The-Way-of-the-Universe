@@ -35,6 +35,10 @@ vec3 segW(vec3 x) {
   vec3 big = (1.0 - exp(-x)) / max(x, vec3(1e-5));
   return mix(1.0 - 0.5 * x, big, step(vec3(1e-3), x));
 }
+// segW with e^{−x} already known (shared with the running transmittance).
+vec3 segWe(vec3 x, vec3 e) {
+  return mix(1.0 - 0.5 * x, (1.0 - e) / max(x, vec3(1e-5)), step(vec3(1e-3), x));
+}
 float segW1(float x) {
   return x < 1e-3 ? 1.0 - 0.5 * x : (1.0 - exp(-x)) / x;
 }

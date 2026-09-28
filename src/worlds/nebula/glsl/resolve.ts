@@ -23,6 +23,7 @@ uniform mat3 uViewToLocal;
 uniform vec3 uCamLocal;
 uniform mat4 uPrevVP;
 uniform float uAlpha;
+uniform float uAlphaSlow;  // blend weight for pixels whose reprojection moved < ~¼ pixel
 uniform float uClip;
 uniform float uHasHist;
 uniform float uSharp;
@@ -111,7 +112,10 @@ void main() {
       vec4 lo = mean - 1.25 * sd - vec4(vec3(0.002), 0.01);
       vec4 hi = mean + 1.25 * sd + vec4(vec3(0.002), 0.01);
       hist = mix(hist, clamp(hist, lo, hi), uClip);
-      float a = clamp(uAlpha * mix(0.7, 1.0, wmax), 0.0, 1.0);
+      // Motion-adaptive weight: a slow drift (auto-rotation moves the view ~0.3 px per frame)
+      // keeps accumulating like a still camera; only real motion falls back to the fast blend.
+      float motion = smoothstep(0.25, 2.0, length(dpx));
+      float a = clamp(mix(min(uAlphaSlow, uAlpha), uAlpha, motion) * mix(0.7, 1.0, wmax), 0.0, 1.0);
       res = mix(hist, cur, a);
     }
   }

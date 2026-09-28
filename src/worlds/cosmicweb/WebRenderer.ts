@@ -45,6 +45,7 @@ import {
   type AccumMode,
   type AtlasMode,
   type TargetSpec,
+  type WebFormats,
 } from './formats';
 
 export interface WebRendererOptions {
@@ -63,6 +64,8 @@ export interface WebRendererOptions {
   varBright: number;
   /** Quality detail (0.35 … 1.6). */
   detail: number;
+  /** Force target formats (testing the fallback paths); normally chosen from the device's extensions. */
+  formats?: Partial<WebFormats>;
 }
 
 export interface WebFrameState {
@@ -96,10 +99,22 @@ export interface WebFrameState {
   cmb: { T: number; radiance: number; aniso: number } | null;
 }
 
+/**
+ * One keyframe texture: RGB16UI, 16-bit box fractions, one texel per particle. Uploaded with raw
+ * texSubImage2D straight from the decoded keyframe (no repacking on the main thread), in row
+ * slices when it is staged ahead of time.
+ */
 interface Slot {
-  tex: THREE.DataTexture;
-  data: Uint16Array;
+  tex: THREE.ExternalTexture;
+  gl: WebGLTexture;
+  /** Keyframe whose upload is complete (−1: none). */
   frame: number;
+  /** Keyframe being uploaded in slices (−1: none), its source array and the rows done. */
+  pending: number;
+  src: Uint16Array | null;
+  rows: number;
+  /** Last use (for choosing which slot to overwrite). */
+  used: number;
 }
 
 /** Pure additive blending (ONE, ONE): three's AdditiveBlending multiplies by source alpha. */
@@ -132,6 +147,11 @@ const VOID_FADE = new THREE.Vector2(0.12, 0.3);
  */
 const THIN = new THREE.Vector3(2.0, 1.0, 0.1);
 
+/** Framebuffer-completeness answers per renderer and target format (see complete()). */
+const completeCache = new WeakMap<THREE.WebGLRenderer, Map<string, boolean>>();
+/** ALIASED_POINT_SIZE_RANGE per renderer (a synchronous query; asked once). */
+const pointSizeCache = new WeakMap<THREE.WebGLRenderer, number>();
+
 const tmpColor = new THREE.Color();
 const tmpSize = new THREE.Vector2();
 
@@ -140,12 +160,24 @@ export class WebRenderer {
   private renderer: THREE.WebGLRenderer;
   private texW: number;
   private texH: number;
+  /** Three keyframe slots: A, B and one being filled ahead of time for the next interval. */
   private slots: Slot[];
-  /** A keyframe pre-packed into upload layout ahead of time (see stage()). */
-  private staged: { data: Uint16Array | null; frame: number; src: Uint16Array | null; i: number } = { data: null, frame: -1, src: null, i: 0 };
-  /** Keyframe index currently bound as A and B. */
+  private useClock = 0;
+  /** Keyframe index currently bound as A and B, and their slots. */
   private boundA = -1;
   private boundB = -1;
+  private slotA = -1;
+  private slotB = -1;
+  /**
+   * True once every program is compiled and linked. Programs are compiled asynchronously
+   * (KHR_parallel_shader_compile via compileAsync) and nothing is drawn before, so first use never
+   * blocks a frame on a driver compile (tens to hundreds of ms per program on ANGLE/D3D11).
+   */
+  ready = false;
+  readonly whenReady: Promise<void>;
+  private disposed = false;
+  /** The one-off warm-up draw has been made (see warmDraw()). */
+  private warmed = false;
   // Density atlas
   readonly grid: number;
   private tilesX: number;
@@ -214,30 +246,26 @@ export class WebRenderer {
     this.renderer = renderer;
     this.opts = opts;
     const N = opts.count;
-    const gl = renderer.getContext();
-    const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array | null;
-    this.maxPointSize = range && range[1] > 1 ? range[1] : 64;
-    const fm = chooseFormats({
-      colorBufferFloat: renderer.extensions.has('EXT_color_buffer_float'),
-      colorBufferHalfFloat: renderer.extensions.has('EXT_color_buffer_half_float'),
-      floatBlend: renderer.extensions.has('EXT_float_blend'),
-    });
-    // Keyframe textures.
+    let maxPt = pointSizeCache.get(renderer);
+    if (maxPt === undefined) {
+      const gl = renderer.getContext();
+      const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array | null;
+      maxPt = range && range[1] > 1 ? range[1] : 64;
+      pointSizeCache.set(renderer, maxPt);
+    }
+    this.maxPointSize = maxPt;
+    const fm = {
+      ...chooseFormats({
+        colorBufferFloat: renderer.extensions.has('EXT_color_buffer_float'),
+        colorBufferHalfFloat: renderer.extensions.has('EXT_color_buffer_half_float'),
+        floatBlend: renderer.extensions.has('EXT_float_blend'),
+      }),
+      ...opts.formats,
+    };
+    // Keyframe textures (see Slot).
     this.texW = N >= 1 << 21 ? 2048 : 1024;
     this.texH = Math.ceil(N / this.texW);
-    // RGBA16UI (three's WebGL backend has no RGB integer upload path); xyz = position, w unused.
-    this.slots = [0, 1].map(() => {
-      const data = new Uint16Array(this.texW * this.texH * 4);
-      const tex = new THREE.DataTexture(data, this.texW, this.texH, THREE.RGBAIntegerFormat, THREE.UnsignedShortType);
-      tex.internalFormat = 'RGBA16UI';
-      tex.minFilter = THREE.NearestFilter;
-      tex.magFilter = THREE.NearestFilter;
-      tex.generateMipmaps = false;
-      tex.flipY = false;
-      tex.unpackAlignment = 8;
-      tex.needsUpdate = true;
-      return { tex, data, frame: -1 };
-    });
+    this.slots = [0, 1, 2].map(() => this.makeSlot());
     // Density atlas: G³ with G ≈ 64 (a few Mpc) — smooth enough for colour and smoothing lengths.
     const G = opts.np >= 128 ? 96 : Math.min(64, opts.np);
     this.grid = G;
@@ -448,10 +476,30 @@ export class WebRenderer {
 
     // Field galaxies: a fixed random subset of particles (index buffer over the particle attributes).
     const frac = Math.min(1, 0.05 * Math.pow(128 / opts.np, 3) * Math.max(0.6, opts.detail));
-    const all = new Uint32Array(N);
+    // Selection by an inline integer hash (a 2M-particle pass of the general hash01 cost ~50 ms here).
+    const thr = Math.floor(frac * 4294967296);
+    const pick = (i: number) => {
+      let h = Math.imul(i ^ 0x9e3779b9, 0x85ebca6b);
+      h ^= h >>> 13;
+      h = Math.imul(h, 0xc2b2ae35);
+      h ^= h >>> 16;
+      return h >>> 0 < thr;
+    };
+    // One pass into a buffer sized for the expected count (+10 σ); a second pass only on overflow.
+    const cap = Math.min(N, Math.ceil(N * frac + 10 * Math.sqrt(N * frac + 1) + 64));
+    let buf = new Uint32Array(cap);
     let nIdx = 0;
-    for (let i = 0; i < N; i++) if (hash01(i, 9173) < frac) all[nIdx++] = i;
-    const idx = all.slice(0, nIdx);
+    for (let i = 0; i < N && nIdx <= cap; i++) if (pick(i)) {
+      if (nIdx < cap) buf[nIdx] = i;
+      nIdx++;
+    }
+    if (nIdx > cap) {
+      nIdx = 0;
+      for (let i = 0; i < N; i++) if (pick(i)) nIdx++;
+      buf = new Uint32Array(nIdx);
+      for (let i = 0, j = 0; i < N; i++) if (pick(i)) buf[j++] = i;
+    }
+    const idx = nIdx === buf.length ? buf : buf.slice(0, nIdx);
     this.fieldCount = nIdx;
     this.fieldGeo = new THREE.BufferGeometry();
     this.fieldGeo.setAttribute('aDelta', this.particleGeo.getAttribute('aDelta'));
@@ -502,6 +550,10 @@ export class WebRenderer {
       vertexShader: CMB_VERT,
       fragmentShader: CMB_FRAG,
       uniforms: { uT: { value: 3000 }, uRadiance: { value: 1 }, uAniso: { value: 0 }, uSeed: { value: 17.3 } },
+      // Additive like every other pass (it is the first thing drawn into a cleared target, so the
+      // result is the same), which keeps the warm-up draw invisible over a caller's scene too.
+      ...ADDITIVE,
+      transparent: true,
       side: THREE.BackSide,
       depthTest: false,
       depthWrite: false,
@@ -512,6 +564,7 @@ export class WebRenderer {
     this.cmbMesh.renderOrder = 0;
 
     this.hdrScene.add(this.cmbMesh, this.compositeMesh, this.fieldPoints, this.galaxyPoints, this.outline);
+    this.whenReady = this.warm();
   }
 
   private makeTarget(w: number, h: number, spec: TargetSpec): THREE.WebGLRenderTarget {
@@ -526,8 +579,25 @@ export class WebRenderer {
     });
   }
 
-  /** Is this target renderable on this device? (Bind it once and ask the driver.) */
+  /**
+   * Is this target renderable on this device? (Bind it once and ask the driver.) The answer depends
+   * only on the format, and checkFramebufferStatus is a synchronous round trip to the GPU process
+   * (it waits for all queued work: 70–200 ms mid-playback in tests), so it is asked once per
+   * renderer and format — by the small glow renderer created at mount, not when a run starts.
+   */
   private complete(rt: THREE.WebGLRenderTarget): boolean {
+    const r = this.renderer;
+    const key = `${rt.texture.type}:${rt.texture.format}`;
+    let known = completeCache.get(r);
+    if (!known) completeCache.set(r, (known = new Map()));
+    const hit = known.get(key);
+    if (hit !== undefined) return hit;
+    const ok = this.checkComplete(rt);
+    known.set(key, ok);
+    return ok;
+  }
+
+  private checkComplete(rt: THREE.WebGLRenderTarget): boolean {
     const r = this.renderer;
     const prev = r.getRenderTarget();
     r.setRenderTarget(rt);
@@ -537,82 +607,170 @@ export class WebRenderer {
     return ok;
   }
 
-  /** Point the A/B slots at two decoded keyframes (uploads only what changed). */
+  private makeSlot(): Slot {
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    const t = gl.createTexture()!;
+    const st = this.renderer.state;
+    st.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGB16UI, this.texW, this.texH);
+    st.unbindTexture();
+    return { tex: new THREE.ExternalTexture(t), gl: t, frame: -1, pending: -1, src: null, rows: 0, used: 0 };
+  }
+
+  /** Upload rows [r0, r1) of keyframe positions `pos` (xyz uint16 per particle) into a slot. */
+  private uploadRows(s: Slot, pos: Uint16Array, r0: number, r1: number): void {
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    const st = this.renderer.state;
+    const W = this.texW;
+    const n = Math.min(pos.length / 3, W * this.texH);
+    const fullRows = Math.floor(n / W);
+    st.bindTexture(gl.TEXTURE_2D, s.gl);
+    st.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+    st.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+    st.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
+    st.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
+    st.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false as unknown as number);
+    st.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false as unknown as number);
+    const a = r0, b = Math.min(r1, fullRows);
+    if (b > a) gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, a, W, b - a, gl.RGB_INTEGER, gl.UNSIGNED_SHORT, pos, a * W * 3);
+    // A last, partial row.
+    const rem = n - fullRows * W;
+    if (rem > 0 && r1 > fullRows && r0 <= fullRows) gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, fullRows, rem, 1, gl.RGB_INTEGER, gl.UNSIGNED_SHORT, pos, fullRows * W * 3);
+    st.unbindTexture();
+  }
+
+  private findSlot(frame: number): number {
+    for (let i = 0; i < 3; i++) if (this.slots[i].frame === frame) return i;
+    return -1;
+  }
+
+  /** Slot (other than k1, k2) with an upload of `frame` in progress — from `src`, if given. */
+  private pendingSlot(frame: number, src: Uint16Array | null, k1: number, k2: number): number {
+    for (let j = 0; j < 3; j++) {
+      const s = this.slots[j];
+      if (j !== k1 && j !== k2 && s.pending === frame && (!src || s.src === src)) return j;
+    }
+    return -1;
+  }
+
+  /** Least recently used slot, other than those listed. */
+  private victim(x: number, y: number): number {
+    let best = -1;
+    for (let i = 0; i < 3; i++) {
+      if (i === x || i === y) continue;
+      if (best < 0 || this.slots[i].used < this.slots[best].used) best = i;
+    }
+    return best;
+  }
+
+  /** Make keyframe `frame` resident in a slot other than `k1`/`k2` (synchronous upload if needed). */
+  private ensure(frame: number, pos: Uint16Array, k1: number, k2: number): number {
+    let i = this.findSlot(frame);
+    if (i >= 0) return i;
+    // A staged upload in progress for this frame: finish it.
+    i = this.pendingSlot(frame, pos, k1, k2);
+    if (i < 0) {
+      i = this.victim(k1, k2);
+      this.slots[i].rows = 0;
+    }
+    const s = this.slots[i];
+    s.frame = -1;
+    this.uploadRows(s, pos, s.rows, this.texH);
+    s.frame = frame;
+    s.pending = -1;
+    s.src = null;
+    s.rows = this.texH;
+    return i;
+  }
+
+  /** Point the A/B slots at two decoded keyframes (uploads only what is not already resident). */
   setKeyframes(a: number, posA: Uint16Array, b: number, posB: Uint16Array): void {
     if (this.boundA === a && this.boundB === b) return;
-    const s = this.slots;
-    const find = (k: number) => (s[0].frame === k ? 0 : s[1].frame === k ? 1 : -1);
-    let ia = find(a);
-    let ib = find(b);
-    if (ia < 0 && ib < 0) {
-      ia = 0;
-      ib = a === b ? 0 : 1;
-      this.upload(ia, a, posA);
-      if (ib !== ia) this.upload(ib, b, posB);
-    } else if (ia < 0) {
-      ia = ib === 0 ? 1 : 0;
-      if (a === b) ia = ib;
-      else this.upload(ia, a, posA);
-    } else if (ib < 0) {
-      ib = ia === 0 ? 1 : 0;
-      if (a === b) ib = ia;
-      else this.upload(ib, b, posB);
-    }
-    this.shared.uPosA.value = s[ia].tex;
-    this.shared.uPosB.value = s[ib].tex;
+    const ia = this.ensure(a, posA, this.findSlot(b), -1);
+    this.slots[ia].used = ++this.useClock;
+    const ib = a === b ? ia : this.ensure(b, posB, ia, -1);
+    this.slots[ib].used = ++this.useClock;
+    this.shared.uPosA.value = this.slots[ia].tex;
+    this.shared.uPosB.value = this.slots[ib].tex;
+    this.slotA = ia;
+    this.slotB = ib;
     this.boundA = a;
     this.boundB = b;
     this.densityDirty = true;
   }
 
-  private upload(slot: number, frame: number, pos: Uint16Array): void {
-    const s = this.slots[slot];
-    const g = this.staged;
-    const n = Math.min(pos.length / 3, s.data.length / 4);
-    if (g.data && g.frame === frame && g.src === pos && g.i >= n) {
-      // Already packed during the previous frames: swap buffers, upload only.
-      const t = s.data;
-      s.data = g.data;
-      g.data = t;
-      g.frame = -1;
-      g.src = null;
-      (s.tex.image as { data: Uint16Array }).data = s.data;
-    } else {
-      const d = s.data;
-      for (let i = 0, j = 0, k = 0; i < n; i++, j += 3, k += 4) {
-        d[k] = pos[j];
-        d[k + 1] = pos[j + 1];
-        d[k + 2] = pos[j + 2];
-      }
-    }
-    s.tex.needsUpdate = true;
-    s.frame = frame;
+  /** Is keyframe `frame` fully uploaded (setKeyframes with it costs nothing)? */
+  isResident(frame: number): boolean {
+    return this.findSlot(frame) >= 0;
   }
 
   /**
-   * Pack keyframe `frame` (decoded positions `pos`) into upload layout, at most `budget` particles
-   * per call. Called once per frame while playback approaches it, so the switch costs only the
-   * GPU upload. Returns true when the frame is ready (or already resident).
+   * Upload keyframe `frame` (decoded positions `pos`) ahead of time into the slot not bound as A or
+   * B, at most `budget` particles per call. Called once per frame while playback approaches it, so
+   * crossing into the next interval costs no upload at all. Returns true when the frame is resident.
    */
   stage(frame: number, pos: Uint16Array, budget: number): boolean {
-    if (this.slots[0].frame === frame || this.slots[1].frame === frame) return true;
-    const g = this.staged;
-    g.data ??= new Uint16Array(this.texW * this.texH * 4);
-    if (g.frame !== frame || g.src !== pos) {
-      g.frame = frame;
-      g.src = pos;
-      g.i = 0;
+    if (this.findSlot(frame) >= 0) return true;
+    let i = this.pendingSlot(frame, null, this.slotA, this.slotB);
+    if (i < 0) {
+      i = this.victim(this.slotA, this.slotB);
+      if (i < 0) return false;
     }
-    const d = g.data;
-    const n = Math.min(pos.length / 3, d.length / 4);
-    const end = Math.min(n, g.i + budget);
-    for (let i = g.i, j = 3 * g.i, k = 4 * g.i; i < end; i++, j += 3, k += 4) {
-      d[k] = pos[j];
-      d[k + 1] = pos[j + 1];
-      d[k + 2] = pos[j + 2];
+    const s = this.slots[i];
+    if (s.pending !== frame || s.src !== pos) {
+      s.pending = frame;
+      s.src = pos;
+      s.rows = 0;
+      s.frame = -1;
     }
-    g.i = end;
-    return end >= n;
+    const rows = Math.max(1, Math.ceil(budget / this.texW));
+    const end = Math.min(this.texH, s.rows + rows);
+    this.uploadRows(s, pos, s.rows, end);
+    s.rows = end;
+    if (end < this.texH) return false;
+    s.frame = frame;
+    s.pending = -1;
+    s.src = null;
+    s.used = ++this.useClock;
+    return true;
+  }
+
+  /**
+   * Compile every program without blocking (the promise resolves when they are linked; drawing
+   * waits for it). Materials must exist; programs are shared with any renderer already using them.
+   */
+  private warm(): Promise<void> {
+    const r = this.renderer;
+    const prev = r.getRenderTarget();
+    // Program variants depend on the bound target (colour space, tone mapping): all passes draw
+    // into render targets, so compile with one bound.
+    r.setRenderTarget(this.accum);
+    this.quad.material = this.blurMat;
+    const scenes: THREE.Object3D[] = [this.depositScene, this.accumScene, this.replicaScene, this.hdrScene, this.quad.scene];
+    // Without KHR_parallel_shader_compile (compileAsync would only warn and poll) link now: this
+    // renderer is built at mount or when a run reports in, not in the middle of playback.
+    const parallel = r.extensions.has('KHR_parallel_shader_compile');
+    let jobs: Promise<unknown>[] = [];
+    try {
+      if (parallel) jobs = scenes.map((sc) => r.compileAsync(sc, this.orthoCam));
+      else for (const sc of scenes) r.compile(sc, this.orthoCam);
+    } catch {
+      jobs = [];
+    }
+    r.setRenderTarget(prev);
+    if (!parallel) {
+      this.ready = true;
+      return Promise.resolve();
+    }
+    // Never wait forever (a lost context or a driver that never reports completion).
+    const timeout = new Promise<void>((res) => setTimeout(res, 4000));
+    return Promise.race([Promise.all(jobs).then(() => undefined), timeout]).then(() => {
+      if (!this.disposed) this.ready = true;
+    });
   }
 
   /** Resolved galaxies for the displayed interval: merge catalogs A and B by galaxy id. */
@@ -722,8 +880,65 @@ export class WebRenderer {
     this.shared.uDensity.value = this.atlasB.texture;
   }
 
+  /**
+   * Draw every pass once — one invisible particle each — into the same target formats, blend
+   * states and primitive types as real use. Drivers build some pipeline variants only at the first
+   * draw (ANGLE/D3D11 compiles the point-sprite geometry shader then; Metal and Vulkan build a
+   * pipeline per program × target format × blend state), which otherwise stalls the frame in which
+   * e.g. the first galaxies appear, mid-playback. Done once per renderer, the first frame it is
+   * ready: at mount (the small glow renderer) and when a run starts — never mid-playback. The GL
+   * programs, and so the drivers' variant caches, are shared by every renderer.
+   */
+  private warmDraw(target: THREE.WebGLRenderTarget | null, camera: THREE.PerspectiveCamera): void {
+    this.warmed = true;
+    const r = this.renderer;
+    const N = this.opts.count;
+    const noGalaxies = this.galaxyCount === 0;
+    if (noGalaxies) {
+      const one = { count: 1, id: new Uint32Array(1), host: new Uint32Array(1), mstar: new Float32Array([1e10]), blue: new Float32Array(1) } as unknown as GalaxyCatalog;
+      this.setGalaxies(one, one);
+    }
+    const am = this.accumMat.uniforms, rm = this.replicaMat.uniforms, cm = this.compositeMat.uniforms;
+    const gm = this.galaxyMat.uniforms, fm = this.fieldMat.uniforms, km = this.cmbMat.uniforms;
+    const saved = [am.uGain.value, rm.uGain.value, cm.uBright.value, gm.uLumScale.value, fm.uLumScale.value, km.uRadiance.value] as number[];
+    am.uGain.value = rm.uGain.value = cm.uBright.value = gm.uLumScale.value = fm.uLumScale.value = km.uRadiance.value = 0;
+    const vis = [this.cmbMesh.visible, this.compositeMesh.visible, this.fieldPoints.visible, this.galaxyPoints.visible, this.outline.visible];
+    this.cmbMesh.visible = this.compositeMesh.visible = this.fieldPoints.visible = this.galaxyPoints.visible = this.outline.visible = true;
+    const outlineColor = this.outlineMat.color.getHex();
+    this.outlineMat.color.setRGB(0, 0, 0);
+    this.particleGeo.setDrawRange(0, 1);
+    this.replicaGeo.setDrawRange(0, 1);
+    this.fieldGeo.setDrawRange(0, 1);
+    const prevTarget = r.getRenderTarget();
+    r.getClearColor(tmpColor);
+    const clearAlpha = r.getClearAlpha();
+    r.setClearColor(0x000000, 0);
+    this.density();
+    r.setRenderTarget(this.accum);
+    r.clear(true, false, false);
+    r.render(this.accumScene, camera);
+    r.render(this.replicaScene, camera);
+    r.setRenderTarget(target);
+    r.render(this.hdrScene, camera);
+    // Restore.
+    r.setRenderTarget(this.accum);
+    r.clear(true, false, false);
+    r.setRenderTarget(prevTarget);
+    r.setClearColor(tmpColor, clearAlpha);
+    this.particleGeo.setDrawRange(0, N);
+    this.replicaGeo.setDrawRange(0, Infinity);
+    this.fieldGeo.setDrawRange(0, Infinity);
+    this.outlineMat.color.setHex(outlineColor);
+    [am.uGain.value, rm.uGain.value, cm.uBright.value, gm.uLumScale.value, fm.uLumScale.value, km.uRadiance.value] = saved;
+    [this.cmbMesh.visible, this.compositeMesh.visible, this.fieldPoints.visible, this.galaxyPoints.visible, this.outline.visible] = vis;
+    if (noGalaxies) this.galaxyCount = 0;
+    this.densityDirty = true;
+  }
+
   /** Render the web into `target` (linear HDR, already cleared) with `camera`. */
   render(target: THREE.WebGLRenderTarget | null, camera: THREE.PerspectiveCamera, st: WebFrameState, hasParticles: boolean): void {
+    if (!this.ready) return;
+    if (!this.warmed) this.warmDraw(target, camera);
     const r = this.renderer;
     const S = this.shared;
     // Follow the target (dynamic resolution) and the pixel density.
@@ -903,7 +1118,13 @@ export class WebRenderer {
   }
 
   dispose(): void {
-    for (const s of this.slots) s.tex.dispose();
+    this.disposed = true;
+    this.ready = false;
+    const gl = this.renderer.getContext();
+    for (const s of this.slots) {
+      s.tex.dispose();
+      gl.deleteTexture(s.gl);
+    }
     this.atlasA.dispose();
     this.atlasB.dispose();
     this.accum.dispose();

@@ -29,10 +29,12 @@ import { DepthSlicer } from './DepthSlices';
 import { Labels, type LabelCandidate } from './Labels';
 import { rockGeometry, rockMaterial } from './Rocks';
 import { SunGlare } from './SunGlare';
-import { CometTails, type CometCandidate } from './CometTails';
+import { CometTails, TAIL_LOW_RES, type CometCandidate } from './CometTails';
+import { TailComposite } from './TailComposite';
 import { sampleHildas, sampleKuiper, sampleMainBelt, sampleNEAs, sampleOort, sampleTrojans } from '../belts';
 
 export type ScaleMode = 'true' | 'enlarged';
+const BELT_KEYS = ['main', 'hildas', 'trojans', 'neas', 'kuiper', 'oort'] as const;
 
 export interface SolarLayerSettings {
   orbits: boolean;
@@ -169,6 +171,9 @@ export class SolarSystemLayer {
   private glare: SunGlare;
   /** Comae, dust and ion tails of the active comets. */
   readonly tails: CometTails;
+  /** The tails draw in their own pass (full-resolution part + reduced-resolution part). */
+  private tailScene = new THREE.Scene();
+  private tailLow: TailComposite | null = null;
   private cometCands: CometCandidate[] = [];
   private occList: BodyRender[] = [];
   private overlayNear = 1e-9;
@@ -231,7 +236,13 @@ export class SolarSystemLayer {
     this.sprites = new BodySprites(model.bodies.length + 4, this.occ);
     this.glare = new SunGlare(this.occ);
     this.tails = new CometTails(this.detail, this.occ);
-    this.overlayScene.add(this.glare.object, this.orbits.object, this.tails.object, this.sprites.object);
+    this.overlayScene.add(this.glare.object, this.orbits.object, this.sprites.object);
+    this.tailScene.add(this.tails.object);
+    // Large tail splats go to a quarter-resolution RGBA16F target (needs half-float render targets:
+    // EXT_color_buffer_float or EXT_color_buffer_half_float; without them everything stays full-res).
+    const ext = renderer.extensions;
+    if (ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float')) this.tailLow = new TailComposite();
+    this.tails.lowRes = this.tailLow !== null;
     const d = this.detail;
     const n = (x: number) => Math.max(500, Math.round(x * d));
     // Reference fluxes chosen so a 10 km, p = 0.1 asteroid at r = 2.7 AU, Δ = 2 AU is display ≈ 1.
@@ -532,6 +543,8 @@ export class SolarSystemLayer {
         nc++;
       }
     }
+    // Fill-rate budget for the tails: ~4 fragments per screen pixel at full detail.
+    this.tails.budget = this.width * this.height * 4 * Math.min(1, Math.max(0.3, this.detail));
     this.tails.update(this.cometCands, nc, {
       jd,
       sunRel: this.sunRel,
@@ -540,19 +553,24 @@ export class SolarSystemLayer {
       exposure: expo,
       selected: this.selected,
       occ: this.occ,
+      view: this.camera.matrixWorldInverse,
+      tanX: Math.tan(fov / 2) * this.camera.aspect,
+      tanY: Math.tan(fov / 2),
     });
 
     // 6. Belts.
     const s = this.settings;
     const camR = cam.length();
     const bm = this.belts;
-    for (const k of ['main', 'hildas', 'trojans', 'neas', 'kuiper', 'oort'] as const) {
+    for (const k of BELT_KEYS) {
       const belt = bm[k];
       let fade: number;
       if (k === 'oort') fade = s.oort ? THREE.MathUtils.smoothstep(camR, 400, 3000) : 0;
       // From inside ~15 AU the Kuiper belt surrounds us and is far too faint to see: fade it in from afar.
       else if (k === 'kuiper') fade = s.kuiper ? THREE.MathUtils.smoothstep(camR, 12, 30) : 0;
-      else fade = s.asteroids ? 1 - THREE.MathUtils.smoothstep(camR, 400, 3000) : 0;
+      // The inner populations (2–5 AU) shrink to a few arc-minutes from the Kuiper belt outward, where
+      // 100 000 additive points would pile up into a bright smudge around the Sun: fade them out.
+      else fade = s.asteroids ? 1 - THREE.MathUtils.smoothstep(camR, 60, 130) : 0;
       belt.fade = fade / expo;
       if (fade > 0) {
         belt.update(jd, this.sunRel, pa, this.pixelRatio, this.maxPointSize);
@@ -735,6 +753,18 @@ export class SolarSystemLayer {
     cam.updateProjectionMatrix();
     this.orbits.near = this.overlayNear * 1.001;
     r.render(this.overlayScene, cam);
+    if (this.tails.active) {
+      const low = this.tails.lowUsed ? this.tailLow : null;
+      this.tails.setPass(low ? 1 : 0);
+      r.render(this.tailScene, cam);
+      if (low) {
+        low.setSize(target.width, target.height, TAIL_LOW_RES);
+        this.tails.setPass(2, low.height / Math.max(1, this.height));
+        low.begin(r);
+        r.render(this.tailScene, cam);
+        low.end(r, target);
+      }
+    }
     cam.near = 1e-9;
     cam.far = 1e7;
     cam.updateProjectionMatrix();
@@ -848,6 +878,7 @@ export class SolarSystemLayer {
     this.sprites.dispose();
     this.glare.dispose();
     this.tails.dispose();
+    this.tailLow?.dispose();
     for (const b of Object.values(this.belts)) b.dispose();
     this.labels?.dispose();
   }

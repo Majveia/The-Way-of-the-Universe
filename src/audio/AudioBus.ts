@@ -57,6 +57,10 @@ export class AudioBus {
   private mood: { name: string; params: MoodParams } = { name: 'silence', params: {} };
   private suspendTimer = 0;
   private listeners = new Set<() => void>();
+  /** In-flight engine load: concurrent enable() calls (on → off → on within the lazy import) share it. */
+  private loading: Promise<void> | null = null;
+  /** Suspended because the page went to the background (not by the listener). */
+  private parked = false;
   enabled = false;
   volume = 0.7;
   options: SoundOptions = { music: false, ambience: true, ui: false };
@@ -66,6 +70,21 @@ export class AudioBus {
       const p = loadPrefs();
       this.volume = p.volume;
       this.options = p.options;
+    }
+    // Background tab / locked phone: stop the audio thread (battery), resume on return.
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (!this.ctx) return;
+        if (document.hidden) {
+          if (this.ctx.state === 'running') {
+            this.parked = true;
+            void this.ctx.suspend().catch(() => undefined);
+          }
+        } else if (this.parked) {
+          this.parked = false;
+          if (this.enabled) void this.ctx.resume().catch(() => undefined);
+        }
+      });
     }
   }
 
@@ -88,15 +107,26 @@ export class AudioBus {
       this.master.connect(comp).connect(this.ctx.destination);
     }
     this.enabled = true;
+    this.parked = false;
     this.emit();
-    await this.ctx.resume();
+    const ctx = this.ctx;
+    await ctx.resume().catch(() => undefined);
     if (!this.engine && this.engineFactory) {
-      this.engine = await this.engineFactory();
-      this.engine.start(this.ctx, this.master!);
-      this.engine.configure?.(this.options);
-      this.engine.setMood(this.mood.name, this.mood.params);
+      // One engine per bus, however many enable() calls race through the lazy import.
+      this.loading ??= this.engineFactory().then((engine) => {
+        this.engine = engine;
+        engine.start(ctx, this.master!);
+        engine.configure?.(this.options);
+        engine.setMood(this.mood.name, this.mood.params);
+      });
+      try {
+        await this.loading;
+      } catch (e) {
+        this.loading = null;
+        throw e;
+      }
     }
-    if (!this.enabled) return;
+    if (!this.enabled || !this.master) return;
     this.master!.gain.cancelScheduledValues(this.ctx.currentTime);
     this.master!.gain.setTargetAtTime(this.volume, this.ctx.currentTime, 0.8);
   }

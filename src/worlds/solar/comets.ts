@@ -15,7 +15,7 @@
  * from the point of release, so the tail points anti-sunward, aberrated by the comet's own motion:
  * tan ψ ≈ v⊥ / u_sw (a few degrees). Colour: CO⁺ comet-tail band system (≈ 400–430 nm) — blue.
  *
- * Coma — isotropic outflow at v_gas ≈ 0.85 r^−0.5 km/s (Delsemme 1982) with photodissociation
+ * Coma — isotropic outflow at v_gas ≈ 0.85 r^−0.5 km/s (Cochran & Schleicher 1993, Icarus 105:235; Delsemme 1982 gives 0.58 r^−0.5) with photodissociation
  * lifetimes (Haser 1957): uniform emission gives a column density ∝ 1/ρ; radiation pressure bends
  * the outflow into a paraboloid of apex distance v²/(2βg) on the sunward side ("fountain model",
  * Eddington 1910).
@@ -47,7 +47,7 @@ export function cometActivity(c: CometPhysics, r: number, soft = 0.3): number {
   return Math.pow(10, -0.4 * soft * (m - 5.5)) * on;
 }
 
-/** Gas outflow speed (km/s) at r AU (Delsemme 1982). */
+/** Gas outflow speed (km/s) at r AU: 0.85 r^−½ (Cochran & Schleicher 1993). */
 export function gasSpeedKms(r: number): number {
   return 0.85 / Math.sqrt(Math.max(r, 0.05));
 }

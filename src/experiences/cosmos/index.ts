@@ -18,6 +18,7 @@ import { makeExpansion } from '../../worlds/cosmicweb/Simulation';
 import type { CosmoParams, HaloCatalog, SimConfig, SimInfo } from '../../worlds/cosmicweb/types';
 import { PLANCK_COSMO } from '../../worlds/cosmicweb/types';
 import type { StoredFrame } from '../../worlds/cosmicweb/SnapshotStore';
+import type { AccumMode, AtlasMode } from '../../worlds/cosmicweb/formats';
 import type { Expansion } from '../../physics/cosmosExpansion';
 import { cosmicCalendar } from '../../physics/cosmology';
 import { formatDuration, formatNumber, formatScientific } from '../../physics/units';
@@ -39,8 +40,12 @@ const VIEWS: Array<{ id: ViewId; label: string }> = [
 ];
 const SPEEDS = [0.25, 0.5, 1, 2, 4];
 const SPEED_TEXT = SPEEDS.map((x) => `×${x}`);
-/** Values decoded / particles packed per frame while playback approaches the next keyframe. */
-const PREFETCH_VALUES = 900_000;
+/**
+ * Main-thread time per frame spent decoding the next keyframe ahead of playback (ms), in chunks of
+ * DECODE_CHUNK values, and particles uploaded per frame into the spare keyframe texture.
+ */
+const DECODE_MS = 2;
+const DECODE_CHUNK = 131_072;
 const STAGE_PARTICLES = 300_000;
 /** Track units per second at ×1 — the whole history in about a minute. */
 const BASE_RATE = 1 / 62;
@@ -130,6 +135,10 @@ class CosmicWebExperience implements Experience {
   private kB = -1;
   private posA: Uint16Array | null = null;
   private posB: Uint16Array | null = null;
+  /** Set by selectInterval when playback must wait for the next keyframe to be prepared. */
+  private holdPlayback = false;
+  /** Renderers replaced by a new run, kept drawing until the new one is ready (then disposed). */
+  private retired: WebRenderer[] = [];
 
   // UI
   private styleEl: HTMLStyleElement | null = null;
@@ -163,6 +172,8 @@ class CosmicWebExperience implements Experience {
   private ringSel!: HTMLElement;
   private selected = -1;
   private selectedFrame = -1;
+  /** The selection was made by the Cluster view (closed again when leaving it). */
+  private autoSelected = false;
   private hover = -1;
   private hoverClock = 0;
   private lastPointerMove = 0;
@@ -217,6 +228,8 @@ class CosmicWebExperience implements Experience {
 
     this.buildUI();
     this.bindInput();
+    // Start compiling every program now (asynchronously), while the simulation seeds its ICs.
+    this.fallback();
     this.startRun(false);
     ctx.audio.setMood('cosmos', { intensity: 0.35, z: 1500 });
     ctx.ui.hint('Drag to orbit · Scroll to zoom · Space play/pause · ←/→ scrub · Click a cluster · V views · X expansion · F fly', 9000);
@@ -292,10 +305,10 @@ class CosmicWebExperience implements Experience {
     // Every run gets a fresh renderer: the Lagrangian overdensities (field galaxies), σL and the
     // collapsed-fraction variances belong to the run — reusing the old one after "Re-run" with a
     // new seed lit field galaxies at the previous universe's peaks.
-    this.web?.dispose();
+    // The previous renderer keeps drawing (the glow) until the new one's programs are linked; the
+    // new materials share its compiled programs, so none is recompiled (see render()).
+    if (this.web) this.retired.push(this.web);
     this.web = null;
-    this.fireballFallback?.dispose();
-    this.fireballFallback = null;
     const varR = info.sigmaL * info.sigmaL;
     const sig11 = this.sigmaAtMass11();
     const opts = {
@@ -308,6 +321,11 @@ class CosmicWebExperience implements Experience {
       varDwarf: Math.max(0.5, info.sigmaMin2 - varR),
       varBright: Math.max(0.3, sig11 - varR),
       detail: this.ctx.quality.detail,
+      // Dev only (URL query): force the portable fallback formats, e.g. ?cwaccum=rgba8&cwatlas=rgba8.
+      formats: {
+        ...(this.ctx.params.get('cwaccum') ? { accum: this.ctx.params.get('cwaccum') as AccumMode } : {}),
+        ...(this.ctx.params.get('cwatlas') ? { atlas: this.ctx.params.get('cwatlas') as AtlasMode } : {}),
+      },
     };
     this.web = new WebRenderer(this.ctx.renderer, opts);
     this.web.pixelRatio = this.ctx.engine.pixelRatio;
@@ -632,6 +650,7 @@ class CosmicWebExperience implements Experience {
       const halos = this.currentHalos();
       const o = this.orbit;
       if (this.rigMode === 'fly' && id !== 'inside') this.setRig('orbit');
+      if (this.autoSelected && id !== 'cluster') this.select(-1);
       switch (id) {
         case 'volume':
           this.state.wrap = false;
@@ -658,7 +677,10 @@ class CosmicWebExperience implements Experience {
           }
           o.flyTo({ target, distance: dist, pitch: 0.25 }, 3);
           o.autoRotate = id === 'cluster' ? 0.06 : 0.035;
-          if (id === 'cluster' && halos && halos.count > 0) this.select(0);
+          if (id === 'cluster' && halos && halos.count > 0) {
+            this.select(0);
+            this.autoSelected = true;
+          }
           break;
         }
         case 'void': {
@@ -777,6 +799,7 @@ class CosmicWebExperience implements Experience {
   }
 
   private select(i: number): void {
+    this.autoSelected = false;
     const h = this.currentHalos();
     this.selected = h && i >= 0 && i < h.count ? i : -1;
     const f = this.frameNear();
@@ -848,6 +871,7 @@ class CosmicWebExperience implements Experience {
     // Playback.
     const buffered = this.bufferedU();
     this.waiting = false;
+    const uPrev = this.u;
     if (this.playing && !this.timeline.isDragging) {
       const rate = BASE_RATE * SPEEDS[this.speedIdx] * (this.u < tl.uIC ? 1.25 : 1);
       let u = this.u + dt * rate;
@@ -879,7 +903,13 @@ class CosmicWebExperience implements Experience {
     st.scale = this.coords === 'physical' ? a : 1;
 
     // Keyframe interval.
+    this.holdPlayback = false;
     this.selectInterval(t, D);
+    if (this.holdPlayback) {
+      // The next keyframe is still being decoded/uploaded (a few frames at most): hold the clock.
+      this.u = uPrev;
+      this.t = tl.tOfU(uPrev);
+    }
 
     // Epoch look: fireball, dark ages, the web lighting up.
     const T = 2.7255 / a;
@@ -962,10 +992,28 @@ class CosmicWebExperience implements Experience {
   private prefetchNext(): void {
     const store = this.client.store;
     const web = this.web;
-    if (!store || !web || !this.playing || this.kB < 0) return;
+    // (While playback is held, selectInterval already spent this frame's budget on the same frame.)
+    if (!store || !web || !this.playing || this.kB < 0 || this.holdPlayback) return;
     const next = this.kB + 1;
     if (next >= store.length) return;
-    if (store.prefetch(next, PREFETCH_VALUES)) web.stage(next, store.positions(next), STAGE_PARTICLES);
+    this.prepare(next);
+  }
+
+  /**
+   * Advance the decode and upload of keyframe k by one frame's budget (time-sliced decode, row-sliced
+   * upload). True when k is decoded and resident on the GPU, i.e. binding it costs nothing.
+   */
+  private prepare(k: number): boolean {
+    const store = this.client.store!;
+    const web = this.web!;
+    if (!store.isDecoded(k)) {
+      if (!store.canPrefetch(k)) store.positions(k);
+      else {
+        const t0 = performance.now();
+        while (!store.prefetch(k, DECODE_CHUNK)) if (performance.now() - t0 > DECODE_MS) return false;
+      }
+    }
+    return web.stage(k, store.positions(k), STAGE_PARTICLES);
   }
 
   private selectInterval(t: number, D: number): void {
@@ -995,6 +1043,21 @@ class CosmicWebExperience implements Experience {
       st.mix = dD > 1e-9 ? THREE.MathUtils.clamp((D - fa.D) / dD, 0, 1) : THREE.MathUtils.clamp((t - fa.t) / Math.max(fb.t - fa.t, 1e-12), 0, 1);
     }
     if (A !== this.kA || B !== this.kB) {
+      // During playback (and for the very first binding) never stall a frame on a decode or a
+      // texture upload: hold the current interval — or show nothing yet — while the new keyframes
+      // are prepared a slice per frame. Scrubbing binds at once.
+      // (With A and B both new while an interval is bound — a jump — there is only one spare
+      // texture to stage into, so that case binds at once too.)
+      const web = this.web;
+      const bothNew = !web.isResident(A) && A !== B && !web.isResident(B);
+      const nonBlocking = this.kA < 0 || (this.playing && !this.timeline.isDragging && !bothNew);
+      if (nonBlocking && !(this.prepare(A) && (A === B || this.prepare(B)))) {
+        if (this.kA >= 0) {
+          this.holdPlayback = true;
+          if (st.za < 0 && B > this.kB) st.mix = 1;
+        }
+        return;
+      }
       this.posA = store.positions(A);
       this.posB = A === B ? this.posA : store.positions(B);
       this.web.setKeyframes(A, this.posA, B, this.posB);
@@ -1138,33 +1201,44 @@ class CosmicWebExperience implements Experience {
     this.camera.updateProjectionMatrix();
     r.setRenderTarget(target);
     const store = this.client.store;
-    const has = !!(this.web && store && store.length && this.kA >= 0);
-    if (this.web) {
-      this.web.pixelRatio = this.ctx.engine.pixelRatio;
-      this.web.render(target, this.camera, this.state, has);
-    } else if (this.state.cmb) {
-      // Before the simulation reports in, the fireball alone.
-      this.renderFireballOnly(target);
+    const web = this.web;
+    if (web && web.ready) {
+      // Programs are shared: once the new renderer is linked, the old ones can go.
+      if (this.retired.length) {
+        for (const w of this.retired) w.dispose();
+        this.retired.length = 0;
+      }
+      if (this.fireballFallback) {
+        this.fireballFallback.dispose();
+        this.fireballFallback = null;
+      }
+      const has = !!(store && store.length && this.kA >= 0);
+      web.pixelRatio = this.ctx.engine.pixelRatio;
+      web.render(target, this.camera, this.state, has);
+      return;
     }
+    // Before the simulation reports in (or while a new renderer's programs link): the glow alone.
+    if (!this.state.cmb) return;
+    const prev = this.retired.find((w) => w.ready) ?? this.fallback();
+    prev.pixelRatio = this.ctx.engine.pixelRatio;
+    prev.render(target, this.camera, this.state, false);
   }
 
   private fireballFallback: WebRenderer | null = null;
-  private renderFireballOnly(target: THREE.WebGLRenderTarget): void {
-    // A tiny renderer instance used only for the sky glow until the real one exists.
-    if (!this.fireballFallback) {
-      this.fireballFallback = new WebRenderer(this.ctx.renderer, {
-        np: 16,
-        count: 16 * 16 * 16,
-        nm: 16,
-        boxWorld: 1,
-        deltaL: new Int8Array(4096),
-        sigmaL: 1,
-        varDwarf: 1,
-        varBright: 1,
-        detail: 0.35,
-      });
-    }
-    this.fireballFallback.render(target, this.camera, this.state, false);
+  /** A tiny renderer used for the sky glow until the real one exists; created at mount so its programs (shared with the real renderer) compile while the page loads. */
+  private fallback(): WebRenderer {
+    this.fireballFallback ??= new WebRenderer(this.ctx.renderer, {
+      np: 16,
+      count: 16 * 16 * 16,
+      nm: 16,
+      boxWorld: 1,
+      deltaL: new Int8Array(4096),
+      sigmaL: 1,
+      varDwarf: 1,
+      varBright: 1,
+      detail: 0.35,
+    });
+    return this.fireballFallback;
   }
 
   resize(w: number, h: number): void {
@@ -1178,6 +1252,8 @@ class CosmicWebExperience implements Experience {
     this.client.dispose();
     this.web?.dispose();
     this.web = null;
+    for (const w of this.retired) w.dispose();
+    this.retired.length = 0;
     this.fireballFallback?.dispose();
     this.fireballFallback = null;
     this.styleEl?.remove();

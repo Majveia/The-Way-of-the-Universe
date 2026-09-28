@@ -302,3 +302,170 @@ describe('collision · Milkomeda timing (CPU reference)', () => {
     expect(best).toBeLessThan(60);
   }, 120000);
 });
+
+// ——— Review additions ———
+import * as THREE from 'three';
+import { timeToPericentre } from '../src/worlds/nbody/orbit';
+import { DUST_KAPPA_V } from '../src/worlds/nbody/GalaxyRenderer';
+import { adaptChunk, budgetFor, stepCost, stepsPerFrame } from '../src/experiences/collision/Collision';
+
+describe('collision · review: orbit timing and frames', () => {
+  it('time to pericentre matches a direct integration of the two-body problem (e < 1, = 1, > 1)', () => {
+    const mu = G_SIM * 100;
+    for (const e of [0.5, 0.8, 1, 1.3]) {
+      const s = keplerStart(50, 50, { rp: 10, e, r0: 60 });
+      // Leapfrog the relative orbit for tPeri; it must then sit at pericentre (r = r_p, ṙ = 0).
+      let [x, y] = s.r, [vx, vy] = s.v;
+      const n = 200000, h = s.tPeri / n;
+      const acc = (px: number, py: number) => {
+        const r3 = Math.hypot(px, py) ** 3;
+        return [(-mu * px) / r3, (-mu * py) / r3];
+      };
+      let a = acc(x, y);
+      for (let i = 0; i < n; i++) {
+        vx += 0.5 * h * a[0];
+        vy += 0.5 * h * a[1];
+        x += h * vx;
+        y += h * vy;
+        a = acc(x, y);
+        vx += 0.5 * h * a[0];
+        vy += 0.5 * h * a[1];
+      }
+      const r = Math.hypot(x, y);
+      expect(r).toBeCloseTo(10, 2);
+      expect(Math.abs(x * vx + y * vy) / (r * Math.hypot(vx, vy))).toBeLessThan(1e-3);
+    }
+    // Barker's equation: a parabola from f = −90° reaches pericentre after (2/3)·√(2 r_p³/μ)·… (closed form).
+    const rp = 10, f = -Math.PI / 2;
+    const expected = 0.5 * Math.sqrt((8 * rp ** 3) / mu) * (1 + 1 / 3);
+    expect(timeToPericentre(mu, rp, 1, f)).toBeCloseTo(expected, 8);
+  });
+
+  it('disk orientations are proper rotations; i = 180° spins against the orbit', () => {
+    for (const [i, w] of [[0, 0], [60, -30], [180, 0], [71, 30]]) {
+      const R = diskRotation(i, w);
+      const m = new THREE.Matrix3().set(R[0], R[1], R[2], R[3], R[4], R[5], R[6], R[7], R[8]);
+      expect(m.determinant()).toBeCloseTo(1, 12);
+      // spin (local +z) → orbit frame; orbital angular momentum is +z
+      expect(R[8]).toBeCloseTo(Math.cos((i * Math.PI) / 180), 12);
+    }
+  });
+
+  it('world frame: the orbital angular momentum points along +Y (three.js up) and the barycentre is at rest at the origin', () => {
+    const data = buildScenario({ galaxies: [{ spec: LATE_SPIRAL, i: 0, w: 0 }, { spec: LATE_SPIRAL, i: 0, w: 0 }], orbit: { rp: 10, e: 1, r0: 60 }, seed: 3 }, { skeleton: 1024, tracers: 2048 });
+    const [a, b] = data.galaxies;
+    const r = new THREE.Vector3(...b.center).sub(new THREE.Vector3(...a.center));
+    const v = new THREE.Vector3(...b.velocity).sub(new THREE.Vector3(...a.velocity));
+    const L = r.clone().cross(v).normalize();
+    expect(L.y).toBeCloseTo(1, 6);
+    // prograde disks (i = 0) spin with the orbit
+    expect(a.spin[1]).toBeCloseTo(1, 6);
+    const P = new THREE.Vector3(...a.velocity).multiplyScalar(a.mass).addScaledVector(new THREE.Vector3(...b.velocity), b.mass);
+    const X = new THREE.Vector3(...a.center).multiplyScalar(a.mass).addScaledVector(new THREE.Vector3(...b.center), b.mass);
+    expect(P.length()).toBeLessThan(1e-9);
+    expect(X.length()).toBeLessThan(1e-9);
+  });
+});
+
+describe('collision · review: dust and star-formation grid numerics', () => {
+  it('dust opacity follows Bohlin et al. (1978): τ_V ≈ 450 per 10¹⁰ M☉ kpc⁻² of gas', () => {
+    const MSUN_G = 1.98847e33, KPC_CM = 3.0857e21, M_H = 1.6735e-24;
+    const sigma = (1e10 * MSUN_G) / KPC_CM ** 2; // g cm⁻²
+    const NH = (0.74 * sigma) / M_H;
+    const tau = NH / 1.9e21 / 1.0857;
+    expect(DUST_KAPPA_V / tau).toBeGreaterThan(0.9);
+    expect(DUST_KAPPA_V / tau).toBeLessThan(1.12);
+  });
+
+  it('half-float grid fallback: spreading parcels over 4 channels keeps a dense cell within ~1 %', () => {
+    // Additive blending into RGBA16F rounds every partial sum to 11 significant bits. A starburst
+    // cell collects hundreds of parcels (high tier: ~0.3 × 10⁶ M☉ each, grid units 10⁶ M☉).
+    const h = (x: number) => THREE.DataUtils.fromHalfFloat(THREE.DataUtils.toHalfFloat(x));
+    // 300 parcels = 9×10⁷ M☉ in a 0.75 kpc cell ≈ 25× the star-formation threshold.
+    const parcel = 0.3, n = 300;
+    let one = 0;
+    const four = [0, 0, 0, 0];
+    for (let i = 0; i < n; i++) {
+      one = h(one + h(parcel));
+      four[i & 3] = h(four[i & 3] + h(parcel));
+    }
+    const exact = n * h(parcel);
+    const split = four.reduce((s, x) => s + x, 0);
+    expect(Math.abs(split / exact - 1)).toBeLessThan(0.012);
+    // …while a single channel is biased by several per cent (why the split exists; float32 +
+    // EXT_float_blend, used when available, has no such error).
+    expect(Math.abs(one / exact - 1)).toBeGreaterThan(0.05);
+  });
+});
+
+describe('collision · review: GPU cost scaling of the quality tiers', () => {
+  // Per-frame GPU work ∝ skeleton² (force pass, per step) + tracers (integration + ~9 render passes).
+  const cost = (d: number) => {
+    const b = budgetFor(d);
+    return { sim: b.skeleton ** 2, render: b.tracers, b };
+  };
+  it('low costs ≤ ¼ of high in both the N² force pass and the tracer work', () => {
+    const lo = cost(0.35), hi = cost(1);
+    expect(lo.sim / hi.sim).toBeLessThan(0.25);
+    expect(lo.render / hi.render).toBeLessThan(0.4);
+    expect(hi.b).toEqual({ skeleton: 8192, tracers: 196608 });
+    // tracer rows are whole and skeleton segments whole 64-particle rows
+    for (const d of [0.35, 0.7, 1, 1.6]) {
+      const b = budgetFor(d);
+      expect(b.tracers % 4096).toBe(0);
+      expect(b.skeleton % 1024).toBe(0);
+    }
+  });
+  it('the per-frame step cap bounds the N² work (≤ 2.7×10⁸ pair interactions, ≥ 1 step)', () => {
+    for (const d of [0.35, 0.7, 1, 1.6]) {
+      const { skeleton: sk, tracers } = budgetFor(d);
+      const n = stepsPerFrame(sk, undefined, undefined, tracers, 4);
+      expect(n).toBeGreaterThanOrEqual(1);
+      expect(n).toBeLessThanOrEqual(10);
+      if (n > 1) expect(n * stepCost(sk, tracers, 4)).toBeLessThanOrEqual(2.7e8);
+    }
+    // The default rates (30–60 Myr/s at dt = 1–1.5 Myr) need ≤ 1 step per 60 Hz frame on every tier.
+    for (const p of PRESETS) expect(p.rate / (p.dt ?? 1) / 60).toBeLessThanOrEqual(stepsPerFrame(budgetFor(1.6).skeleton));
+  });
+});
+
+describe('collision · review 2: frame budget and sprite photometry', () => {
+  it('a step costs the N² force pass plus the tracer sub-steps (which dominate on low tiers)', () => {
+    const lo = budgetFor(0.35), hi = budgetFor(1);
+    // high: force pass dominates; low: tracers are a sizeable share, so they must be in the budget
+    expect(stepCost(hi.skeleton, 0)).toBeGreaterThan(0.8 * stepCost(hi.skeleton, hi.tracers));
+    expect(stepCost(lo.skeleton, lo.tracers) / stepCost(lo.skeleton, 0)).toBeGreaterThan(1.3);
+    // the low tier's per-frame step cap is therefore smaller than N² alone would allow
+    expect(stepsPerFrame(lo.skeleton, 5.4e8, 64, lo.tracers)).toBeLessThan(stepsPerFrame(lo.skeleton, 5.4e8, 64));
+    // whole-frame integrator work on 'low' is ≤ ¼ of 'high' at the same simulated rate
+    expect(stepCost(lo.skeleton, lo.tracers) / stepCost(hi.skeleton, hi.tracers)).toBeLessThan(0.25);
+  });
+  it('fast-forward chunks adapt to the measured frame interval and stay within [1, cap]', () => {
+    expect(adaptChunk(10, 80, 64)).toBeLessThan(10);
+    expect(adaptChunk(10, 16, 64)).toBeGreaterThan(10);
+    expect(adaptChunk(10, 30, 64)).toBe(10);
+    expect(adaptChunk(1, 500, 64)).toBe(1);
+    expect(adaptChunk(64, 1, 64)).toBe(64);
+    // a slow GPU converges from the cap to a frame near 33 ms: cost 5 ms/step → ~6 steps
+    let c = 64;
+    for (let i = 0; i < 30; i++) c = adaptChunk(c, 5 * c, 64);
+    expect(5 * c).toBeGreaterThan(20);
+    expect(5 * c).toBeLessThan(50);
+  });
+  it('sprite normalisations: 2πσ² for the Gaussian points, 0.771 R² for the exp(−4r²/R²) cluster disks', () => {
+    // ∫∫_{r<R} exp(−4 r²/R²) dA = (π R²/4)(1 − e⁻⁴)
+    expect((Math.PI / 4) * (1 - Math.exp(-4))).toBeCloseTo(0.771, 3);
+    // numerical check of the discrete Gaussian point (σ = 0.6 px, truncated at 3σ) on a pixel grid
+    for (const sigma of [0.6, 0.9, 1.2]) {
+      let sum = 0;
+      for (let y = -6; y <= 6; y++)
+        for (let x = -6; x <= 6; x++) {
+          const r2 = (x * x + y * y) / (sigma * sigma);
+          if (r2 <= 9) sum += Math.exp(-0.5 * r2);
+        }
+      // light conserved to a few per cent whatever the sub-pixel phase (here centred)
+      expect(sum / (2 * Math.PI * sigma * sigma)).toBeGreaterThan(0.97);
+      expect(sum / (2 * Math.PI * sigma * sigma)).toBeLessThan(1.25);
+    }
+  });
+});

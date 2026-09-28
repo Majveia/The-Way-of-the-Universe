@@ -31,6 +31,7 @@ uniform vec2 uBounds;      // Rmax, Zmax
 uniform float uMaxSteps;
 uniform float uStepK;
 uniform vec2 uStepRange;   // min, max step (pc)
+uniform float uStepNear;   // step as a fraction of the distance from the camera (in-plane rays)
 uniform float uFrame;
 uniform vec3 uColDisk;
 uniform vec3 uColThick;
@@ -52,11 +53,28 @@ uniform float uScatter;
 uniform sampler3D uNoise;
 uniform float uNoiseTile;
 uniform float uGain;
+uniform float uLocalReach; // local clouds + Local Bubble matter only within this distance (pc) of uBubble.xyz
 uniform float uNearCut;    // emission closer than this (pc) is drawn as individual stars instead
 uniform int uDebug;
+uniform float uEncode;     // > 0 only without float render targets: store y = xE / (1 + xE) in 8 bits
 uniform int uMask;         // component bits: 1 disk, 2 thick, 4 bulge, 8 bar, 16 young, 32 HII, 64 scattering, 128 dust
 
-float sech2(float x) { float c = cosh(clamp(x, -30.0, 30.0)); return 1.0 / (c * c); }
+// sech²x = 4e/(1 + e)² with e = exp(−2|x|): one exp instead of cosh's two, no overflow.
+// localDustRho (ismGlsl) with the squared radius scaled by k (ragged outlines).
+float localDustRhoRagged(vec3 m, float k) {
+  float rho = 0.0;
+  for (int i = 0; i < 8; i++) {
+    if (i >= uCloudCount) break;
+    vec4 c = uClouds[i];
+    vec3 d = m - c.xyz;
+    d.z /= CLOUD_FLAT;
+    float r2 = k * dot(d, d) / (c.w * c.w);
+    if (r2 < 9.0) rho += uCloudTau[i] / (1.772 * c.w) * exp(-r2);
+  }
+  return rho;
+}
+
+float sech2(float x) { float e = exp(-2.0 * min(abs(x), 30.0)); float d = 1.0 + e; return 4.0 * e / (d * d); }
 
 // Interval of the ray inside the cylinder R < Rmax and slab |H| < Zmax.
 vec2 bounds(vec3 ro, vec3 rd) {
@@ -99,8 +117,7 @@ void main() {
   float jitter = ign(gl_FragCoord.xy + vec2(uFrame * 5.588238, uFrame * 3.1));
   float absRdz = abs(rd.z);
   float steps = 0.0;
-  float barAng = uBarAngle0 + uOmegaB * uTime;
-  float cb = cos(barAng), sb = sin(barAng);
+  float cb = uBarCS.x, sb = uBarCS.y;
   bool first = true;
 
   for (int i = 0; i < 400; i++) {
@@ -111,9 +128,14 @@ void main() {
     // camera (∝ distance) and the bulge (∝ r); far above the plane only smooth, faint light remains.
     float ds = uStepK * (abs(h0) + 20.0) / max(absRdz, 0.012);
     float r0 = length(m0);
-    ds = min(ds, min(0.03 * t + 3.0, 0.22 * r0 + 30.0));
+    ds = min(ds, min(uStepNear * t + 3.0, 0.22 * r0 + 30.0));
     ds = clamp(ds, uStepRange.x, max(uStepRange.y, 0.35 * abs(h0)));
-    ds = max(ds, (iv.y - t) / max(1.0, uMaxSteps - steps));
+    // Reach the far end within the step budget — but only when the geometric near-camera schedule
+    // alone would not: forcing (remaining / steps left) from the first step made in-plane rays
+    // start with ~125 pc steps, which dithered the nearby clouds (Great Rift, ~20 pc across at
+    // 100–200 pc) into holes and speckle.
+    float left = max(1.0, uMaxSteps - steps);
+    if (log((uStepNear * iv.y + 3.0) / (uStepNear * t + 3.0)) > uStepNear * left) ds = max(ds, (iv.y - t) / left);
     float tm = t + ds * (first ? jitter : 0.5);
     if (first) { ds *= jitter + 0.5; first = false; }
     vec3 m = ro + rd * tm;
@@ -123,7 +145,7 @@ void main() {
     float R = length(m.xy);
     float phi = atan(m.y, m.x);
     float h = m.z - warpH(R, phi);
-    vec4 mp = mapAt(m.xy);
+    vec4 mp = mapAtPolar(R, phi); // same as mapAt(m.xy), reusing R and φ
     vec3 j = vec3(0.0);
 
     // Thin and thick disks (sech² vertical profile, flaring outer disk, truncation).
@@ -146,7 +168,8 @@ void main() {
       if (rb < uBulgeP.w) {
         float rc = 0.12 * uBulgeP.y;
         float rs = sqrt(rb * rb + rc * rc);
-        j += uColBulge * (uBulgeP.x / (rs * pow(rs + uBulgeP.y, 3.0)) / uBulgeP.z);
+        float ra = rs + uBulgeP.y;
+        j += uColBulge * (uBulgeP.x / (rs * ra * ra * ra) / uBulgeP.z);
       }
       if (uNucP.x > 0.0 && r3 < uNucP.y * 12.0) {
         float x = r3 / uNucP.y;
@@ -180,8 +203,16 @@ void main() {
     float hdEff = uDustH * (0.65 + 0.9 * n.a);
     float dustV = (mp.b + barDust(m.xy)) * uDustAmount;
     float rho = dustV * exp(-abs(h) / hdEff) / (2.0 * hdEff);
-    rho *= (0.2 + 1.35 * n.r * (0.45 + 1.1 * n2.b)) * bubbleFactor(m);
-    rho += localDustRho(m);
+    rho *= 0.2 + 1.35 * n.r * (0.45 + 1.1 * n2.b);
+    // The Local Bubble and the nearby clouds (8 Gaussians) only exist around the Sun: one distance
+    // test instead of nine evaluations on every step of every ray.
+    if (uLocalReach > 0.0 && dot(m - uBubble.xyz, m - uBubble.xyz) < uLocalReach * uLocalReach) {
+      // Nearby clouds are turbulent, not Gaussian balls: the fine noise (≈ 9 pc features) roughens
+      // their outlines (radius scaled by 0.55–1.45) and breaks the interior into clumps and lanes,
+      // keeping the mean column roughly unchanged (star extinction uses the smooth analytic column).
+      float rag = n2.r;
+      rho = rho * bubbleFactor(m) + localDustRhoRagged(m, 0.55 + 0.9 * rag) * (0.15 + 1.9 * smoothstep(0.32, 0.72, rag)) * (0.7 + 0.6 * n2.g);
+    }
     if ((uMask & 128) == 0) rho = 0.0;
 
     // Young stars (diffuse, clumped into associations) and HII regions ([OIII] cores where brightest).
@@ -192,14 +223,14 @@ void main() {
       j += uColYoung * (uYoungP.x * mp.g * clump * exp(-abs(h) / uYoungP.y) / (2.0 * uYoungP.y));
     }
     if ((uMask & 32) != 0) {
-      float knot = pow(n2.b, 2.0) * 3.2;
+      float knot = n2.b * n2.b * 3.2;
       float hiiK = mp.a * uHIIP.x * exp(-abs(h) / uHIIP.y) / (2.0 * uHIIP.y) * knot;
       float core = smoothstep(0.6, 0.95, n2.b);
       j += mix(uColHII, uColOIII, 0.4 * core) * hiiK;
     }
 
     // Dust-scattered disk light (albedo ≈ 0.6; bluer than the stars that light it).
-    if ((uMask & 64) != 0) j += uColScatter * (uScatter * rho * (uDiskP.x * exp(-R / uDiskP.y) + 4.0 * uYoungP.x * mp.g));
+    if (uScatter > 0.0 && (uMask & 64) != 0) j += uColScatter * (uScatter * rho * (uDiskP.x * exp(-R / uDiskP.y) + 4.0 * uYoungP.x * mp.g));
 
     // Nearby light belongs to the resolved local star field, not to a glow around the viewer.
     if (uNearCut > 0.0) j *= smoothstep(0.45 * uNearCut, uNearCut, tm);
@@ -219,20 +250,32 @@ void main() {
   bool ok = (outL.r >= 0.0 || outL.r < 0.0) && (outL.g >= 0.0 || outL.g < 0.0) && (outL.b >= 0.0 || outL.b < 0.0) && (outT >= 0.0 || outT < 0.0);
   if (!ok) { outL = vec3(0.0); outT = 1.0; }
   outL = min(max(outL, vec3(0.0)), vec3(6.0e4));
+  if (uEncode > 0.0) outL = outL * uEncode / (1.0 + outL * uEncode);
   outColor = vec4(outL, outT);
 }
 `;
 
-/** Upsample + composite: dst = volume.rgb + dst × volume.a (blend ONE, SRC_ALPHA). */
+/**
+ * Upsample + composite: dst = volume.rgb + stars_lo.rgb + stars_hi.rgb + dst × volume.a (blend ONE, SRC_ALPHA).
+ * `tStars` holds the wide (smooth) star sprites splatted at reduced resolution (see STAR_VERT uPass);
+ * they are added after the volume's transmittance, exactly as if drawn additively on top.
+ */
 export const VOLUME_COMPOSITE_FRAG = /* glsl */ `
 precision highp float;
 in vec2 vUv;
 out vec4 outColor;
 uniform sampler2D tVol;
 uniform vec2 uTexel;
-// 9-tap Catmull–Rom via 4 bilinear fetches (smooth, sharper than bilinear on dust lanes).
-vec4 sampleBicubic(vec2 uv) {
-  vec2 p = uv / uTexel - 0.5;
+uniform sampler2D tStars;
+uniform vec2 uStarTexel;
+uniform float uHasVol;
+uniform float uHasStars;
+uniform sampler2D tStarsHi; // sharp sprites at full resolution (same grid as the output)
+uniform float uHasStarsHi;
+uniform float uDecode;   // > 0: the volume is stored tone-compressed (8-bit fallback), L = y / (1 − y) / uDecode
+// 9-tap Catmull–Rom via 5 bilinear fetches (smooth, sharper than bilinear on dust lanes).
+vec4 sampleBicubic(sampler2D tex, vec2 uv, vec2 texel) {
+  vec2 p = uv / texel - 0.5;
   vec2 f = fract(p);
   vec2 i = floor(p);
   vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
@@ -241,18 +284,22 @@ vec4 sampleBicubic(vec2 uv) {
   vec2 w3 = f * f * (-0.5 + 0.5 * f);
   vec2 w12 = w1 + w2;
   vec2 o12 = w2 / w12;
-  vec2 t0 = (i - 0.5) * uTexel;
-  vec2 t3 = (i + 2.5) * uTexel;
-  vec2 t12 = (i + 0.5 + o12) * uTexel;
-  vec4 c = texture(tVol, vec2(t12.x, t0.y)) * w12.x * w0.y
-         + texture(tVol, vec2(t0.x, t12.y)) * w0.x * w12.y
-         + texture(tVol, vec2(t12.x, t12.y)) * w12.x * w12.y
-         + texture(tVol, vec2(t3.x, t12.y)) * w3.x * w12.y
-         + texture(tVol, vec2(t12.x, t3.y)) * w12.x * w3.y;
+  vec2 t0 = (i - 0.5) * texel;
+  vec2 t3 = (i + 2.5) * texel;
+  vec2 t12 = (i + 0.5 + o12) * texel;
+  vec4 c = texture(tex, vec2(t12.x, t0.y)) * w12.x * w0.y
+         + texture(tex, vec2(t0.x, t12.y)) * w0.x * w12.y
+         + texture(tex, vec2(t12.x, t12.y)) * w12.x * w12.y
+         + texture(tex, vec2(t3.x, t12.y)) * w3.x * w12.y
+         + texture(tex, vec2(t12.x, t3.y)) * w12.x * w3.y;
   return c / (w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y);
 }
 void main() {
-  vec4 c = sampleBicubic(vUv);
-  outColor = vec4(max(c.rgb, vec3(0.0)), clamp(c.a, 0.0, 1.0));
+  vec4 c = uHasVol > 0.5 ? sampleBicubic(tVol, vUv, uTexel) : vec4(0.0, 0.0, 0.0, 1.0);
+  vec3 rgb = max(c.rgb, vec3(0.0));
+  if (uDecode > 0.0) rgb = rgb / max(1.0 - rgb, vec3(1e-3)) / uDecode;
+  if (uHasStars > 0.5) rgb += max(sampleBicubic(tStars, vUv, uStarTexel).rgb, vec3(0.0));
+  if (uHasStarsHi > 0.5) rgb += texelFetch(tStarsHi, ivec2(gl_FragCoord.xy), 0).rgb;
+  outColor = vec4(rgb, clamp(c.a, 0.0, 1.0));
 }
 `;

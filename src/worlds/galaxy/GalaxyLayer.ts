@@ -93,6 +93,7 @@ export class GalaxyLayer {
   private meterRT: THREE.WebGLRenderTarget | null = null;
   private meterMat: THREE.ShaderMaterial | null = null;
   private meterBuf = new Float32Array(16 * 9 * 4);
+  private meterHalf: Uint16Array | null = null;
   private meterPending = false;
   private meterFrame = 0;
   /** Time (Myr) at which the dark halo was removed (NaN while it is present). */
@@ -136,6 +137,26 @@ export class GalaxyLayer {
   nearCut = 200;
 
   private volRT: THREE.WebGLRenderTarget | null = null;
+  /**
+   * Wide (smooth) star sprites are splatted at reduced resolution into this target and added in
+   * the volume composite: aggregate particles are Gaussians several pixels wide, so a coarser grid
+   * loses nothing, and it is not multisampled — it cuts the dominant fill-rate cost ~4–8×.
+   */
+  private starLoRT: THREE.WebGLRenderTarget | null = null;
+  /**
+   * The sharp (point-like) sprites, when the HDR target is multisampled: splatted here at full
+   * resolution without MSAA and added in the same composite. Additive Gaussians gain nothing from
+   * 4× MSAA, but every blend would touch 4 samples of RGBA16F — the dominant fill cost on a real GPU.
+   */
+  private starHiRT: THREE.WebGLRenderTarget | null = null;
+  /** Star low-resolution scale (fraction of the target size). */
+  private readonly starLoScale = 0.5;
+  /** Float/half-float render targets available (else an 8-bit, tone-compressed fallback). */
+  private readonly halfRT: boolean;
+  private readonly floatRT: boolean;
+  /** Encoding exposure of the 8-bit volume fallback (0 = linear half-float storage). */
+  private volEncode = 0;
+  private readonly clearTmp = new THREE.Color();
   /** Temporal accumulation of the jittered ray-march (history ping-pong). */
   private accRT: [THREE.WebGLRenderTarget, THREE.WebGLRenderTarget] | null = null;
   private accIdx = 0;
@@ -168,11 +189,26 @@ export class GalaxyLayer {
   private volScale: number;
   private mapsDirty = true;
   private normsDirty = true;
-  private youngInt = 1;
-  private hiiInt = 1;
+  /** ∫ over the disk of the map's young (G) and HII (A) channels; 0 = unknown (that light is off). */
+  private youngInt = 0;
+  private hiiInt = 0;
   private readonly tmpV = new THREE.Vector3();
   private readonly camModel = new THREE.Vector3();
   private readonly maxPointSize: number;
+  /** cos, sin of the local field's co-rotation angle (see localRotation). Shared by every tier. */
+  private readonly localRot = { value: new THREE.Vector2(1, 0) };
+
+  /**
+   * The procedural local star field turns rigidly about the centre at Ω(R_ref) — R_ref = R⊙, or
+   * 3 disk scale lengths — as the real solar neighbourhood does (stars near the Sun share its
+   * orbit, ±20 km/s). A field fixed in space would stream past a Sun-following camera at 230 km/s ×
+   * the time warp. Angle 0 at t = 0, so nearestStars is unchanged for a galaxy that does not run.
+   */
+  localRotation(): number {
+    const p = this.params;
+    const R = p.sun?.R ?? Math.max(1000, 3 * p.disk.scaleLength);
+    return this.kin.potential.omega(R, true) * this.time;
+  }
 
   constructor(renderer: THREE.WebGLRenderer, o: GalaxyLayerOptions) {
     this.renderer = renderer;
@@ -183,7 +219,10 @@ export class GalaxyLayer {
     this.useWorker = o.worker ?? true;
     this.live = defaultLive(o.params);
     this.kin = new Kinematics(o.params, this.live);
-    this.volScale = THREE.MathUtils.clamp(0.22 + 0.2 * this.detail, 0.3, 0.55);
+    const tier = galaxyTier(this.detail);
+    this.volScale = tier.volScale;
+    this.floatRT = renderer.extensions.has('EXT_color_buffer_float');
+    this.halfRT = this.floatRT || renderer.extensions.has('EXT_color_buffer_half_float');
     const gl = renderer.getContext();
     const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array | number[] | null;
     this.maxPointSize = range ? Math.min(64, Number(range[1]) || 64) : 64;
@@ -229,12 +268,13 @@ export class GalaxyLayer {
       uCloudCount: { value: 0 },
       uClouds: { value: Array.from({ length: 8 }, v4) },
       uCloudTau: { value: new Array(8).fill(0) },
+      uBarCS: { value: new THREE.Vector2(1, 0) },
     };
 
     // Maps (log-polar, pattern frame).
     const mapSize = this.detail >= 0.9 ? 1024 : 512;
     const rtOpts = {
-      type: THREE.HalfFloatType,
+      type: this.halfRT ? THREE.HalfFloatType : THREE.UnsignedByteType,
       format: THREE.RGBAFormat,
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
@@ -243,7 +283,13 @@ export class GalaxyLayer {
       generateMipmaps: false,
     } as const;
     this.mapRT = new THREE.WebGLRenderTarget(mapSize, mapSize, { ...rtOpts, wrapS: THREE.ClampToEdgeWrapping, wrapT: THREE.RepeatWrapping });
-    this.mapNormRT = new THREE.WebGLRenderTarget(128, 128, { ...rtOpts, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
+    // Read back on the CPU: Float32 where renderable (RGBA/FLOAT reads are always legal then).
+    this.mapNormRT = new THREE.WebGLRenderTarget(128, 128, {
+      ...rtOpts,
+      type: this.floatRT ? THREE.FloatType : rtOpts.type,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+    });
     this.shared.uMap.value = this.mapRT.texture;
     this.mapMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
@@ -302,6 +348,9 @@ export class GalaxyLayer {
         uSmooth: { value: new THREE.Vector4(1, 1, 1, 1) },
         uSmoothBar: { value: 1 },
         uYoungMult: { value: 1 },
+        uPass: { value: 0 },
+        uSplit: { value: new THREE.Vector2(1.2, 1.7) },
+        uLoScale: { value: this.starLoScale },
       },
       blending: THREE.CustomBlending,
       blendSrc: THREE.OneFactor,
@@ -370,6 +419,7 @@ export class GalaxyLayer {
           uN: { value: N },
           uMaxPer: { value: per },
           uCamCell: { value: new THREE.Vector3() },
+          uLocalRot: this.localRot,
           uTierL: { value: new THREE.Vector4(tier.lLo, tier.lHi, tier.n0, tier.giants) },
           uRadius: { value: tier.radius },
           uBeta: { value: tier.beta },
@@ -415,8 +465,11 @@ export class GalaxyLayer {
         uCamWorld: { value: new THREE.Matrix4() },
         uCamModel: { value: new THREE.Vector3() },
         uBounds: { value: new THREE.Vector2() },
-        uMaxSteps: { value: Math.round(90 + 150 * Math.min(1.2, this.detail)) },
+        uMaxSteps: { value: tier.maxSteps },
         uStepK: { value: 0.3 },
+        // In-plane rays (views from inside the disk) are dominated by this geometric schedule:
+        // 4.5 % of the distance per step on high, coarser on lower tiers (jitter + history hide it).
+        uStepNear: { value: tier.stepNear },
         uStepRange: { value: new THREE.Vector2(6, 260) },
         uFrame: { value: 0 },
         uColDisk: { value: new THREE.Vector3() },
@@ -440,8 +493,10 @@ export class GalaxyLayer {
         uNoiseTile: { value: 2400 },
         uGain: { value: 1 },
         uNearCut: { value: 0 },
+        uLocalReach: { value: 0 },
         uDebug: { value: 0 },
         uMask: { value: 255 },
+        uEncode: { value: 0 },
       },
     });
     this.compMat = new THREE.ShaderMaterial({
@@ -457,7 +512,17 @@ export class GalaxyLayer {
       blendEquation: THREE.AddEquation,
       blendSrcAlpha: THREE.ZeroFactor,
       blendDstAlpha: THREE.OneFactor,
-      uniforms: { tVol: { value: null }, uTexel: { value: new THREE.Vector2() } },
+      uniforms: {
+        tVol: { value: null },
+        uTexel: { value: new THREE.Vector2() },
+        tStars: { value: null },
+        uStarTexel: { value: new THREE.Vector2() },
+        uHasVol: { value: 1 },
+        uHasStars: { value: 0 },
+        tStarsHi: { value: null },
+        uHasStarsHi: { value: 0 },
+        uDecode: { value: 0 },
+      },
     });
 
     this.applyParams();
@@ -521,7 +586,9 @@ export class GalaxyLayer {
   private startIntegrator(): void {
     this.integ?.dispose();
     this.integ = null;
-    if (!this.particles) return;
+    // The state lives in float render targets; without any (no EXT_color_buffer_half_float/float)
+    // every star would collapse to the origin, so the stars keep their analytic orbits instead.
+    if (!this.particles || !this.halfRT) return;
     this.shared.uTime.value = this.time;
     this.integ = new GalaxyIntegrator(this.renderer, this.particles.data, this.particles.count, this.shared);
     this.integ.setPotential(this.params.potential, false);
@@ -545,8 +612,11 @@ export class GalaxyLayer {
     if (!ism || !sun) {
       s.uCloudCount.value = 0;
       (s.uBubble.value as THREE.Vector4).set(0, 0, 0, 0);
+      this.volMat.uniforms.uLocalReach.value = 0;
       return;
     }
+    // Everything local lies within this distance of the Sun (bubble edge; clouds to 3 radii).
+    let reach = 1.3 * ism.bubble;
     (s.uBubble.value as THREE.Vector4).set(sun.x, sun.y, sun.z, ism.bubble);
     const phi = Math.atan2(sun.y, sun.x);
     const gx = -Math.cos(phi), gy = -Math.sin(phi); // toward the Galactic Centre (l = 0)
@@ -565,7 +635,9 @@ export class GalaxyLayer {
         c.r,
       );
       T[i] = c.tau * this.live.dust;
+      reach = Math.max(reach, c.d + 3.2 * c.r);
     }
+    this.volMat.uniforms.uLocalReach.value = reach;
     s.uCloudCount.value = n;
   }
 
@@ -762,32 +834,80 @@ export class GalaxyLayer {
     this.quad.render(r, this.mapRT);
     if (this.normsDirty) {
       // Normalisation integrals from a small copy: ∫G dA and ∫A dA with dA = R² d(lnR) dφ.
+      // The first one is read synchronously (the volume needs it before its first frame); later
+      // ones (slider drags) asynchronously, keeping the previous normalisation for a frame or two
+      // instead of stalling the pipeline.
       this.quad.render(r, this.mapNormRT);
       const w = this.mapNormRT.width;
       const h = this.mapNormRT.height;
-      const buf = new Uint16Array(w * h * 4);
-      r.readRenderTargetPixels(this.mapNormRT, 0, 0, w, h, buf);
-      const geo = this.shared.uMapGeom.value as THREE.Vector3;
-      const lnRange = 1 / geo.y;
-      let gI = 0;
-      let aI = 0;
-      for (let j = 0; j < h; j++) {
-        for (let i = 0; i < w; i++) {
-          const u = (i + 0.5) / w;
-          const R = Math.exp(geo.x + u * lnRange);
-          const dA = R * R * (lnRange / w) * ((2 * Math.PI) / h);
-          const o = (j * w + i) * 4;
-          gI += THREE.DataUtils.fromHalfFloat(buf[o + 1]) * dA;
-          aI += THREE.DataUtils.fromHalfFloat(buf[o + 3]) * dA;
-        }
-      }
-      this.youngInt = gI;
-      this.hiiInt = aI;
       this.normsDirty = false;
-      this.updateVolumeNorms();
+      if (!this.floatRT) {
+        // No Float32 targets: a synchronous RGBA/FLOAT read (half float) or bytes (8-bit fallback).
+        this.readNormsFallback(r, w, h);
+        this.applyNorms();
+      } else if (!this.normsValid) {
+        r.readRenderTargetPixels(this.mapNormRT, 0, 0, w, h, this.normBuf);
+        this.applyNorms();
+      } else if (!this.normsPending) {
+        this.normsPending = true;
+        r.readRenderTargetPixelsAsync(this.mapNormRT, 0, 0, w, h, this.normBuf)
+          .then(() => {
+            if (!this.disposed) this.applyNorms();
+          })
+          .catch(() => {
+            /* keep the previous normalisation */
+          })
+          .finally(() => {
+            this.normsPending = false;
+            if (this.normsDirty) this.mapsDirty = true;
+          });
+      } else this.normsDirty = true; // a read is in flight: redo once it lands
     }
     r.setRenderTarget(prev);
     this.mapsDirty = false;
+  }
+
+  private normBuf = new Float32Array(128 * 128 * 4);
+  private readNormsFallback(r: THREE.WebGLRenderer, w: number, h: number): void {
+    const gl = r.getContext() as WebGL2RenderingContext;
+    const buf = this.normBuf;
+    buf.fill(0);
+    r.setRenderTarget(this.mapNormRT);
+    if (this.halfRT) {
+      // Legal for float colour buffers; if a driver refuses, the diffuse young light stays off.
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, buf);
+      if (gl.getError() !== gl.NO_ERROR) buf.fill(0);
+      return;
+    }
+    const b8 = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, b8);
+    for (let i = 0; i < b8.length; i++) buf[i] = b8[i] / 255;
+  }
+  private normsValid = false;
+  private normsPending = false;
+  private applyNorms(): void {
+    const w = this.mapNormRT.width;
+    const h = this.mapNormRT.height;
+    const buf = this.normBuf;
+    const geo = this.shared.uMapGeom.value as THREE.Vector3;
+    const lnRange = 1 / geo.y;
+    let gI = 0;
+    let aI = 0;
+    for (let j = 0; j < h; j++) {
+      for (let i = 0; i < w; i++) {
+        const u = (i + 0.5) / w;
+        const R = Math.exp(geo.x + u * lnRange);
+        const dA = R * R * (lnRange / w) * ((2 * Math.PI) / h);
+        const o = (j * w + i) * 4;
+        gI += buf[o + 1] * dA;
+        aI += buf[o + 3] * dA;
+      }
+    }
+    // A failed read (all zeros / NaN) must not switch the young light off: keep the last good value.
+    if (gI > 0 && Number.isFinite(gI)) this.youngInt = gI;
+    if (aI > 0 && Number.isFinite(aI)) this.hiiInt = aI;
+    this.normsValid = true;
+    this.updateVolumeNorms();
   }
 
   private async regenerate(): Promise<void> {
@@ -887,16 +1007,24 @@ export class GalaxyLayer {
 
   // ——— Rendering ———————————————————————————————————————————————————————————
 
+  /**
+   * Size the internal targets for a `width × height` HDR target (called by the owner on resize;
+   * render() also follows the target it is given, so dynamic resolution needs no extra call).
+   * The volume runs at volScale of the target, capped at ~1 MP × detail so a 4K canvas does not
+   * pay for detail the smooth light does not have.
+   */
   resize(width: number, height: number): void {
-    const w = Math.max(1, Math.round(width * this.volScale));
-    const h = Math.max(1, Math.round(height * this.volScale));
-    if (this.volRT && this.volRT.width === w && this.volRT.height === h) return;
-    this.volRT?.dispose();
-    this.accRT?.[0].dispose();
-    this.accRT?.[1].dispose();
-    const mk = () =>
-      new THREE.WebGLRenderTarget(w, h, {
-        type: THREE.HalfFloatType,
+    const cap = Math.sqrt(galaxyTier(this.detail).volPixelCap / Math.max(1, width * height));
+    const vs = Math.min(this.volScale, cap);
+    const w = Math.max(1, Math.round(width * vs));
+    const h = Math.max(1, Math.round(height * vs));
+    const sw = Math.max(1, Math.round(width * this.starLoScale));
+    const sh = Math.max(1, Math.round(height * this.starLoScale));
+    this.sizedFor.set(width, height);
+    const type = this.halfRT ? THREE.HalfFloatType : THREE.UnsignedByteType;
+    const mk = (W: number, H: number) =>
+      new THREE.WebGLRenderTarget(W, H, {
+        type,
         format: THREE.RGBAFormat,
         minFilter: THREE.LinearFilter,
         magFilter: THREE.LinearFilter,
@@ -904,9 +1032,44 @@ export class GalaxyLayer {
         stencilBuffer: false,
         generateMipmaps: false,
       });
-    this.volRT = mk();
-    this.accRT = [mk(), mk()];
+    if (this.halfRT && !(this.starLoRT && this.starLoRT.width === sw && this.starLoRT.height === sh)) {
+      this.starLoRT?.dispose();
+      this.starLoRT = mk(sw, sh);
+    }
+    if (this.volRT && this.volRT.width === w && this.volRT.height === h) return;
+    this.volRT?.dispose();
+    this.accRT?.[0].dispose();
+    this.accRT?.[1].dispose();
+    this.volRT = mk(w, h);
+    this.accRT = [mk(w, h), mk(w, h)];
     this.accCount = 0;
+  }
+  private readonly sizedFor = new THREE.Vector2();
+
+  private ensureStarHi(w: number, h: number): THREE.WebGLRenderTarget | null {
+    if (!this.halfRT) return null;
+    if (this.starHiRT && this.starHiRT.width === w && this.starHiRT.height === h) return this.starHiRT;
+    this.starHiRT?.dispose();
+    this.starHiRT = new THREE.WebGLRenderTarget(w, h, {
+      type: THREE.HalfFloatType,
+      format: THREE.RGBAFormat,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+      generateMipmaps: false,
+    });
+    return this.starHiRT;
+  }
+
+  /** Clear a private target to transparent black, keeping the renderer's clear colour. */
+  private clearTarget(renderer: THREE.WebGLRenderer, rt: THREE.WebGLRenderTarget): void {
+    renderer.getClearColor(this.clearTmp);
+    const ca = renderer.getClearAlpha();
+    renderer.setRenderTarget(rt);
+    renderer.setClearColor(0x000000, 0);
+    renderer.clear(true, false, false);
+    renderer.setClearColor(this.clearTmp, ca);
   }
 
   /**
@@ -920,7 +1083,7 @@ export class GalaxyLayer {
     const pxPerRad = this.volRT!.height / (2 * Math.tan((camera.fov * Math.PI) / 360));
     // Rotation: change of the camera basis vectors (radians, small-angle).
     let rot = 0;
-    for (const i of [0, 1, 2, 4, 5, 6, 8, 9, 10]) rot = Math.max(rot, Math.abs(e[i] - p[i]));
+    for (const i of BASIS_IDX) rot = Math.max(rot, Math.abs(e[i] - p[i]));
     const dPos = Math.hypot(e[12] - p[12], e[13] - p[13], e[14] - p[14]);
     const nearest = Math.max(40, Math.min(Math.hypot(cam.x, cam.y, cam.z) * 0.5, Math.abs(cam.z) + 60));
     const shift = (rot + dPos / nearest) * pxPerRad;
@@ -949,6 +1112,8 @@ export class GalaxyLayer {
    */
   render(renderer: THREE.WebGLRenderer, camera: THREE.PerspectiveCamera, target: THREE.WebGLRenderTarget, o: GalaxyRenderOptions = {}): void {
     this.shared.uTime.value = this.time;
+    const barAng = this.params.bar.angle + (this.shared.uOmegaB.value as number) * this.time;
+    (this.shared.uBarCS.value as THREE.Vector2).set(Math.cos(barAng), Math.sin(barAng));
     this.updateLocalISM();
     if (this.mapsDirty) this.renderMaps();
     const cam = this.cameraModel(camera, o.origin);
@@ -968,8 +1133,16 @@ export class GalaxyLayer {
     this.localActive = this.starsVisible && this.darkMatter && Math.abs(cam.z) < 1500 && Rc < this.dens.trunc * 1.05;
     const cutFade = 1 - THREE.MathUtils.smoothstep(Math.abs(cam.z), 600, 1500);
     this.volMat.uniforms.uNearCut.value = this.localActive ? this.nearCut * cutFade : 0;
-    if (this.useVolume && this.volumeVisible && this.volumeGain > 0.001) {
-      if (!this.volRT) this.resize(target.width, target.height);
+    const drawVol = this.useVolume && this.volumeVisible && this.volumeGain > 0.001;
+    const drawStars = !!this.stars && this.starsVisible;
+    if (drawVol || drawStars) {
+      if (!this.volRT || this.sizedFor.x !== target.width || this.sizedFor.y !== target.height) this.resize(target.width, target.height);
+    }
+    const cu = this.compMat.uniforms;
+    cu.uHasVol.value = 0;
+    cu.uHasStars.value = 0;
+    cu.uHasStarsHi.value = 0;
+    if (drawVol) {
       const vu = this.volMat.uniforms;
       const th = Math.tan(fov / 2);
       (vu.uTanFov.value as THREE.Vector2).set(th * camera.aspect, th);
@@ -977,6 +1150,9 @@ export class GalaxyLayer {
       (vu.uCamModel.value as THREE.Vector3).copy(cam);
       vu.uFrame.value = (o.frame ?? 0) % 64;
       vu.uGain.value = this.radianceScale * this.volumeGain;
+      // 8-bit fallback: store the volume tone-compressed around the exposure the post chain applies.
+      this.volEncode = this.halfRT ? 0 : Math.max(exposure, 1e-6);
+      vu.uEncode.value = this.volEncode;
       this.quad.material = this.volMat;
       this.quad.render(renderer, this.volRT!);
       // Temporal accumulation.
@@ -989,17 +1165,14 @@ export class GalaxyLayer {
       this.quad.material = this.accMat;
       this.quad.render(renderer, dst);
       this.accIdx = 1 - this.accIdx;
-      const cu = this.compMat.uniforms;
       cu.tVol.value = dst.texture;
+      cu.uHasVol.value = 1;
+      cu.uDecode.value = this.volEncode;
       (cu.uTexel.value as THREE.Vector2).set(1 / this.volRT!.width, 1 / this.volRT!.height);
-      this.quad.material = this.compMat;
-      renderer.setRenderTarget(target);
-      renderer.render(this.quad.scene, this.quad.camera);
-      if (++this.meterFrame % 6 === 1) this.runMeter(renderer, target);
     }
 
-    if (this.stars && this.starsVisible) {
-      const su = this.starMat.uniforms;
+    const su = this.starMat.uniforms;
+    if (drawStars) {
       (su.uCamModel.value as THREE.Vector3).copy(cam);
       (su.uOrigin.value as THREE.Vector3).copy(o.origin ?? ZERO);
       su.uFluxToRad.value = this.radianceScale / (4 * Math.PI * omegaPx);
@@ -1016,16 +1189,59 @@ export class GalaxyLayer {
       hu.uPxPerRad.value = su.uPxPerRad.value = H / (2 * Math.tan(fov / 2));
       hu.uMaxSize.value = Math.min(this.maxPointSize, 64);
       hu.uGain.value = this.hiiGain * this.params.gas.hii;
+      // Smooth (wide) sprites at reduced resolution, composited below together with the volume.
+      const lo = this.starLoRT;
+      if (lo) {
+        su.uLoScale.value = lo.height / H;
+        su.uPass.value = 2;
+        this.clearTarget(renderer, lo);
+        if (this.hii) this.hii.visible = false;
+        renderer.render(this.starScene, camera);
+        cu.tStars.value = lo.texture;
+        cu.uHasStars.value = 1;
+        (cu.uStarTexel.value as THREE.Vector2).set(1 / lo.width, 1 / lo.height);
+        // Multisampled target: the sharp sprites too go through a single-sample target (same grid).
+        const hi = target.samples > 0 ? this.ensureStarHi(target.width, target.height) : null;
+        if (hi) {
+          su.uPass.value = 1;
+          this.clearTarget(renderer, hi);
+          renderer.render(this.starScene, camera);
+          cu.tStarsHi.value = hi.texture;
+          cu.uHasStarsHi.value = 1;
+        }
+        if (this.hii) this.hii.visible = true;
+      }
+    }
+
+    if (cu.uHasVol.value || cu.uHasStars.value) {
+      this.quad.material = this.compMat;
       renderer.setRenderTarget(target);
+      renderer.render(this.quad.scene, this.quad.camera);
+    }
+    if (drawVol && ++this.meterFrame % 6 === 1) this.runMeter(renderer, target);
+
+    if (drawStars) {
+      su.uPass.value = this.starLoRT ? 1 : 0;
+      renderer.setRenderTarget(target);
+      // Sharp sprites already composited: only the HII regions (and the local field) remain.
+      const hiDone = cu.uHasStarsHi.value === 1 && !!this.stars;
+      if (hiDone) this.stars!.visible = false;
       renderer.render(this.starScene, camera);
+      if (hiDone) this.stars!.visible = true;
       if (this.localActive) {
+        const th = this.localRotation();
+        const c = Math.cos(th), sn = Math.sin(th);
+        this.localRot.value.set(c, sn);
+        // Camera in the co-rotating frame.
+        const rx = c * cam.x + sn * cam.y;
+        const ry = -sn * cam.x + c * cam.y;
         for (const lt of this.localTiers) {
           const u = lt.mat.uniforms;
           const C = u.uCell.value as number;
           const R = u.uRadius.value as number;
           // Skip tiers whose stars are all out of reach (camera far above or outside the disk).
           lt.pts.visible = Math.abs(cam.z) < R + 2500 && Math.hypot(cam.x, cam.y) < this.dens.trunc * 1.1 + R;
-          (u.uCamCell.value as THREE.Vector3).set(Math.floor(cam.x / C), Math.floor(cam.y / C), Math.floor(cam.z / C));
+          (u.uCamCell.value as THREE.Vector3).set(Math.floor(rx / C), Math.floor(ry / C), Math.floor(cam.z / C));
           u.uGain.value = this.radianceScale;
         }
         renderer.render(this.localScene, camera);
@@ -1040,10 +1256,13 @@ export class GalaxyLayer {
    */
   nearestStars(posPc: THREE.Vector3, k = 16): StarRecord[] {
     const m = this.kin.fromRender(posPc.x, posPc.y, posPc.z, { x: 0, y: 0, z: 0 });
-    const field = nearestLocalStars(this.dens, this.params.seed >>> 0, m.x, m.y, m.z, k);
+    // The field lives in the co-rotating frame (as drawn): query there, rotate the results back.
+    const th = this.localRotation();
+    const c = Math.cos(th), sn = Math.sin(th);
+    const field = nearestLocalStars(this.dens, this.params.seed >>> 0, c * m.x + sn * m.y, -sn * m.x + c * m.y, m.z, k);
     const out: Array<StarRecord & { d: number }> = field.map((f) => {
       const v = new THREE.Vector3();
-      this.kin.toRender(f.x, f.y, f.h, v);
+      this.kin.toRender(c * f.x - sn * f.y, sn * f.x + c * f.y, f.h, v);
       return { id: f.id, position: v, temperatureK: f.temperatureK, luminosity: f.luminosity, massSun: f.massSun, seed: f.seed, kind: 'field' as const, d: v.distanceTo(posPc) };
     });
     const reach = out.length ? out[out.length - 1].d : Infinity;
@@ -1083,8 +1302,11 @@ export class GalaxyLayer {
   private runMeter(renderer: THREE.WebGLRenderer, target: THREE.WebGLRenderTarget): void {
     if (this.meterPending || !this.volRT) return;
     if (!this.meterRT) {
+      // Float32 when renderable (EXT_color_buffer_float), else half float; 8-bit targets cannot hold
+      // the log sums, so without either the meter stays off and exposure keeps its default.
+      if (!this.halfRT) return;
       this.meterRT = new THREE.WebGLRenderTarget(16, 9, {
-        type: THREE.FloatType,
+        type: this.floatRT ? THREE.FloatType : THREE.HalfFloatType,
         format: THREE.RGBAFormat,
         minFilter: THREE.NearestFilter,
         magFilter: THREE.NearestFilter,
@@ -1100,6 +1322,7 @@ export class GalaxyLayer {
         depthWrite: false,
         uniforms: { tVol: { value: null }, uFloor: { value: 0.5 } },
       });
+      if (!this.floatRT) this.meterHalf = new Uint16Array(16 * 9 * 4);
     }
     const mat = this.meterMat!;
     mat.uniforms.tVol.value = this.accRT ? this.accRT[this.accIdx].texture : this.volRT.texture;
@@ -1108,11 +1331,13 @@ export class GalaxyLayer {
     renderer.setRenderTarget(target);
     this.meterPending = true;
     const rt = this.meterRT;
+    const half = this.meterHalf;
     renderer
-      .readRenderTargetPixelsAsync(rt, 0, 0, 16, 9, this.meterBuf)
+      .readRenderTargetPixelsAsync(rt, 0, 0, 16, 9, half ?? this.meterBuf)
       .then(() => {
         if (this.disposed) return;
         const b = this.meterBuf;
+        if (half) for (let i = 0; i < b.length; i++) b[i] = THREE.DataUtils.fromHalfFloat(half[i]);
         let sl = 0;
         let sw = 0;
         let sa = 0;
@@ -1177,6 +1402,8 @@ export class GalaxyLayer {
     this.mapNormRT.dispose();
     this.noiseRT.dispose();
     this.volRT?.dispose();
+    this.starLoRT?.dispose();
+    this.starHiRT?.dispose();
     this.accRT?.[0].dispose();
     this.accRT?.[1].dispose();
     this.accMat.dispose();
@@ -1184,7 +1411,23 @@ export class GalaxyLayer {
   }
 }
 
+/**
+ * Cost knobs of the diffuse-light ray-march per quality `detail` (0.35 low … 1 high … 1.6 ultra).
+ * Volume pixels ∝ volScale² (capped at volPixelCap), steps per ray ≤ maxSteps; in-plane rays take
+ * geometric steps of stepNear × distance. Low costs ≈ ¼ of high per target pixel.
+ */
+export function galaxyTier(detail: number): { volScale: number; maxSteps: number; stepNear: number; volPixelCap: number } {
+  const d = Math.max(0.35, detail);
+  return {
+    volScale: Math.min(0.55, Math.max(0.26, 0.18 + 0.24 * d)),
+    maxSteps: Math.round(90 + 150 * Math.min(1.2, d)),
+    stepNear: Math.min(0.075, Math.max(0.04, 0.045 / Math.sqrt(d))),
+    volPixelCap: 1.0e6 * d,
+  };
+}
+
 const ZERO = new THREE.Vector3();
+const BASIS_IDX = [0, 1, 2, 4, 5, 6, 8, 9, 10] as const;
 let MW_REF = 0;
 const mwRef = () => (MW_REF ||= mwReference(milkyWay(1)));
 

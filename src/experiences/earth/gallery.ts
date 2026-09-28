@@ -168,9 +168,11 @@ export const GALLERY: GalleryWorld[] = [
     body: 'Limb darkening from the grey atmosphere (Eddington–Barbier: we see to τ ≈ μ, cooler toward the limb, so it is dimmer and redder). Granulation, spots with filamentary penumbrae, faculae, Hα prominences and the white corona.',
     rows: [['T_eff', '5 772 K'], ['Radius', '695 700 km'], ['Granules', '≈ 1 000 km']],
     lighting: 'day',
-    distance: 1.9,
+    // The whole disk, right of centre, with black sky above it: a near-white Sun filling the frame put the
+    // top-right controls and the hint on white.
+    distance: 5.5,
     pitch: 0.05,
-    frameX: 0.4,
+    frameX: 0.22,
     rotationHours: 609,
   },
 ];

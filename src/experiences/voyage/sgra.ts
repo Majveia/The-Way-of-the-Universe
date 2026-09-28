@@ -60,6 +60,7 @@ void main() {
 export class SgrARegime {
   readonly frame: Frame;
   bh: BlackHoleRenderer | null = null;
+  /** Distance weight of the ray-traced view (0 beyond 2 500 r_g, 1 inside 1 500 r_g). */
   weight = 0;
   exposure = 1;
   private cube: THREE.WebGLCubeRenderTarget | null = null;
@@ -72,6 +73,8 @@ export class SgrARegime {
   private meterToken = 0;
   private fader: LayerFader;
   private captured = false;
+  /** The captured sky's log-mean brightness has been read back (asynchronously) and applied. */
+  private metered = false;
   private cam = new THREE.PerspectiveCamera(55, 1, 0.01, 1e9);
   private faceCams: THREE.PerspectiveCamera[] = [];
   private time = 0;
@@ -125,11 +128,22 @@ export class SgrARegime {
       this.meterRT = null;
       this.meterToken++;
       this.captured = false;
+      this.metered = false;
     }
   }
 
   get needsCapture(): boolean {
     return !!this.bh && !this.captured;
+  }
+
+  /** The lens can be shown: environment captured and metered (an unmetered sky would be ~100× too bright). */
+  get lensReady(): boolean {
+    return !!this.bh && this.captured && this.metered;
+  }
+
+  /** Weight with which the lensed view actually replaces the scene this frame. */
+  get visibleWeight(): number {
+    return this.lensReady ? this.weight : 0;
   }
 
   /**
@@ -173,7 +187,10 @@ export class SgrARegime {
     // Meter the captured sky (log-mean luminance over all faces) so the lensed environment keeps the
     // dark-adapted look of the sky it replaces (a bulge-lit sky is bright). Read back asynchronously
     // (no pipeline stall); the lens is still invisible here (it mixes in below 2 500 r_g).
+    // Until the value arrives the lens stays hidden (lensReady); on a real GPU that is 1–3 frames, and
+    // the capture happens while the hole is still far (it only mixes in below 2 500 r_g).
     const token = ++this.meterToken;
+    this.metered = false;
     r.readRenderTargetPixelsAsync(meter, 0, 0, meter.width, meter.height, this.meterBuf)
       .then(() => {
         if (token !== this.meterToken) return;
@@ -182,9 +199,13 @@ export class SgrARegime {
         const n = meter.width * meter.height;
         for (let k = 0; k < n; k++) sum += ((b[k * 4] + b[k * 4 + 1] / 255) / 255) * 16 - 12;
         this.envNorm = THREE.MathUtils.clamp(ENV_LEVEL / Math.max(Math.exp(sum / n), 1e-6), 1e-3, 10);
+        this.metered = true;
       })
       .catch(() => {
-        /* metering is optional: keep the default normalisation */
+        // Metering unavailable: a typical galactic-centre sky (log-mean ≈ 2.5 in these units).
+        if (token !== this.meterToken) return;
+        this.envNorm = ENV_LEVEL / 2.5;
+        this.metered = true;
       });
     r.setRenderTarget(prev);
   }
@@ -201,7 +222,7 @@ export class SgrARegime {
    */
   render(target: THREE.WebGLRenderTarget, quat: THREE.Quaternion, fov: number, camPosRg: THREE.Vector3, postE: number, frame: number): void {
     const bh = this.bh;
-    if (!bh || !this.captured || this.weight <= 0.001) return;
+    if (!bh || !this.lensReady || this.weight <= 0.001) return;
     const c = this.cam;
     c.fov = fov;
     c.aspect = target.width / target.height;

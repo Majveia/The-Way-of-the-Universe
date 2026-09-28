@@ -4,6 +4,7 @@
 import * as THREE from 'three';
 import { AU } from '../../physics/constants';
 import { radecToVector, sunState, msToJD, VOYAGER1_PALE_BLUE_DOT } from '../../physics/planets-ephemeris';
+import { NIGHT_GAIN } from '../../worlds/planet/glow';
 
 export const R_EARTH_KM = 6371;
 /** 1 AU in Earth radii. */
@@ -79,4 +80,10 @@ export function moonOrientation(moonPos: THREE.Vector3, obliquity: number, out: 
   mx.addScaledVector(my, -mx.dot(my)).normalize();
   mz.crossVectors(mx, my);
   return out.setFromRotationMatrix(mm.makeBasis(mx, my, mz));
+}
+
+/** '10⁵' for the night-vision gain (one exaggeration for cities, aurora and airglow; see glow.ts). */
+export function nightGainText(gain = NIGHT_GAIN): string {
+  const SUP = '⁰¹²³⁴⁵⁶⁷⁸⁹';
+  return `10${String(Math.round(Math.log10(gain))).replace(/\d/g, (d) => SUP[Number(d)])}`;
 }

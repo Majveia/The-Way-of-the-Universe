@@ -799,4 +799,50 @@ describe('Review: keyframes encoded off the main thread', () => {
     expect(s.prefetch(8, 1)).toBe(true);
     expect(Array.from(s.positions(8))).toEqual(Array.from(ref.positions(8)));
   });
+
+  it('recycled decode buffers never corrupt a frame: playback, prefetch and random scrubs agree with fresh decodes', () => {
+    // The store reuses evicted decode buffers (no 12 MB allocation per keyframe crossing). A buffer
+    // must never be recycled while it is still cached, being decoded from, or is an I-frame's
+    // stored array — any of those would silently rewrite positions on screen.
+    const count = 256;
+    const truth = makeFrames(count, 26, 9);
+    const s = new SnapshotStore(count);
+    truth.forEach((p, f) => s.add(kf(f, { positions: p.slice() })));
+    const fresh = (f: number) => {
+      const r = new SnapshotStore(count);
+      truth.forEach((p, g) => r.add(kf(g, { positions: p.slice() })));
+      return Array.from(r.positions(f));
+    };
+    const want = truth.map((_, f) => fresh(f));
+    const iframe0 = Array.from(s.positions(0));
+    // Playback: bind A/B, prefetch the next in slices, cross, repeat.
+    for (let k = 0; k + 1 < truth.length; k++) {
+      const A = s.positions(k), B = s.positions(k + 1);
+      expect(Array.from(A)).toEqual(want[k]);
+      expect(Array.from(B)).toEqual(want[k + 1]);
+      if (k + 2 < truth.length) {
+        expect(s.canPrefetch(k + 2)).toBe(true);
+        while (!s.prefetch(k + 2, 97));
+        // Held references to the displayed pair are still intact after the prefetch's eviction.
+        expect(Array.from(A)).toEqual(want[k]);
+        expect(Array.from(B)).toEqual(want[k + 1]);
+      }
+    }
+    // Random scrubs (decode chains from I-frames or cached neighbours).
+    const rnd = mulberry32(4);
+    for (let i = 0; i < 60; i++) {
+      const f = Math.floor(rnd() * truth.length);
+      expect(Array.from(s.positions(f))).toEqual(want[f]);
+    }
+    // I-frames are served without a copy and are never overwritten by recycling.
+    expect(s.positions(8)).toBe(s.frames[8].full);
+    expect(Array.from(s.positions(0))).toEqual(iframe0);
+    // A frame whose predecessor is not cached cannot be prefetched incrementally.
+    const t = new SnapshotStore(count);
+    truth.forEach((p, f) => t.add(kf(f, { positions: p.slice() })));
+    expect(t.canPrefetch(5)).toBe(false);
+    expect(t.canPrefetch(8)).toBe(true);
+    t.positions(4);
+    expect(t.canPrefetch(5)).toBe(true);
+  });
 });

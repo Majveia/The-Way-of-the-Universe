@@ -34,6 +34,9 @@ export function marchFragment(d: MarchDefines): string {
     d.layout === 'shock' ? '#define SHOCK 1' : '#define PHOTO 1',
     d.synchrotron ? '#define SYNCHROTRON 1' : '',
     d.probe ? '#define PROBE 1' : '',
+    // Empty-space skipping: only where an empty coarse cell guarantees medium() == 0
+    // (photoionized layouts without an analytic continuum).
+    d.layout === 'photo' && !d.synchrotron ? '#define OCCUPANCY 1' : '',
   ].join('\n');
   return /* glsl */ `
 precision highp float;
@@ -45,6 +48,9 @@ ${NEBULA_COMMON_GLSL}
 
 uniform sampler3D uField;
 uniform sampler3D uDetail;
+#ifdef OCCUPANCY
+uniform sampler3D uOcc;    // coarse occupancy (1 = some gas or dust within the cell's trilinear footprint)
+#endif
 uniform vec2 uRes;
 uniform vec2 uJitter;
 uniform float uFrame;
@@ -101,6 +107,7 @@ uniform vec4 uWisp;        // wisp ring radius, width, height, brightness
 
 #ifdef PROBE
 uniform vec2 uProbeNdc;
+uniform float uProbeScale;  // keeps the raw accumulators inside half-float range on the fallback path
 layout(location = 0) out vec4 oA;
 layout(location = 1) out vec4 oB;
 layout(location = 2) out vec4 oC;
@@ -129,8 +136,11 @@ Medium medium(vec3 p, vec3 rd, float tCam) {
   // Detail LOD: a 3D texture has no mips here, so fade each octave to its mean once a texel
   // is smaller than the pixel footprint (otherwise it aliases into a moiré of dots).
   float fp = tCam * uPixAngle;
-  vec4 D1 = mix(vec4(0.5), texture(uDetail, pc * uDetailFreq.x + uDrift1), 1.0 - smoothstep(0.6, 1.8, fp / uTexel.x));
-  vec4 D2 = mix(vec4(0.5), texture(uDetail, pc * uDetailFreq.y + uDrift2), 1.0 - smoothstep(0.6, 1.8, fp / uTexel.y));
+  // (Skip the fetch entirely once an octave has faded out: distant views save two 3D taps.)
+  float w1 = 1.0 - smoothstep(0.6, 1.8, fp / uTexel.x);
+  float w2 = 1.0 - smoothstep(0.6, 1.8, fp / uTexel.y);
+  vec4 D1 = w1 > 0.0 ? mix(vec4(0.5), textureLod(uDetail, pc * uDetailFreq.x + uDrift1, 0.0), w1) : vec4(0.5);
+  vec4 D2 = w2 > 0.0 ? mix(vec4(0.5), textureLod(uDetail, pc * uDetailFreq.y + uDrift2, 0.0), w2) : vec4(0.5);
 #ifdef PHOTO
   // Unit-variance sub-voxel fluctuation (the detail channels have σ ≈ 0.1–0.15).
   float turb = (D1.r - 0.5) * 6.0 + (D2.r - 0.5) * 3.5 + (D2.g - 0.45) * 1.5;
@@ -269,6 +279,16 @@ void main() {
     float c = max(tn, uNearScale);
     float beta = max(log(1.0 + (tf - tn) / c), 1e-4);
     float eb = exp(beta) - 1.0;
+    // Geometric sample spacing t(u) = tn + (tf − tn)(e^{βu} − 1)/(e^β − 1), evaluated
+    // incrementally: e^{β(i+1)/N} = e^{βi/N} · e^{β/N} (one multiply per step instead of 3 exp).
+    float Lspan = (tf - tn) / eb;
+    float rStep = exp(beta / N);
+    float rJit = exp(beta * jit / N);
+    float E = 1.0;
+    // Running transmittances of the line groups and of the continuum: T ← T e^{−Δτ k}, sharing
+    // e^{−Δτ k} with the segment weight (1 − e^{−Δτ k})/(Δτ k).
+    vec3 TL = vec3(1.0);
+    vec3 TC = vec3(1.0);
     float tPrev = tn;
     float dPrev = 0.0;
     bool havePrev = false;
@@ -277,19 +297,25 @@ void main() {
     float tP2 = tn;
     for (int i = 0; i < MAX_STEPS; i++) {
       if (i >= uSteps) break;
-      float u0 = float(i) / N;
-      float u1 = (float(i) + 1.0) / N;
-      float us = (float(i) + jit) / N;
-      float ta = tn + (tf - tn) * (exp(beta * u0) - 1.0) / eb;
-      float tb2 = tn + (tf - tn) * (exp(beta * u1) - 1.0) / eb;
-      float ts = tn + (tf - tn) * (exp(beta * us) - 1.0) / eb;
+      float E1 = E * rStep;
+      float ta = tn + Lspan * (E - 1.0);
+      float tb2 = tn + Lspan * (E1 - 1.0);
+      float ts = tn + Lspan * (E * rJit - 1.0);
+      E = E1;
       float dt = tb2 - ta;
       vec3 p = ro + rd * ts;
+#ifdef OCCUPANCY
+      // Empty coarse cell: medium() is exactly zero here (no emission, no dust, no scattering).
+      if (textureLod(uOcc, p / (uExpand * 2.0 * uHalf) + 0.5, 0.0).r < 0.5) continue;
+#endif
       Medium M = medium(p, rd, ts);
       float dTau = M.sigma * dt;
-      vec3 Tl = exp(-tauV * uKLine);
-      vec3 wl = segW(dTau * uKLine) * Tl * dt;
-      vec3 Tc = exp(-tauV * uKExt) * segW(dTau * uKExt) * dt;
+      vec3 xL = dTau * uKLine;
+      vec3 eL = exp(-xL);
+      vec3 wl = segWe(xL, eL) * TL * dt;
+      vec3 xC = dTau * uKExt;
+      vec3 eC = exp(-xC);
+      vec3 Tc = TC * segWe(xC, eC) * dt;
       vec4 dA = M.eA * vec4(wl.x, wl.y, wl.z, wl.y);
       vec4 dB = M.eB * vec4(wl.x, wl.x, wl.y, wl.z);
       vec3 dC = M.cont * Tc;
@@ -328,7 +354,7 @@ void main() {
         sR *= M.sheet.y;
         sO *= M.sheet.z;
         sB *= M.sheet.w;
-        vec3 Ts = exp(-tauV * uKLine);
+        vec3 Ts = TL;
         dA += vec4((sR + sB) * uRatiosA.x * Ts.x, (sR + sB) * uRatiosA.y * Ts.y, (sR + sB) * uRatiosA.z * Ts.z, sO * uRatiosA.w * Ts.y);
         dB += vec4(sR * uRatiosB.x * Ts.x, sR * uRatiosB.y * Ts.x, sR * uRatiosB.z * Ts.y, 0.0);
       }
@@ -345,6 +371,8 @@ void main() {
       float lum = dA.x * 0.08 + dA.w * 0.3 + dB.x * 0.08 + dot(dC, vec3(0.3));
       wDepth += lum;
       sDepth += lum * ts;
+      TL *= eL;
+      TC *= eC;
       float tauNew = tauV + dTau;
       if (tOpaque < 0.0 && tauNew > 0.7) tOpaque = ts;
       tauV = tauNew;
@@ -352,9 +380,9 @@ void main() {
     }
   }
 #ifdef PROBE
-  oA = accA;
-  oB = accB;
-  oC = vec4(cont, tauV);
+  oA = accA * uProbeScale;
+  oB = accB * uProbeScale;
+  oC = vec4(cont * uProbeScale, tauV);
 #else
   vec3 rgb = accA.x * uColA[0] + accA.y * uColA[1] + accA.z * uColA[2] + accA.w * uColA[3]
            + accB.x * uColB[0] + accB.y * uColB[1] + accB.z * uColB[2] + accB.w * uColB[3]

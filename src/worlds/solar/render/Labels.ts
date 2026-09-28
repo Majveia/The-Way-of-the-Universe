@@ -60,6 +60,12 @@ export class Labels {
   private placedPool: Array<{ x: number; y: number; w: number }> = [];
   private seen = new Set<string>();
   visible = true;
+  /**
+   * Screen rectangles (CSS px, overlay coordinates) that labels must not overlap — the host UI's
+   * readouts, time bar, title and info card. The first `keepOutCount` entries are used.
+   */
+  readonly keepOut: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+  keepOutCount = 0;
   private snapNext = false;
 
   /** Skip the fades on the next update (the view jumped). */
@@ -129,7 +135,12 @@ export class Labels {
       }
       const lx = left ? c.x - off - e.width : c.x + off;
       const ly = c.y;
-      let ok = this.visible && c.strength > 0.02 && c.x > -40 && c.x < width + 10 && c.y > -10 && c.y < height + 10;
+      // (Kept 10 px inside the top and bottom edges: a label cut in half by the frame edge is just noise.)
+      let ok = this.visible && c.strength > 0.02 && c.x > -40 && c.x < width + 10 && c.y > 10 && c.y < height - 10;
+      for (let r = 0; ok && r < this.keepOutCount; r++) {
+        const k = this.keepOut[r];
+        if (lx < k.x1 && lx + e.width > k.x0 && ly + 8 > k.y0 && ly - 8 < k.y1) ok = false;
+      }
       if (ok) {
         for (const p of this.placed) {
           if (Math.abs(p.y - ly) < 14 && lx < p.x + p.w + 6 && lx + e.width + 6 > p.x) {

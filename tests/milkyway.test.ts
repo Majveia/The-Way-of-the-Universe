@@ -291,3 +291,195 @@ describe('GalaxyModel facade', () => {
     expect(g.potential.vcKms(8200)).toBeGreaterThan(220);
   });
 });
+
+// ——— Review additions: conventions, GPU/CPU mirrors, and the Sun's place in the Galaxy ———————————
+import { VIS_EFF_COEFFS } from '../src/physics/galaxyStars';
+import { GALAXY_COMMON_GLSL } from '../src/worlds/galaxy/shaders/galaxyGlsl';
+
+describe('review: frames and conventions', () => {
+  it('the Sun sits at render (−8200, +20.8, 0) pc: GC at the origin, north Galactic pole along +y', () => {
+    const p = milkyWay(1);
+    const k = new Kinematics(p);
+    const s = p.sun!;
+    const o = { x: 0, y: 0, z: 0 };
+    k.toRender(s.R * Math.cos(s.phi), s.R * Math.sin(s.phi), s.z, o);
+    expect(o.x).toBeCloseTo(-8200, 6);
+    expect(o.y).toBeCloseTo(20.8, 6); // Bennett & Bovy (2019): the Sun is north of the plane
+    expect(Math.abs(o.z)).toBeLessThan(1e-6);
+    const back = k.fromRender(o.x, o.y, o.z, { x: 0, y: 0, z: 0 });
+    expect(back.x).toBeCloseTo(s.R * Math.cos(s.phi), 6);
+    expect(back.y).toBeCloseTo(s.R * Math.sin(s.phi), 6);
+    expect(back.z).toBeCloseTo(s.z, 6);
+  });
+
+  it('the Milky Way rotates clockwise seen from the north Galactic pole (L_y < 0 in the render frame)', () => {
+    const p = milkyWay(1);
+    const g = generateParticles(p, 20000);
+    const k = new Kinematics(p);
+    const a: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+    const b: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+    let Ly = 0;
+    let n = 0;
+    for (let i = 0; i < g.count; i++) {
+      if (g.data[i * STRIDE] !== KIND_DISK) continue;
+      particleState(k, g.data, i, 10, a);
+      particleState(k, g.data, i, 10.5, b);
+      // L_y = z·v_x − x·v_z (y-component of r × v).
+      Ly += a.z * (b.x - a.x) - a.x * (b.z - a.z);
+      n++;
+    }
+    expect(n).toBeGreaterThan(1000);
+    expect(Ly).toBeLessThan(0);
+  });
+
+  it('GLSL visual efficacy uses exactly the CPU fit coefficients (no silent drift)', () => {
+    const m = GALAXY_COMMON_GLSL.match(/pow\(10\.0,\s*([-\d.e]+)\s*\+\s*x\s*\*\s*\(([-\d.e]+)\s*\+\s*x\s*\*\s*\(([-\d.e]+)\s*\+\s*x\s*\*\s*\(([-\d.e]+)\s*\+\s*x\s*\*\s*([-\d.e]+)\)/);
+    expect(m).not.toBeNull();
+    const c = m!.slice(1, 6).map(Number);
+    c.forEach((v, i) => expect(v).toBeCloseTo(VIS_EFF_COEFFS[i], 9));
+    expect(visualEfficacyFit(5772)).toBeGreaterThan(0.97);
+    expect(visualEfficacyFit(5772)).toBeLessThan(1.03);
+  });
+});
+
+describe('review: the Sun in the Galaxy', () => {
+  it("Sun's angular speed (v_c + V⊙)/R⊙ ≈ 30.3 km/s/kpc (Sgr A* proper motion, Reid & Brunthaler 2020)", () => {
+    const p = milkyWay(1);
+    const pot = new GalaxyPotential(milkyWayComponents());
+    const w = (pot.vcKms(p.sun!.R) + p.sun!.V) / (p.sun!.R / 1000);
+    expect(w).toBeGreaterThan(29.2);
+    expect(w).toBeLessThan(31.4);
+  });
+
+  it('spiral corotation lies outside the Sun but inside the disk edge (Ω_p = 25 km/s/kpc → R_CR ≈ 9 kpc)', () => {
+    const p = milkyWay(1);
+    const pot = new GalaxyPotential(milkyWayComponents());
+    const cr = pot.resonance(radMyrFromKmsKpc(p.spiral.patternSpeed), 'CR');
+    expect(cr).toBeGreaterThan(8200);
+    expect(cr).toBeLessThan(11000);
+    // The Sun moves faster than the pattern: arms drift backwards past it (Ω⊙ > Ω_p).
+    expect(kmsKpcFromRadMyr(pot.omega(8200))).toBeGreaterThan(p.spiral.patternSpeed);
+  });
+
+  it('arms at the Sun’s azimuth today: Sagittarius–Carina inside, Orion Spur at the Sun, Perseus outside (Reid et al. 2019)', () => {
+    const p = milkyWay(1);
+    const arms = p.spiral.armList!;
+    const crossing = (name: string, lo: number, hi: number): number => {
+      const a = arms.find((x) => (x.name ?? '').startsWith(name))!;
+      let best = NaN;
+      let bestD = Infinity;
+      for (let R = lo; R <= hi; R += 5) {
+        const d = Math.abs(wrapPi(armPhi(a, R) - p.sun!.phi));
+        if (d < bestD) {
+          bestD = d;
+          best = R;
+        }
+      }
+      expect(bestD).toBeLessThan(0.01);
+      return best;
+    };
+    const sgr = crossing('Sagittarius', 5000, 8000);
+    const orion = crossing('Orion', 7400, 9800);
+    const per = crossing('Perseus', 8500, 12500);
+    expect(sgr).toBeGreaterThan(5800);
+    expect(sgr).toBeLessThan(7600);
+    expect(Math.abs(orion - p.sun!.R)).toBeLessThan(500);
+    expect(per).toBeGreaterThan(9200);
+    expect(per).toBeLessThan(11200);
+  });
+});
+
+describe('review: the GPU frequency table', () => {
+  it('LUT interpolation (what every star shader reads) matches the exact potential to < 0.5 % from 0.3 to 30 kpc', () => {
+    const p = milkyWay(1);
+    const k = new Kinematics(p);
+    for (let R = 300; R <= 30000; R *= 1.17) {
+      for (const [row, dark] of [[0, true], [1, false]] as const) {
+        expect(Math.abs(k.lutAt(R, row, 0) / k.potential.omega(R, dark) - 1)).toBeLessThan(5e-3);
+        expect(Math.abs(k.lutAt(R, row, 1) / k.potential.kappa(R, dark) - 1)).toBeLessThan(5e-3);
+        expect(Math.abs(k.lutAt(R, row, 3) / k.potential.vc(R, dark) - 1)).toBeLessThan(5e-3);
+      }
+    }
+  });
+});
+
+// ——— Second review: epicycle sense, bar orientation, cost tiers ————————————————————————————————
+import { KIND_BAR, defaultLive } from '../src/worlds/galaxy/model';
+import { galaxyTier } from '../src/worlds/galaxy/GalaxyLayer';
+
+describe('review 2: epicycles and the bar', () => {
+  it('disk epicycles conserve angular momentum to first order (retrograde epicycle, y = −γ·x-phase; B&T eq. 3.94)', () => {
+    // With x = −X cos ψ the tangential offset must be y = +(2Ω/κ) X sin ψ: then R²φ̇ is constant to
+    // O(X²). The opposite sign makes L_z oscillate by ≈ 4 X/R — a sign error invisible in any still image.
+    const p = milkyWay(1);
+    const k = new Kinematics(p, { ...defaultLive(p), arms: 0 });
+    const g = generateParticles(p, 20000);
+    const a: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+    const b: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+    let ratioSum = 0;
+    let n = 0;
+    for (let i = 0; i < g.count && n < 300; i++) {
+      const o = i * STRIDE;
+      if (g.data[o] !== KIND_DISK) continue;
+      const Rg = g.data[o + 1];
+      const X = g.data[o + 3]; // epicycle amplitude / R_g
+      if (Rg < 4000 || Rg > 12000 || X < 0.03 || X > 0.2) continue;
+      const kap = k.lutAt(Rg, 0, 1);
+      const Ls: number[] = [];
+      for (let j = 0; j < 16; j++) {
+        const t = (j / 16) * ((2 * Math.PI) / kap);
+        const dt = 0.01;
+        particleState(k, g.data, i, t - dt, a);
+        particleState(k, g.data, i, t + dt, b);
+        const x = 0.5 * (a.x + b.x), z = 0.5 * (a.z + b.z);
+        Ls.push(z * ((b.x - a.x) / (2 * dt)) - x * ((b.z - a.z) / (2 * dt)));
+      }
+      const mean = Ls.reduce((s, v) => s + v, 0) / Ls.length;
+      const rms = Math.sqrt(Ls.reduce((s, v) => s + (v / mean - 1) ** 2, 0) / Ls.length);
+      ratioSum += rms / X;
+      n++;
+    }
+    expect(n).toBeGreaterThan(50);
+    // Correct sense: rms(ΔL/L) ≈ O(X) · X ≪ X. Wrong sense: ≈ 2.8 X.
+    expect(ratioSum / n).toBeLessThan(0.4);
+  });
+
+  it('bar stars are elongated along the bar major axis at every time (x1 orbits rotate with Ω_b)', () => {
+    const p = milkyWay(1);
+    const k = new Kinematics(p);
+    const g = generateParticles(p, 20000);
+    const s: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+    const m = { x: 0, y: 0, z: 0 };
+    for (const t of [0, 37, 111]) {
+      const ang = p.bar.angle + k.omegaB * t;
+      let along = 0;
+      let across = 0;
+      for (let i = 0; i < g.count; i++) {
+        if (g.data[i * STRIDE] !== KIND_BAR) continue;
+        particleState(k, g.data, i, t, s);
+        k.fromRender(s.x, s.y, s.z, m);
+        const u = m.x * Math.cos(ang) + m.y * Math.sin(ang);
+        const v = -m.x * Math.sin(ang) + m.y * Math.cos(ang);
+        along += u * u;
+        across += v * v;
+      }
+      // Wegg et al. (2015): long bar axis ratio ≈ 0.3–0.5 in the plane.
+      expect(Math.sqrt(across / along)).toBeLessThan(0.7);
+    }
+  });
+});
+
+describe('review 2: quality tiers really scale the ray-march cost', () => {
+  it('low ≤ ~¼ of high per target pixel; ultra is the most expensive', () => {
+    const cost = (d: number) => {
+      const t = galaxyTier(d);
+      return t.volScale ** 2 * t.maxSteps;
+    };
+    expect(cost(0.35) / cost(1)).toBeLessThan(0.27);
+    expect(cost(0.7) / cost(1)).toBeLessThan(0.75);
+    expect(cost(1.6)).toBeGreaterThan(cost(1));
+    // Geometric in-plane steps: coarser on low, never coarser than 7.5 % of the distance.
+    expect(galaxyTier(0.35).stepNear).toBeGreaterThan(galaxyTier(1).stepNear);
+    expect(galaxyTier(0.35).stepNear).toBeLessThanOrEqual(0.075);
+  });
+});

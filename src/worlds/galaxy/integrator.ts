@@ -93,6 +93,7 @@ uniform sampler2D uPos;
 uniform sampler2D uVel;
 uniform int uSteps;
 uniform float uH;
+uniform float uPark;   // escapers are parked at this radius (finite in the storage format)
 layout(location = 0) out vec4 outPos;
 layout(location = 1) out vec4 outVel;
 void main() {
@@ -108,7 +109,7 @@ void main() {
     v += 0.5 * uH * accel(x);
   }
   // Escapers far beyond the halo are parked (still finite) rather than overflowing half floats downstream.
-  if (!(dot(x, x) < 1e14)) { x = normalize(P.xyz + 1e-3) * 1e7; v = vec3(0.0); }
+  if (!(dot(x, x) < uPark * uPark)) { x = normalize(P.xyz + 1e-3) * uPark; v = vec3(0.0); }
   outPos = vec4(x, P.w);
   outVel = vec4(v, 0.0);
 }
@@ -119,6 +120,8 @@ export class GalaxyIntegrator {
   readonly height: number;
   /** Largest leapfrog sub-step (Myr): ≥ 25 steps per orbit down to R ≈ 300 pc. */
   maxStep = 0.4;
+  /** Storage precision of the state textures. */
+  readonly precision: 'float32' | 'float16';
   private rts: [THREE.WebGLRenderTarget, THREE.WebGLRenderTarget];
   private cur = 0;
   private dataTex: THREE.DataTexture;
@@ -140,10 +143,15 @@ export class GalaxyIntegrator {
     this.dataTex = new THREE.DataTexture(padded, this.width * 3, this.height, THREE.RGBAFormat, THREE.FloatType);
     this.dataTex.minFilter = this.dataTex.magFilter = THREE.NearestFilter;
     this.dataTex.needsUpdate = true;
+    // Float32 state needs EXT_color_buffer_float (most desktops, Android, iOS 15+). Without it the
+    // state is stored in half floats (≈ 0.05% precision: a few pc at R⊙, visibly noisier but moving)
+    // rather than rendering into an incomplete framebuffer (every star would collapse to the origin).
+    const f32 = renderer.extensions.has('EXT_color_buffer_float');
+    this.precision = f32 ? 'float32' : 'float16';
     const mk = () => {
       const rt = new THREE.WebGLRenderTarget(this.width, this.height, {
         count: 2,
-        type: THREE.FloatType,
+        type: f32 ? THREE.FloatType : THREE.HalfFloatType,
         format: THREE.RGBAFormat,
         minFilter: THREE.NearestFilter,
         magFilter: THREE.NearestFilter,
@@ -183,6 +191,7 @@ export class GalaxyIntegrator {
         uVel: { value: null },
         uSteps: { value: 1 },
         uH: { value: 0.1 },
+        uPark: { value: f32 ? 1e7 : 6e4 },
       },
     });
   }

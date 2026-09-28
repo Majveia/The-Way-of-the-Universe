@@ -1,10 +1,24 @@
 import * as THREE from 'three';
 import { FullscreenQuad, FULLSCREEN_VERT } from '../../core/post/FullscreenQuad';
-import { bulkWindow, CENTER_TAU, type Diagnostics } from './cpu';
+import { bulkWindow, CENTER_TAU, TRACK_RADII, type Diagnostics } from './cpu';
 import { sphereScale, SMOOTH_EPS, type SmoothModel } from './galaxy';
 import { applyDiskMoments, DISK_REFIT_TAU, MOMENT_HARD, MOMENT_SIGMA, type DiskMoments } from './moments';
 import { SKELETON_WIDTH, TRACER_WIDTH, type ScenarioData } from './scenario';
-import { COPY2_FRAG, DEPOSIT_FRAG, DEPOSIT_VERT, DIAG_FRAG, FORCE_FRAG, SFR_FRAG, K_FRAG, KD_FRAG, MOMENTS_FRAG, TRACER_FRAG, TRACK_FRAG } from './shaders';
+import {
+  COPY2_FRAG,
+  DEPOSIT_FRAG,
+  DEPOSIT_VERT,
+  DIAG_FRAG,
+  FORCE_FRAG,
+  SFR_FRAG,
+  K_FRAG,
+  KD_FRAG,
+  MOMENTS_FRAG,
+  TRACER_FRAG,
+  TRACK_FRAG,
+  TRACK_REDUCE_FRAG,
+  TRACK_ROWS_FRAG,
+} from './shaders';
 import { SF_EFFICIENCY, SF_GRID_N } from './starformation';
 import { G_SIM } from './units';
 
@@ -104,11 +118,18 @@ export class NBodySystem {
   private tB: THREE.WebGLRenderTarget;
   private mA: THREE.WebGLRenderTarget;
   private mB: THREE.WebGLRenderTarget;
+  /** Centre tracking scratch: per-row windowed sums (MRT ×3) and two centroid estimates (1×2). */
+  private rowRT: THREE.WebGLRenderTarget;
+  private cA: THREE.WebGLRenderTarget;
+  private cB: THREE.WebGLRenderTarget;
+  private s2Wide: number[];
+  private s2Narrow: number[];
   private diagRT: THREE.WebGLRenderTarget;
   private momRT: THREE.WebGLRenderTarget;
   private attr: THREE.DataTexture;
   /** Gas density grids (two 64³ atlases side by side) for star formation. */
   private gridRT: THREE.WebGLRenderTarget;
+  private readonly gridFloat: boolean;
   private gridScene = new THREE.Scene();
   private gridCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   private gridGeoms: THREE.BufferGeometry[] = [];
@@ -116,8 +137,6 @@ export class NBodySystem {
   starFormation: boolean;
   private mats: Record<string, THREE.ShaderMaterial> = {};
   private pending = { diag: false, mom: false, model: false, sfr: false };
-  /** Frame-ish counters of how long each async read has been outstanding. */
-  private waited = { diag: 0, mom: 0, model: 0, sfr: 0 };
   private sfrRT: THREE.WebGLRenderTarget;
   /**
    * Star-formation rate (M☉/yr) averaged over the last `sfrWindow` Myr, per galaxy's gas
@@ -126,11 +145,13 @@ export class NBodySystem {
   starFormationRate: { total: number; perGalaxy: [number, number]; time: number } | null = null;
   sfrWindow = 10;
   /**
-   * Some drivers (notably software rasterisers) signal fences very late; after one read has waited
-   * too long, fall back to synchronous reads of these tiny textures.
+   * Synchronous reads of the tiny reduction textures (deterministic screenshots on software GL).
+   * Off by default: a synchronous readPixels drains the GPU queue and stalls the frame, so the
+   * frame loop only ever uses asynchronous (fenced PBO) reads; a slow fence just delays a readout.
    */
   syncReads = false;
   private lastRefitTime = 0;
+  private readonly hasGas: boolean;
   private disposed = false;
   private readonly sH: number;
   private readonly tH: number;
@@ -157,13 +178,24 @@ export class NBodySystem {
     this.tB = floatTarget(TRACER_WIDTH, this.tH, 2);
     this.mA = floatTarget(1, 2, 4);
     this.mB = floatTarget(1, 2, 4);
+    this.rowRT = floatTarget(1, this.sH, 3);
+    this.cA = floatTarget(1, 2, 1);
+    this.cB = floatTarget(1, 2, 1);
+    // Shrinking windows (TRACK_RADII = 2, 1 × the bulk window): s² = 2 (f w)².
+    const wins = data.galaxies.map((g) => bulkWindow(g.spec.disk.scale));
+    this.s2Wide = wins.map((w) => 2 * (TRACK_RADII[0] * w) ** 2);
+    this.s2Narrow = wins.map((w) => 2 * (TRACK_RADII[1] * w) ** 2);
     this.diagRT = floatTarget(1, this.sH, 2);
     this.momRT = floatTarget(1, this.tH, 3);
     this.sfrRT = floatTarget(1, this.tH, 1);
     this.attr = dataTexture(T.attr, TRACER_WIDTH, this.tH);
     this.starFormation = opts.starFormation ?? true;
+    this.hasGas = data.tracers.ranges.gas.some((g) => g[1] > 0);
+    // Additive deposit: float32 when it can be blended (EXT_float_blend), else half float with the
+    // mass spread over four channels (see DEPOSIT_VERT) — half float blends on every WebGL2 device.
+    this.gridFloat = renderer.extensions.has('EXT_float_blend');
     this.gridRT = new THREE.WebGLRenderTarget(SF_GRID_N * 16, SF_GRID_N * 8, {
-      type: THREE.HalfFloatType,
+      type: this.gridFloat ? THREE.FloatType : THREE.HalfFloatType,
       format: THREE.RGBAFormat,
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
@@ -217,19 +249,38 @@ export class NBodySystem {
       uG: { value: G_SIM },
     });
     // Segment rows per (comp, galaxy): index comp*2 + g — same order as scenario segments.
-    this.material('track', TRACK_FRAG, {
-      tPos: { value: null },
-      tVel: { value: null },
-      tAcc: { value: null },
+    const trackCommon = () => ({
       tM0: { value: null },
       tM1: { value: null },
       tM2: { value: null },
-      uRows: { value: segRows },
-      uWin: { value: this.data.galaxies.map((g) => bulkWindow(g.spec.disk.scale)) },
       uInitCenter: { value: this.data.galaxies.map((g) => new THREE.Vector3(...g.center)) },
       uDt: dtU,
-      uTau: { value: new THREE.Vector3(CENTER_TAU.x, CENTER_TAU.v, CENTER_TAU.u) },
       uInit: { value: 0 },
+    });
+    this.material('trackRows', TRACK_ROWS_FRAG, {
+      ...trackCommon(),
+      tPos: { value: null },
+      tVel: { value: null },
+      tAcc: { value: null },
+      tCen: { value: null },
+      uUsePred: { value: 1 },
+      uMode: { value: 0 },
+      uS2: { value: this.s2Wide },
+    });
+    this.material('trackReduce', TRACK_REDUCE_FRAG, {
+      ...trackCommon(),
+      tRows: { value: this.rowRT.textures[0] },
+      tCen: { value: null },
+      uUsePred: { value: 1 },
+      uRows: { value: segRows },
+    });
+    this.material('track', TRACK_FRAG, {
+      ...trackCommon(),
+      tRows1: { value: this.rowRT.textures[1] },
+      tRows2: { value: this.rowRT.textures[2] },
+      tCen: { value: this.cB.texture },
+      uRows: { value: segRows },
+      uTau: { value: new THREE.Vector3(CENTER_TAU.x, CENTER_TAU.v, CENTER_TAU.u) },
     });
     this.material('tracer', TRACER_FRAG, {
       tPos: { value: null },
@@ -368,21 +419,51 @@ export class NBodySystem {
   }
 
   private initTrack(): void {
-    const t = this.mats.track;
-    t.uniforms.uInit.value = 1;
-    this.bindTrack(t, this.mA);
-    this.pass(t, this.mB);
-    t.uniforms.uInit.value = 0;
-    [this.mA, this.mB] = [this.mB, this.mA];
+    this.track(true);
   }
 
-  private bindTrack(t: THREE.ShaderMaterial, model: THREE.WebGLRenderTarget): void {
-    t.uniforms.tPos.value = this.sA.textures[0];
-    t.uniforms.tVel.value = this.sA.textures[1];
-    t.uniforms.tAcc.value = this.sAcc.texture;
-    t.uniforms.tM0.value = model.textures[0];
-    t.uniforms.tM1.value = model.textures[1];
-    t.uniforms.tM2.value = model.textures[2];
+  /**
+   * One centre-tracking update (see TRACK_ROWS_FRAG): predict → windowed centroid (2w) →
+   * centroid (w) → bulk velocity/acceleration → filtered state into mB, then swap.
+   */
+  private track(init: boolean): void {
+    const { trackRows: R, trackReduce: D, track: T } = this.mats;
+    for (const m of [R, D, T]) {
+      const u = m.uniforms;
+      u.uInit.value = init ? 1 : 0;
+      u.tM0.value = this.mA.textures[0];
+      u.tM1.value = this.mA.textures[1];
+      u.tM2.value = this.mA.textures[2];
+    }
+    const r = R.uniforms, d = D.uniforms;
+    r.tPos.value = this.sA.textures[0];
+    r.tVel.value = this.sA.textures[1];
+    r.tAcc.value = this.sAcc.texture;
+    // 1. centroid in the wide window around the predicted centre
+    r.uUsePred.value = 1;
+    r.uMode.value = 0;
+    r.uS2.value = this.s2Wide;
+    r.tCen.value = this.cB.texture; // unused (bound for validity)
+    this.pass(R, this.rowRT);
+    d.uUsePred.value = 1;
+    d.tCen.value = this.cB.texture; // unused
+    this.pass(D, this.cA);
+    // 2. centroid in the narrow window
+    r.uUsePred.value = 0;
+    r.uS2.value = this.s2Narrow;
+    r.tCen.value = this.cA.texture;
+    this.pass(R, this.rowRT);
+    d.uUsePred.value = 0;
+    d.tCen.value = this.cA.texture;
+    this.pass(D, this.cB);
+    // 3. bulk velocity and acceleration in the narrow window around the final centroid
+    r.uMode.value = 1;
+    r.tCen.value = this.cB.texture;
+    this.pass(R, this.rowRT);
+    this.pass(T, this.mB);
+    const t = this.mA;
+    this.mA = this.mB;
+    this.mB = t;
   }
 
   /** Advance `n` skeleton steps (each with `substeps` tracer sub-steps). */
@@ -390,7 +471,7 @@ export class NBodySystem {
     if (this.disposed) return;
     const r = this.renderer;
     const prev = r.getRenderTarget();
-    const { kd, k, track, tracer } = this.mats;
+    const { kd, k, tracer } = this.mats;
     for (let i = 0; i < n; i++) {
       kd.uniforms.tPos.value = this.sA.textures[0];
       kd.uniforms.tVel.value = this.sA.textures[1];
@@ -401,10 +482,8 @@ export class NBodySystem {
       k.uniforms.tVel.value = this.sB.textures[1];
       k.uniforms.tAcc.value = this.sAcc.texture;
       this.pass(k, this.sA);
-      this.bindTrack(track, this.mA);
-      this.pass(track, this.mB);
-      [this.mA, this.mB] = [this.mB, this.mA];
-      const sf = this.starFormation && this.data.tracers.ranges.gas.some((g) => g[1] > 0);
+      this.track(false);
+      const sf = this.starFormation && this.hasGas;
       if (sf) this.depositGas();
       tracer.uniforms.uSfOn.value = sf ? 1 : 0;
       tracer.uniforms.uTime.value = this.time + this.dt;
@@ -414,7 +493,9 @@ export class NBodySystem {
       tracer.uniforms.tM0.value = this.mA.textures[0];
       tracer.uniforms.tM3.value = this.mA.textures[3];
       this.pass(tracer, this.tB);
-      [this.tA, this.tB] = [this.tB, this.tA];
+      const t = this.tA;
+      this.tA = this.tB;
+      this.tB = t;
       this.time += this.dt;
       this.steps++;
     }
@@ -452,11 +533,7 @@ export class NBodySystem {
 
   /** Read several attachments of a small float target, async when possible. */
   private read(kind: 'diag' | 'mom' | 'model' | 'sfr', rt: THREE.WebGLRenderTarget, w: number, h: number, bufs: Float32Array[]): Promise<Float32Array[]> | null {
-    if (this.pending[kind]) {
-      if (++this.waited[kind] > 45) this.syncReads = true;
-      return null;
-    }
-    this.waited[kind] = 0;
+    if (this.pending[kind]) return null;
     const r = this.renderer;
     if (this.syncReads) {
       bufs.forEach((b, k) => r.readRenderTargetPixels(rt, 0, 0, w, h, b, undefined, k));
@@ -470,10 +547,7 @@ export class NBodySystem {
 
   /** Energy / momentum of the skeleton (resolves into `diagnostics`). */
   requestDiagnostics(): void {
-    if (this.disposed || this.pending.diag) {
-      if (this.pending.diag && ++this.waited.diag > 45) this.syncReads = true;
-      return;
-    }
+    if (this.disposed || this.pending.diag) return;
     const d = this.mats.diag;
     d.uniforms.tPos.value = this.sA.textures[0];
     d.uniforms.tVel.value = this.sA.textures[1];
@@ -504,10 +578,7 @@ export class NBodySystem {
 
   /** Disk-tracer moments → refit the smooth disks (applied when the read completes). */
   requestDiskRefit(): void {
-    if (this.disposed || this.pending.mom) {
-      if (this.pending.mom && ++this.waited.mom > 45) this.syncReads = true;
-      return;
-    }
+    if (this.disposed || this.pending.mom) return;
     const m = this.mats.moments;
     m.uniforms.tPos.value = this.tA.textures[0];
     m.uniforms.tVel.value = this.tA.textures[1];
@@ -551,10 +622,7 @@ export class NBodySystem {
 
   /** Star-formation rate over the last `sfrWindow` Myr (resolves into `starFormationRate`). */
   requestStarFormationRate(): void {
-    if (this.disposed || this.pending.sfr) {
-      if (this.pending.sfr && ++this.waited.sfr > 45) this.syncReads = true;
-      return;
-    }
+    if (this.disposed || this.pending.sfr) return;
     const m = this.mats.sfr;
     m.uniforms.tPos.value = this.tA.textures[0];
     m.uniforms.uTime.value = this.time;
@@ -606,11 +674,14 @@ export class NBodySystem {
   /** Debug: maximum and total of the gas density grids (10⁶ M☉ per cell). */
   gridStats(): { max: number; sum: number; cells: number } {
     const w = this.gridRT.width, h = this.gridRT.height;
-    const buf = new Uint16Array(w * h * 4);
+    const n = w * h * 4;
+    const buf = this.gridFloat ? new Float32Array(n) : new Uint16Array(n);
     this.renderer.readRenderTargetPixels(this.gridRT, 0, 0, w, h, buf);
+    const val = (i: number) => (this.gridFloat ? buf[i] : THREE.DataUtils.fromHalfFloat(buf[i]));
     let max = 0, sum = 0, cells = 0;
     for (let i = 0; i < w * h; i++) {
-      const v = THREE.DataUtils.fromHalfFloat(buf[i * 4]);
+      let v = 0;
+      for (let k = 0; k < 4; k++) v += val(i * 4 + k);
       if (v > 0) cells++;
       sum += v;
       max = Math.max(max, v);
@@ -633,7 +704,7 @@ export class NBodySystem {
 
   dispose(): void {
     this.disposed = true;
-    for (const rt of [this.sA, this.sB, this.sAcc, this.tA, this.tB, this.mA, this.mB, this.diagRT, this.momRT, this.gridRT, this.sfrRT]) rt.dispose();
+    for (const rt of [this.sA, this.sB, this.sAcc, this.tA, this.tB, this.mA, this.mB, this.rowRT, this.cA, this.cB, this.diagRT, this.momRT, this.gridRT, this.sfrRT]) rt.dispose();
     for (const g of this.gridGeoms) g.dispose();
     this.attr.dispose();
     for (const m of Object.values(this.mats)) m.dispose();

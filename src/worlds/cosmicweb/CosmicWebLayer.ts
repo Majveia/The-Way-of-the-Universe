@@ -88,6 +88,8 @@ export class CosmicWebLayer {
       });
       this.web.setKeyframes(0, d.today.positions, 0, d.today.positions);
       this.web.setGalaxies(d.today.galaxies, d.today.galaxies);
+      // Programs link asynchronously (nothing is drawn before): resolve once the layer can draw.
+      return this.web.whenReady;
     });
   }
 
@@ -97,7 +99,7 @@ export class CosmicWebLayer {
   }
 
   get isReady(): boolean {
-    return !!this.web;
+    return !!this.web && this.web.ready;
   }
 
   /** Draw into the currently bound render target (linear HDR, additive). */

@@ -122,6 +122,13 @@ function noiseBuffer(ctx: AudioContext, seconds: number, color: 'white' | 'pink'
   return buf;
 }
 
+function sameParams(a: MoodParams, b: MoodParams): boolean {
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  for (const k of ka) if (a[k] !== b[k]) return false;
+  return true;
+}
+
 /** Retrigger-safe envelope: quick fade of whatever is sounding, then attack and exponential decay. */
 function strike(p: AudioParam, t: number, peak: number, attack: number, decay: number): void {
   p.cancelScheduledValues(t);
@@ -164,6 +171,7 @@ class GenerativeEngine implements SoundEngine {
   private brushTap!: GainNode;
   private sleepers: Sleeper[] = [];
   private jazzSleep!: Sleeper;
+  private ambSleep!: Sleeper;
   private sweepSleep!: Sleeper;
   private tickSleep!: Sleeper;
   private rumbleSleep!: Sleeper;
@@ -196,6 +204,8 @@ class GenerativeEngine implements SoundEngine {
   private comp: number[] = [];
   private motif: Array<[number, number]> = [];
   private timer = 0;
+  private lastMood = '';
+  private lastParams: MoodParams = {};
 
   start(ctx: AudioContext, dest: AudioNode): void {
     this.ctx = ctx;
@@ -238,10 +248,15 @@ class GenerativeEngine implements SoundEngine {
     this.ambient = g(1);
     this.jazzBus = g(0);
     this.fxBus = g(0.9);
-    for (const b of [this.ambient, this.fxBus]) {
-      b.connect(this.dry);
-      b.connect(this.send);
-    }
+    this.fxBus.connect(this.dry);
+    this.fxBus.connect(this.send);
+    // Ambient layers reach the mix through one gain, parked while "Ambience" is off
+    // (a parked sub-graph is not pulled, so it costs no audio-thread time).
+    const ambOut = g(1);
+    ambOut.connect(this.dry);
+    ambOut.connect(this.send);
+    this.ambSleep = new Sleeper(this.ambient, ambOut);
+    this.ambSleep.wake(Infinity);
     // The jazz layer reaches the mix through one gain, parked while the music is off.
     const jazzOut = g(1);
     jazzOut.connect(this.dry);
@@ -369,7 +384,9 @@ class GenerativeEngine implements SoundEngine {
       car.connect(out).connect(p);
       return { car, mod, idx, out, pan: p, free: 0, sleep: sl(p, bus) };
     };
-    for (let i = 0; i < 6; i++) this.bells.push(fm(this.ambient, (i / 5) * 1.2 - 0.6));
+    // The bell pool also plays event chimes, UI ticks and the jazz vibes, so it must not sit behind
+    // the Ambience switch (ambientBell() itself checks opts.ambience).
+    for (let i = 0; i < 6; i++) this.bells.push(fm(this.fxBus, (i / 5) * 1.2 - 0.6));
     for (let i = 0; i < 8; i++) this.eps.push(fm(this.jazzBus, ((i % 4) / 3) * 0.6 - 0.3));
 
     // ——— Upright bass: sine + soft triangle through a low-pass, plucked envelope ———
@@ -410,6 +427,8 @@ class GenerativeEngine implements SoundEngine {
     if (this.opts.music) this.jazzSleep.wake(Infinity);
     else this.jazzSleep.sleepAt(t + 4);
     this.ambient.gain.setTargetAtTime(this.opts.ambience ? 1 : 0, t, 0.9);
+    if (this.opts.ambience) this.ambSleep.wake(Infinity);
+    else this.ambSleep.sleepAt(t + 4);
     if (this.opts.music && !was) {
       this.nextBeat = t + 0.4;
       this.beat = 0;
@@ -426,6 +445,10 @@ class GenerativeEngine implements SoundEngine {
   }
 
   setMood(name: string, params: MoodParams): void {
+    // Callers may re-send the same mood often; skip the resolve (and its strings) when nothing changed.
+    if (this.ctx && name === this.lastMood && sameParams(params, this.lastParams)) return;
+    this.lastMood = name;
+    this.lastParams = { ...params };
     this.spec = resolveMood(name, params);
     if (!this.ctx) return;
     const k = harmonyKey(this.spec);
@@ -586,7 +609,8 @@ class GenerativeEngine implements SoundEngine {
     // Tiny, low-level, pitched to the current key; routed through uiBus (off by default).
     const f = midiToHz(this.spec.tonic + 48 + (name === 'ui-close' ? 0 : name === 'ui-move' ? 7 : 12));
     this.bellNote(f, t, name === 'ui-move' ? 0.008 : 0.016, 2, 0.08, 0.3);
-    this.tick(t, 0.015);
+    // The tick voice is shared with pulsar pulses scheduled ahead; a UI click would cancel them.
+    if (this.spec.pulse <= 0) this.tick(t, 0.015);
   }
 
   /** A click of band-limited noise (pulsar pulses, UI). */
@@ -636,6 +660,7 @@ class GenerativeEngine implements SoundEngine {
       if (s.rumble > 0.001) this.rumbleSleep.wake(now + 5);
       for (const z of this.sleepers) z.tick(now);
       this.jazzSleep.tick(now);
+      this.ambSleep.tick(now);
     }
     // Pad chord walk (ambient only; with jazz the pad holds a quartal colour on the tonic).
     if (now > this.nextPadChange) {

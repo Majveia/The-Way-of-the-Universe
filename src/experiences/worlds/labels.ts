@@ -60,6 +60,12 @@ export class Labels {
     this.starW = 0;
   }
 
+  private zones = true;
+  /** The zone labels follow the "Habitable zone · snow line" toggle. */
+  setZonesVisible(v: boolean): void {
+    this.zones = v;
+  }
+
   setVisible(v: boolean): void {
     this.visible = v;
     this.root.style.opacity = v ? '1' : '0';
@@ -92,7 +98,12 @@ export class Labels {
     const s = layer.project(layer.starPos, camera, w, h, this.starScreen);
     const srpx = Math.max(4, layer.pixelRadius(layer.starPos, layer.starRadius, camera, h));
     if (s.z <= 1) this.boxes.push(s.x - srpx, s.y - srpx, s.x + srpx, s.y + srpx);
-    const order = layer.bodies.map((_, i) => i).sort((a, b) => (a === this.selected ? -1 : b === this.selected ? 1 : layer.bodies[b].data.radius - layer.bodies[a].data.radius));
+    // Priority: the selected planet, then by size (reused array: no per-frame garbage).
+    const order = this.order;
+    order.length = 0;
+    for (let i = 0; i < layer.bodies.length; i++) order.push(i);
+    this.sortLayer = layer;
+    order.sort(this.byPriority);
     for (const i of order) {
       const b = layer.bodies[i];
       const e = this.planets[i];
@@ -117,9 +128,18 @@ export class Labels {
     if (dir.lengthSq() < 1e-12) dir.set(1, 0, 0);
     dir.normalize();
     const hzR = layer.mapRadius(layer.sys.hz.maxGreenhouse);
-    this.place(this.hz, layer, camera, w, h, dir, hzR, true);
-    this.place(this.snow, layer, camera, w, h, dir, layer.mapRadius(layer.sys.snowLine), true);
+    this.place(this.hz, layer, camera, w, h, dir, hzR, this.zones);
+    this.place(this.snow, layer, camera, w, h, dir, layer.mapRadius(layer.sys.snowLine), this.zones);
   }
+
+  private order: number[] = [];
+  private sortLayer: SystemLayer | null = null;
+  private byPriority = (a: number, b: number): number => {
+    if (a === this.selected) return -1;
+    if (b === this.selected) return 1;
+    const bodies = this.sortLayer!.bodies;
+    return bodies[b].data.radius - bodies[a].data.radius;
+  };
 
   private place(el: HTMLElement, layer: SystemLayer, camera: THREE.PerspectiveCamera, w: number, h: number, dir: THREE.Vector3, r: number, ok: boolean): void {
     const p = this.tmp.copy(dir).multiplyScalar(r);

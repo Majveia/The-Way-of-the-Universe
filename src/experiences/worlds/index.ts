@@ -4,7 +4,7 @@ import { OrbitRig } from '../../core/rigs/OrbitRig';
 import { Sky } from '../../worlds/sky/Sky';
 import { formatNumber } from '../../physics/units';
 import { Rng } from '../../physics/random';
-import { findSeed, generateSystem, SystemLayer, WorldCloseup, type SystemData, type SystemFeature } from '../../worlds/systems';
+import { findSeed, generateSystem, spinAxis, SystemLayer, WorldCloseup, type SystemData, type SystemFeature } from '../../worlds/systems';
 import { Portal } from './portal';
 import { formatPeriod, planetCard, skySizeText, starCard } from './cards';
 import { Labels } from './labels';
@@ -110,6 +110,7 @@ class PossibleWorlds implements Experience {
     const q = ctx.params;
     const seed = q.has('seed') ? Number(q.get('seed')) : DEFAULT_SEED;
     this.buildUI();
+    this.fitAspect = this.cssW / Math.max(1, this.cssH);
     this.load(seed, true);
     this.bindInput();
     ctx.audio.setMood('worlds', { intensity: 0.35 });
@@ -133,7 +134,16 @@ class PossibleWorlds implements Experience {
   resize(w: number, h: number): void {
     this.width = w;
     this.height = h;
+    // Re-fit the overview when the screen's *shape* changes (a phone rotating), not when dynamic
+    // resolution rescales the target (that would undo the viewer's zoom every few seconds).
+    if (!this.ctx) return;
+    const aspect = this.cssW / Math.max(1, this.cssH);
+    if (Math.abs(aspect - this.fitAspect) > 0.05 * this.fitAspect) {
+      this.fitAspect = aspect;
+      if (this.layer && this.mode === 'system' && this.focus.to < 0 && !this.jump) this.frameSystem(0.6);
+    }
   }
+  private fitAspect = 0;
 
   // ——— Systems ———
 
@@ -143,7 +153,10 @@ class PossibleWorlds implements Experience {
     this.layer?.dispose();
     this.sys = generateSystem(seed);
     this.layer = new SystemLayer(this.sys, { detail: this.detail, gamma: this.toggles.trueScale ? 1 : 0.5 });
-    this.layer.prepare(this.ctx.renderer);
+    // First load: bake everything before the first frame. Portal jumps bake one planet per frame
+    // (update → prepareStep) behind the vortex, instead of one multi-hundred-ms hitch.
+    if (initial) this.layer.prepare(this.ctx.renderer);
+    this.innerPeriodDays = Math.min(365, ...this.sys.planets.map((p) => p.periodDays));
     this.layer.setOrbitsVisible(this.toggles.orbits);
     this.layer.setZonesVisible(this.toggles.zones);
     this.gammaGoal = this.layer.compression;
@@ -189,12 +202,13 @@ class PossibleWorlds implements Experience {
   /** Overview distance in units of the system's extent (fits ~80% of the width). */
   private get frameFactor(): number {
     const aspect = this.cssW / Math.max(1, this.cssH);
-    return THREE.MathUtils.clamp(1.27 / (Math.tan((21 * Math.PI) / 180) * aspect), 1.85, 5.2);
+    return THREE.MathUtils.clamp(1.27 / (Math.tan((21 * Math.PI) / 180) * aspect), 1.85, 7.5);
   }
 
   /** Natural clock: the innermost planet completes an orbit in ~25 s. */
+  private innerPeriodDays = 365;
   private innerPeriod(): number {
-    return Math.min(...this.sys.planets.map((p) => p.periodDays), 365);
+    return this.innerPeriodDays;
   }
   private get daysPerSecond(): number {
     if (this.mode === 'system') return (this.innerPeriod() / 25) * this.rate;
@@ -255,7 +269,7 @@ class PossibleWorlds implements Experience {
     this.rig.minDistance = 1.08;
     this.rig.maxDistance = 60;
     this.rig.set({ distance: dPlanetRadii });
-    this.rig.flyTo({ distance: this.closeDistance(i), pitch: this.bigStar(i) ? -0.2 : this.rig.pitch }, 1.6);
+    this.rig.flyTo({ distance: this.closeDistance(i), pitch: this.bigStar(i) ? -0.2 : this.closePitch(i, this.rig.goal.yaw, this.rig.goal.pitch) }, 1.6);
     this.labels.setVisible(false);
     this.updateReadoutLabels();
   }
@@ -344,7 +358,7 @@ class PossibleWorlds implements Experience {
         this.focus = { from: i, to: i, t: 1, dur: 1 };
         this.rig.set({ distance: this.layer.bodies[i].displayRadius * 5.5, yaw: this.dayYaw(i), pitch: 0.16 });
         this.enterCloseup(i);
-        this.rig.set({ distance: this.closeDistance(i), pitch: this.bigStar(i) ? -0.2 : 0.16 });
+        this.rig.set({ distance: this.closeDistance(i), pitch: this.bigStar(i) ? -0.2 : this.closePitch(i, this.rig.yaw, 0.16) });
         break;
       }
       case 'orbit': {
@@ -389,6 +403,30 @@ class PossibleWorlds implements Experience {
     const p = this.sys.planets[i];
     if (this.bigStar(i)) return 6.5;
     return p.spec.rings ? 3.4 * Math.max(1.5, p.spec.rings.outer * 0.75) : 3.4;
+  }
+
+  /**
+   * Close-up camera elevation for planet i. A ringed planet seen from near its orbital plane shows
+   * its rings edge-on (a hairline across the disk) whenever the axial tilt is small, so aim for
+   * ≈ 22° above the *ring* plane, on the star-lit face, with the least change from `pitch`.
+   */
+  private closePitch(i: number, yaw: number, pitch: number): number {
+    const p = this.sys.planets[i];
+    if (!p.spec.rings || this.bigStar(i)) return pitch;
+    const n = spinAxis(p, this.tmp2); // ring normal
+    let side = 1;
+    if (this.closeup) side = Math.sign(n.dot(this.closeup.starDirection(this.tmp))) || 1;
+    let best = pitch, bestCost = Infinity;
+    for (let q = -0.9; q <= 0.9; q += 0.02) {
+      const d = Math.cos(q) * Math.sin(yaw) * n.x + Math.sin(q) * n.y + Math.cos(q) * Math.cos(yaw) * n.z;
+      const elev = Math.asin(THREE.MathUtils.clamp(d * side, -1, 1));
+      const cost = Math.abs(elev - 0.38) + 0.25 * Math.abs(q - pitch);
+      if (cost < bestCost) {
+        bestCost = cost;
+        best = q;
+      }
+    }
+    return best;
   }
 
   /** The most interesting planet: habitable > eyeball > ringed > largest. */
@@ -461,6 +499,7 @@ class PossibleWorlds implements Experience {
       if (this.mode === 'system' && this.focus.to < 0) this.rig.goal.logDistance = Math.log(this.layer.extent * this.frameFactor);
     }
     this.layer.setTime(this.timeDays);
+    this.layer.prepareStep(this.ctx.renderer, 1);
     this.rig.update(dt);
     this.focus.t = Math.min(this.focus.t + dt, this.focus.dur);
     // Exposure eases toward the goal (the close-up of a bright ice world vs a dark hot Jupiter).
@@ -497,7 +536,11 @@ class PossibleWorlds implements Experience {
       const card = document.querySelector('.info-card') as HTMLElement | null;
       this.cardOpen = !!card && !card.hidden && !document.querySelector('.ui.is-hidden');
     }
-    this.updateReadouts();
+    // Readouts at ~12 Hz: the digits are unreadable faster, and it keeps string churn off the frame.
+    if (--this.readoutCheck <= 0) {
+      this.readoutCheck = 5;
+      this.updateReadouts();
+    }
     this.labels.update(this.layer, this.camera, this.cssW, this.cssH, this.mode === 'system' && !this.jump);
   }
 
@@ -564,9 +607,21 @@ class PossibleWorlds implements Experience {
 
   render(target: THREE.WebGLRenderTarget): void {
     const r = this.ctx.renderer;
+    // Every renderer.render() into the multisampled HDR target ends with an MSAA resolve blit;
+    // this world draws several passes (sky, depth slices, portal). Nothing samples the resolved
+    // depth, so resolve colour only (≈ ⅓ less traffic per pass); restored below.
+    const resolveDepth = target.resolveDepthBuffer;
+    target.resolveDepthBuffer = false;
     this.camera.aspect = target.width / Math.max(1, target.height);
     this.camera.fov = this.mode === 'orbit' ? 60 : 42;
     r.setRenderTarget(target);
+    if (this.portal.covers) {
+      // Mid-jump the vortex hides everything: skip the sky and the system (two full passes and
+      // their MSAA resolves) while the next system bakes behind it.
+      this.portal.render(r, target, this.shaderTime, 1.4);
+      target.resolveDepthBuffer = resolveDepth;
+      return;
+    }
     // Sky at infinity: rotation only, with this system's orientation.
     const saved = this.savedQuat.copy(this.camera.quaternion);
     this.camera.quaternion.premultiply(this.skyRotation);
@@ -590,12 +645,21 @@ class PossibleWorlds implements Experience {
     else this.closeup?.render(r, this.camera);
     this.portal.render(r, target, this.shaderTime, 1.4);
     this.camera.clearViewOffset();
+    target.resolveDepthBuffer = resolveDepth;
+  }
+
+  /** Debug: cost accounting for the current view (render passes into the HDR target). */
+  stats(): { mode: Mode; passes: number; slices: number; planetsReady: boolean } {
+    const slices = this.mode === 'system' ? 1 : this.closeup?.slicesDrawn ?? 0;
+    if (this.portal.covers) return { mode: this.mode, passes: 1, slices: 0, planetsReady: this.layer.prepared };
+    return { mode: this.mode, passes: 1 + slices + (this.portal.active ? 1 : 0), slices, planetsReady: this.layer.prepared };
   }
 
   private frameShift = 0;
   private savedQuat = new THREE.Quaternion();
   private savedPos = new THREE.Vector3();
   private cardCheck = 0;
+  private readoutCheck = 0;
   private cardOpen = false;
 
   // ——— Input ———
@@ -684,7 +748,7 @@ class PossibleWorlds implements Experience {
       0,
     );
     v.toggle({ label: 'Orbits', value: true, onChange: (x) => { this.toggles.orbits = x; this.layer.setOrbitsVisible(x); } });
-    v.toggle({ label: 'Habitable zone · snow line', value: true, onChange: (x) => { this.toggles.zones = x; this.layer.setZonesVisible(x); } });
+    v.toggle({ label: 'Habitable zone · snow line', value: true, onChange: (x) => { this.toggles.zones = x; this.layer.setZonesVisible(x); this.labels.setZonesVisible(x); } });
     v.toggle({ label: 'Labels', value: true, onChange: (x) => { this.toggles.labels = x; this.labels.setVisible(x && this.mode === 'system'); } });
     this.trueScaleCtl = v.toggle({ label: 'True distances', value: false, onChange: (x) => this.setTrueScale(x, false) });
     v.slider({ label: 'Time rate', min: 0.02, max: 50, log: true, value: 1, unit: '×', onChange: (x) => (this.rate = x) });

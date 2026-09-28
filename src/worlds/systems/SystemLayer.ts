@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { orbitState } from '../../physics/kepler';
 import { createPlanet, type PlanetRenderer } from '../planet';
+import type { PlanetUpdate } from '../planet/types';
 import { createStar, type StarRenderer } from '../star';
 import { binaryMu, type PlanetData, type SystemData } from './generate';
 import { OrbitLine, ZoneDisk } from './overlays';
@@ -43,6 +44,8 @@ export interface BodyEntry {
   irradiance: number;
   meanAnomaly: number;
   spin: number;
+  /** GPU resources built (see SystemLayer.prepareStep); hidden until then. */
+  ready: boolean;
 }
 
 const tmpA = new THREE.Vector3();
@@ -115,7 +118,7 @@ export class SystemLayer {
     for (const p of sys.planets) {
       const planet = createPlanet({ ...p.spec, radius: 1, detail: detail * (p.spec.detail ?? 1) });
       const tilt = new THREE.Group();
-      tilt.rotation.z = p.axialTilt;
+      applyObliquity(tilt, p);
       tilt.add(planet.object);
       this.scene.add(tilt);
       const orbit = new OrbitLine(p.orbit, this.gamma, ORBIT_COLOR);
@@ -137,7 +140,9 @@ export class SystemLayer {
         irradiance: THREE.MathUtils.clamp(Math.pow(p.insolation / Smed, 0.25), 0.4, 2.2),
         meanAnomaly: 0,
         spin: 0,
+        ready: false,
       });
+      tilt.visible = false;
     }
     this.layoutSizes();
     this.setTime(0);
@@ -145,7 +150,31 @@ export class SystemLayer {
 
   /** Build GPU resources (atmosphere LUTs, surface bakes) now rather than on first sight. */
   prepare(renderer: THREE.WebGLRenderer): void {
-    for (const b of this.bodies) b.planet.prepare(renderer);
+    while (!this.prepareStep(renderer, Infinity));
+  }
+
+  /**
+   * Incremental preparation: bake at most `count` planets (surface cubes, LUTs, shader programs)
+   * and return true once every planet is ready. Each bake is synchronous GPU work (plus a small
+   * read-back and, for a new planet kind, a program link), so a portal jump spreads them over
+   * frames instead of one long hitch. Unprepared planets stay hidden and skip their updates.
+   */
+  prepareStep(renderer: THREE.WebGLRenderer, count = 1): boolean {
+    let n = 0;
+    for (const b of this.bodies) {
+      if (b.ready) continue;
+      if (n >= count) return false;
+      b.planet.prepare(renderer);
+      b.ready = true;
+      b.tilt.visible = true;
+      n++;
+    }
+    return true;
+  }
+
+  /** True when every planet has been prepared. */
+  get prepared(): boolean {
+    return this.bodies.every((b) => b.ready);
   }
 
   /** Map a true position (AU) to display units. */
@@ -265,18 +294,34 @@ export class SystemLayer {
   /** Per-frame: lighting and shader clocks. `timeSec` drives clouds/turbulence. */
   update(camera: THREE.Camera, renderer: THREE.WebGLRenderer, timeSec: number): void {
     const sys = this.sys;
-    this.star.update({ time: timeSec, camera });
-    this.companion?.update({ time: timeSec, camera });
+    // Reused argument objects: no per-frame garbage (renderers copy what they keep).
+    const su = this.su;
+    su.time = timeSec;
+    su.camera = camera;
+    this.star.update(su);
+    this.companion?.update(su);
+    const pu = this.pu;
+    pu.time = timeSec;
+    pu.camera = camera;
+    pu.renderer = renderer;
+    pu.sunColor = tmpC;
     for (const b of this.bodies) {
+      // Unprepared (still hidden) planets wait for prepareStep(); updating would bake them now.
+      if (!b.ready) continue;
       // Light from the primary (the dominant source); a circumbinary pair acts as one lamp at
       // its luminosity-weighted centre, with the summed colour.
       const sunPos = sys.companion?.config === 'P' ? this.lampPosition(tmpB) : tmpB.copy(this.starPos);
       this.lightColorAt(b.truePos, tmpC).multiplyScalar(b.irradiance);
       const dTrue = b.truePos.distanceTo(this.starTruePos);
-      b.planet.update({ time: timeSec, sunPosition: sunPos, sunColor: tmpC, camera, sunAngularRadius: (sys.star.radius * R_SUN_AU) / Math.max(dTrue, 1e-6), renderer });
+      pu.sunPosition = sunPos;
+      pu.sunAngularRadius = (sys.star.radius * R_SUN_AU) / Math.max(dTrue, 1e-6);
+      b.planet.update(pu);
       if (b.eyeball) b.eyeball.update(tmpA.copy(sunPos).sub(b.pos).normalize(), tmpC);
     }
   }
+
+  private pu: PlanetUpdate = { time: 0, sunPosition: new THREE.Vector3(), camera: new THREE.PerspectiveCamera() };
+  private su: { time: number; camera: THREE.Camera } = { time: 0, camera: this.pu.camera };
 
   /** Colour (luminance-normalised, summed over stars by flux) of starlight at a true position. */
   lightColorAt(truePos: THREE.Vector3, out = new THREE.Color()): THREE.Color {
@@ -409,3 +454,20 @@ export function adaptedLight(c: THREE.Color, out = new THREE.Color()): THREE.Col
   const y = 0.2126 * out.r + 0.7152 * out.g + 0.0722 * out.b;
   return out.multiplyScalar(1 / y);
 }
+
+/**
+ * Spin-axis orientation: obliquity `axialTilt` toward a pole azimuth fixed by the planet's seed
+ * (no generator draw, so every seed keeps its system). R = R_y(φ) · R_z(obliquity), so the
+ * equinoxes fall at a different point of each orbit instead of every planet's pole leaning along
+ * the same axis (which put every ringed giant at equinox — rings edge-on to their star — at the
+ * same orbital phase).
+ */
+export const poleAzimuth = (p: PlanetData): number => (((p.spec.seed * 0.6180339887) % 1) + 1) % 1 * 2 * Math.PI;
+export function applyObliquity(obj: THREE.Object3D, p: PlanetData): void {
+  obj.rotation.set(0, poleAzimuth(p), p.axialTilt);
+}
+/** Unit spin axis (north pole) of planet p in the three.js frame. */
+export function spinAxis(p: PlanetData, out: THREE.Vector3): THREE.Vector3 {
+  return out.set(0, 1, 0).applyEuler(_euler.set(0, poleAzimuth(p), p.axialTilt));
+}
+const _euler = new THREE.Euler();

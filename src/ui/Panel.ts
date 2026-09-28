@@ -275,6 +275,22 @@ export class Panel {
     grip.setAttribute('aria-hidden', 'true');
     this.el.append(grip, head, this.content);
     parent.appendChild(this.el);
+    // After a pointer drags a slider or flips a switch, hand the keyboard back to the world:
+    // a focused <input> otherwise swallows every experience key (WASD, Space…) until the
+    // canvas is clicked. Keyboard users (Tab/arrows) keep focus — this runs only on pointerup.
+    this.el.addEventListener('pointerup', () => {
+      window.setTimeout(() => {
+        const a = document.activeElement;
+        if (a instanceof HTMLInputElement && (a.type === 'range' || a.type === 'checkbox') && this.el.contains(a)) a.blur();
+      }, 0);
+    });
+    // Same for a <select> chosen with the pointer (blur on change; the dropdown is closed by then).
+    let viaPointer = false;
+    this.el.addEventListener('pointerdown', () => (viaPointer = true));
+    this.el.addEventListener('keydown', () => (viaPointer = false));
+    this.el.addEventListener('change', (e) => {
+      if (viaPointer && e.target instanceof HTMLSelectElement) e.target.blur();
+    });
     this.bindSheetDrag(grip);
     this.bindSheetDrag(head);
   }

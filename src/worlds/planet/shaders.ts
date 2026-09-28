@@ -102,6 +102,25 @@ float nyquist(float f, float footprint) {
   return smoothstep(1.0 / f, 0.33 / f, footprint);
 }
 
+// Band-limited fBm (lacunarity 2, gain 1/2): p is already scaled by f, the base frequency per radius.
+// Each octave fades out through nyquist() before it aliases, and the loop stops at the first octave
+// finer than the pixel — plain fbm3 gated on its base frequency alone let its top octaves (8× finer)
+// alias into salt-and-pepper grain on close views. Normalised by the full octave weight, so the
+// detail loses contrast (as its average would) instead of being re-amplified.
+float fbmAA(vec3 p, float f, float footprint, int octaves) {
+  float sum = 0.0, amp = 0.5;
+  for (int i = 0; i < 6; i++) {
+    if (i >= octaves) break;
+    float w = nyquist(f, footprint);
+    if (w <= 0.0) break;
+    sum += amp * w * snoise(p);
+    p *= 2.0;
+    f *= 2.0;
+    amp *= 0.5;
+  }
+  return sum / (1.0 - exp2(-float(octaves)));
+}
+
 // Zonal wind profile (rad per flow cycle): easterly trades, mid-latitude westerlies, polar easterlies.
 float windProfile(float lat) {
   float a = abs(lat);
@@ -127,7 +146,7 @@ float cloudCover(vec3 d, float footprint) {
   float texel = PI / 2048.0;
   float detail = smoothstep(texel, texel * 0.1, footprint) * nyquist(900.0, footprint);
   if (detail > 0.0) {
-    float n = fbm3(d * 900.0 + vec3(uCloudTime * 0.3), DETAIL_LEVEL >= 2 ? 4 : 3);
+    float n = fbmAA(d * 900.0 + vec3(uCloudTime * 0.3), 900.0, footprint, DETAIL_LEVEL >= 2 ? 4 : 3);
     c = clamp(c + detail * (n * 0.35) * (1.0 - c) * c * 4.0, 0.0, 1.0);
   }
 #endif
@@ -139,13 +158,16 @@ float cloudCover(vec3 d, float footprint) {
   float f1 = fract(uCloudTime);
   float f2 = fract(uCloudTime + 0.5);
   float w = windProfile(lat) * 0.3;
-  float c1 = texture(uCubeC, rotY(d, w * (f1 - 0.5))).r;
-  float c2 = texture(uCubeC, rotY(d, w * (f2 - 0.5))).r;
+  // Explicit LOD from the pixel footprint (the cloud cube is half the bake size): this runs inside the
+  // limb pass's ray loop, where implicit-derivative fetches are slow on D3D (see ATMO_LOOKUP_GLSL).
+  float lod = log2(max(footprint / (2.0 * uBakeTexel), 1.0));
+  float c1 = textureLod(uCubeC, rotY(d, w * (f1 - 0.5)), lod).r;
+  float c2 = textureLod(uCubeC, rotY(d, w * (f2 - 0.5)), lod).r;
   float c = mix(c1, c2, abs(2.0 * f1 - 1.0));
 #if DETAIL_LEVEL >= 1
   float detail = smoothstep(uBakeTexel * 2.0, uBakeTexel * 0.2, footprint) * nyquist(260.0, footprint);
   if (detail > 0.0) {
-    float n = fbm3(d * 260.0 + uSeedOffRT, DETAIL_LEVEL >= 2 ? 4 : 3);
+    float n = fbmAA(d * 260.0 + uSeedOffRT, 260.0, footprint, DETAIL_LEVEL >= 2 ? 4 : 3);
     c = clamp(c + detail * n * 0.5 * c * (1.0 - c) * 4.0, 0.0, 1.0);
   }
 #endif
@@ -286,7 +308,7 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
     vec3 G = moonCraterGrad(q, g1, g2);
     N = normalize(N - (east * dot(G, east) + north * dot(G, north)) * 0.16);
     float fa = nyquist(1400.0, footprint);
-    if (fa > 0.0) s.albedo *= 1.0 + 0.12 * g1 * fa * fbm3(q * 700.0, 3);
+    if (fa > 0.0) s.albedo *= 1.0 + 0.12 * g1 * fa * fbmAA(q * 700.0, 700.0, footprint, 3);
   }
 #endif
   s.N = N;
@@ -311,7 +333,7 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
   float detail = smoothstep(uBakeTexel * 1.5, uBakeTexel * 0.2, footprint) * nyquist(700.0, footprint);
   if (detail > 0.0) {
     vec3 q = d + uSeedOffRT * 0.01;
-    float fil = fbm3(vec3(q.x * 90.0, q.y * 700.0, q.z * 90.0), DETAIL_LEVEL >= 2 ? 4 : 3);
+    float fil = fbmAA(vec3(q.x * 90.0, q.y * 700.0, q.z * 90.0), 700.0, footprint, DETAIL_LEVEL >= 2 ? 4 : 3);
     s.albedo *= 1.0 + detail * 0.12 * fil;
   }
 #endif
@@ -330,9 +352,9 @@ Surf surfaceAt(vec3 d, vec3 n, float footprint) {
   if (detail > 0.0 && s.spec < 0.5) {
     const int OCT = DETAIL_LEVEL >= 2 ? 5 : 3;
     vec3 q = d * 180.0 + uSeedOffRT;
-    float e0 = fbm3(q, OCT);
-    float ex = fbm3(q + east * 0.02, OCT);
-    float ey = fbm3(q + north * 0.02, OCT);
+    float e0 = fbmAA(q, 180.0, footprint, OCT);
+    float ex = fbmAA(q + east * 0.02, 180.0, footprint, OCT);
+    float ey = fbmAA(q + north * 0.02, 180.0, footprint, OCT);
     vec3 g = (east * (ex - e0) + north * (ey - e0)) / 0.02;
     s.N = normalize(s.N - detail * 0.004 * uRelief * g * 180.0 * 0.12);
     s.albedo *= 1.0 + detail * 0.2 * e0;
@@ -498,7 +520,9 @@ void main() {
     float rad = 46200.0 * (exp(c2 / 5772.0) - 1.0) / (exp(c2 / T) - 1.0);
     Lg += blackbody(T) * rad * uEmission * smoothstep(0.02, 0.2, s.emission);
 #else
-    float h = hash12(floor(gl_FragCoord.xy * 0.25));
+    // Per-place colour variation (sodium vs LED districts), keyed to the ground so it does not
+    // shimmer as the planet turns (a screen-space hash would re-roll as cities cross pixels).
+    float h = hash13(floor(d * 1300.0));
     vec3 lc = mix(uLightsColorA, uLightsColorB, clamp(s.emission * 3.0 + h * 0.2, 0.0, 1.0));
     Lg += lc * s.emission * uLights * exp(-daylight * 60.0);
 #endif
@@ -557,13 +581,16 @@ void main() {
   vec3 rd = rv / camDist;
   float tCam = -camDist;
   if (uPixelRadius < 1.0) discard;
-  // The surface pass owns rays that hit the ground. Test with the closest approach, biased by a few
-  // tens of metres toward "sky", so grazing rays are never dropped by both passes (float rounding of
-  // the two proxies differs); a hair-thin overlap is invisible, a hole is a black pixel.
+  // The surface pass owns rays that hit the ground. The two passes reconstruct each pixel's ray from
+  // different proxy meshes, so at grazing angles (the limb seen from low orbit) they can disagree by a
+  // fraction of a pixel; a pixel both passes dropped is a black hole in the limb. So leave the ground
+  // to the surface only a full pixel inside the limb: where the surface did draw, its depth already
+  // rejects this pass; where it missed, this pass fills in the limb glow.
   float tca = -dot(ro, rd);
   vec3 pca = ro + rd * tca;
   float b2 = dot(pca, pca);
-  if (b2 < 1.0 - 1e-5 && tca + sqrt(max(0.0, 1.0 - b2)) > tCam) discard;
+  float margin = max(1e-5, 2.0 * (tca - tCam) * uPixelAngle);
+  if (b2 < 1.0 - margin && tca + sqrt(max(0.0, 1.0 - b2)) > tCam) discard;
   vec2 top = raySphere(ro, rd, vec3(0.0), uTop);
   float t0 = max(top.x, tCam);
   float t1 = top.y;

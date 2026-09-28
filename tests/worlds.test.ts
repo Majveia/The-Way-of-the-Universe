@@ -5,8 +5,12 @@ import {
   msLuminosity, msRadius, effectiveTemperature, holmanWiegertS, holmanWiegertP, massRadius, CK_TERRAN_MAX,
   CK_NEPTUNIAN_MAX, equilibriumTemperature, tidalLockTimeYears, keepsAtmosphere, nextHillSpacedOrbit, hillSeparation,
   hillRadius, spectralClass, snowLineAU, periodDays, semiMajorAxisAU, eyeballOpening, M_JUP_EARTH, R_JUP_EARTH,
-  catalogueName, givenName, type SystemData,
+  catalogueName, givenName, GM_SUN_AU_DAY, HOT_JUPITER_CLEAR_P, insolation, type SystemData,
 } from '../src/worlds/systems';
+import { cornerCos, planSlices, ringDistance, shellDistance, MAX_SLICE_RATIO, type SliceItem } from '../src/worlds/systems/slices';
+import { glareStrength } from '../src/worlds/systems/glare';
+import { poleAzimuth, spinAxis } from '../src/worlds/systems/SystemLayer';
+import * as THREE from 'three';
 
 const systems = (n: number, start = 1): SystemData[] => Array.from({ length: n }, (_, i) => generateSystem(start + i));
 
@@ -231,5 +235,130 @@ describe('Surface classes', () => {
     for (let seed = 0; seed < 300; seed++) {
       for (const p of generateSystem(seed * 104729 + 17).planets) if (p.kind === 'desert') expect(p.teq).toBeGreaterThan(100);
     }
+  });
+});
+
+describe('Review: orbital mechanics and occurrence', () => {
+  it('uses the enclosed mass for every orbit (circumbinary planets orbit both stars)', () => {
+    let P = 0;
+    for (const s of systems(2500)) {
+      const M = s.star.mass + (s.companion?.config === 'P' ? s.companion.star.mass : 0);
+      if (s.companion?.config === 'P') P++;
+      for (const p of s.planets) {
+        expect(p.periodDays / periodDays(p.orbit.a, M)).toBeCloseTo(1, 9);
+        expect(p.mu / (GM_SUN_AU_DAY * M)).toBeCloseTo(1, 9);
+        // The animation clock (Gaussian k, sidereal year) and the quoted period agree to < 10⁻⁴.
+        const Panim = (2 * Math.PI) / Math.sqrt(p.mu / p.orbit.a ** 3);
+        expect(Math.abs(Panim / p.periodDays - 1)).toBeLessThan(1e-4);
+      }
+    }
+    expect(P).toBeGreaterThan(5);
+  });
+
+  it('keeps hot Jupiters lonely (Steffen et al. 2012): no neighbour within a factor ~5 in period', () => {
+    let hj = 0;
+    for (let seed = 1; seed < 12000; seed++) {
+      const s = generateSystem(seed);
+      for (const p of s.planets) {
+        if (p.class !== 'gas-giant' || p.periodDays >= 10) continue;
+        hj++;
+        for (const q of s.planets) {
+          if (q === p) continue;
+          const r = q.periodDays / p.periodDays;
+          expect(r > HOT_JUPITER_CLEAR_P * 0.97 || r < 1 / (HOT_JUPITER_CLEAR_P * 0.97)).toBe(true);
+        }
+      }
+    }
+    expect(hj).toBeGreaterThan(20);
+  });
+
+  it('gives insolation and T_eq consistent with the Stefan–Boltzmann definition', () => {
+    for (const s of systems(300)) {
+      for (const p of s.planets) {
+        expect(p.insolation).toBeCloseTo(insolation(s.hzLuminosity, p.orbit.a), 9);
+        // T_eq = 278.3 K · S^¼ (1 − A)^¼ (Earth: S = 1, A = 0.3 → 255 K).
+        expect(p.teq / (278.3 * Math.pow(p.insolation, 0.25) * Math.pow(1 - p.albedo, 0.25))).toBeCloseTo(1, 6);
+      }
+    }
+  });
+
+  it('keeps the default seed (60372) the showcase it was designed as', () => {
+    const s = generateSystem(60372);
+    expect(s.star.spectralType).toBe('G6.5 V');
+    expect(s.planets.map((p) => p.kind)).toEqual(['gas-giant', 'ocean', 'ice', 'gas-giant', 'ice-giant', 'gas-giant']);
+  });
+});
+
+describe('Review: close-up depth slices', () => {
+  const item = (near: number, far: number, dist: number, solo = false): SliceItem => ({ near, far, dist, solo, slice: -1 });
+
+  it('merges the planet and its moons into one slice but keeps stars apart', () => {
+    const ranges: number[] = [];
+    // Star far away, a moon at ~40 radii, the planet at 3 radii (sorted far → near).
+    const items = [item(2.3e4, 2.4e4, 2.35e4, true), item(38, 42, 40), item(1.8, 4.2, 3)];
+    expect(planSlices(items, ranges)).toBe(2);
+    expect(items.map((i) => i.slice)).toEqual([0, 1, 1]);
+    expect(ranges).toEqual([2.3e4, 2.4e4, 1.8, 42]);
+  });
+
+  it('splits bodies whose merged depth range would exceed one buffer', () => {
+    const ranges: number[] = [];
+    const items = [item(300, 310, 305), item(1e-3, 2, 1)];
+    expect(300 / 1e-3).toBeGreaterThan(MAX_SLICE_RATIO);
+    expect(planSlices(items, ranges)).toBe(2);
+  });
+
+  it('never merges two solo items (each star glare needs its own slice)', () => {
+    const ranges: number[] = [];
+    const items = [item(100, 110, 105, true), item(90, 99, 95, true)];
+    expect(planSlices(items, ranges)).toBe(2);
+  });
+
+  it('measures distances to shells and to a ring annulus', () => {
+    expect(shellDistance(1.04, 0.999, 1.0015)).toBeCloseTo(0.0385, 9);
+    expect(shellDistance(1.0, 0.999, 1.0015)).toBe(0);
+    expect(shellDistance(0.5, 0.999, 1.0015)).toBeCloseTo(0.499, 9);
+    expect(ringDistance(0, 0.5, 0, 1.25, 2.5)).toBeCloseTo(Math.hypot(1.25, 0.5), 9);
+    expect(ringDistance(2, 0.1, 0, 1.25, 2.5)).toBeCloseTo(0.1, 9);
+    expect(ringDistance(0, 0, 3, 1.25, 2.5)).toBeCloseTo(0.5, 9);
+  });
+
+  it('bounds view depth by the frustum corner cosine (incl. a view offset)', () => {
+    // Symmetric 60° vertical fov, 16:9.
+    const t = Math.tan(Math.PI / 6);
+    const P = [1 / (t * 16 / 9), 0, 0, 0, 0, 1 / t, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0];
+    const c = cornerCos(P);
+    expect(c).toBeCloseTo(1 / Math.sqrt(1 + (t * 16 / 9) ** 2 + t * t), 9);
+    // Shift the window sideways: the far corner is more oblique.
+    const Q = P.slice();
+    Q[8] = 0.26;
+    expect(cornerCos(Q)).toBeLessThan(c);
+  });
+});
+
+describe('Review: glare', () => {
+  it('is full for unresolved stars and gone once the disk is several degrees wide', () => {
+    expect(glareStrength(0.05)).toBe(1);
+    expect(glareStrength(2.4)).toBe(0);
+    expect(glareStrength(1)).toBeGreaterThan(glareStrength(1.5));
+  });
+});
+
+describe('Review: spin axes', () => {
+  it('tilts each pole by its obliquity, toward azimuths spread around the orbit normal', () => {
+    const v = new THREE.Vector3();
+    const az: number[] = [];
+    for (const s of systems(60)) {
+      for (const p of s.planets) {
+        spinAxis(p, v);
+        expect(v.length()).toBeCloseTo(1, 9);
+        expect(Math.acos(v.y)).toBeCloseTo(p.axialTilt, 6);
+        az.push(poleAzimuth(p));
+      }
+    }
+    // Not all leaning the same way: the azimuths fill the circle.
+    const q = [0, 0, 0, 0];
+    for (const a of az) q[Math.floor((a / (2 * Math.PI)) * 4) % 4]++;
+    for (const c of q) expect(c).toBeGreaterThan(az.length / 8);
   });
 });

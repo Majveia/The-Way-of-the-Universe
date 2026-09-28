@@ -11,7 +11,7 @@ import { formatDistance, formatNumber } from '../../physics/units';
 import { EarthCamera, meanMotion, type OrbitFraming } from './camera';
 import { GALLERY, phaseFor, type GalleryWorld, type Lighting } from './gallery';
 import { Sunbeam } from './sunbeam';
-import { AU_RE, R_EARTH_KM, fovForDistance, moonOrientation, pbdProgress, smooth, voyagerGeocentricAU } from './math';
+import { AU_RE, R_EARTH_KM, fovForDistance, moonOrientation, nightGainText, pbdProgress, smooth, voyagerGeocentricAU } from './math';
 import { SunGlare } from './glare';
 
 /**
@@ -36,6 +36,8 @@ const GEO_R = 42_164 / R_EARTH_KM;
  * We draw it ~40× dimmer so that the bloom stays a glare rather than a white-out (said in the UI).
  */
 const SUN_INTENSITY = 30;
+/** Apollo 8's Earthrise photograph (AS08-14-2383), UTC. */
+const APOLLO8_EARTHRISE = Date.UTC(1968, 11, 24, 16, 40, 7);
 const PBD_EXPOSURE = 260;
 
 type ViewId = 'dawn' | 'disk' | 'night' | 'iss' | 'moon' | 'eclipse' | 'voyager';
@@ -165,11 +167,15 @@ class EarthExperience implements Experience {
   private readonly moonOccluders = [{ position: new THREE.Vector3(), radius: 1.012, umbraLight: new THREE.Color(0.012, 0.0035, 0.0009) }];
   private readonly astro = { x: 0, y: 0, z: 0 };
   private readonly bodies: DepthLayer[] = [];
-  /** Depth layers reused every frame: Sun, Moon, Earth (1.075 R⊕ encloses the aurora shell), gallery. */
+  /**
+   * Depth layers reused every frame: Sun, Moon, Earth, gallery. Each radius encloses the body's proxy
+   * meshes: 1.08 R⊕ the aurora shell (420 km, ×1.004 proxy inflation); 1.045 R☾ the Moon's surface proxy,
+   * which PlanetRenderer inflates by up to 3.5 % when the body is small on screen (uProxyScale).
+   */
   private readonly layerSlots: [DepthLayer, DepthLayer, DepthLayer, DepthLayer] = [
     { scene: this.sunScene, centre: this.sunPos, radius: SUN_R * 6.5, dist: 0 },
-    { scene: this.moonScene, centre: this.moonPos, radius: MOON_R * 1.01, dist: 0 },
-    { scene: this.earthScene, centre: this.origin, radius: 1.075, dist: 0 },
+    { scene: this.moonScene, centre: this.moonPos, radius: MOON_R * 1.045, dist: 0 },
+    { scene: this.earthScene, centre: this.origin, radius: 1.08, dist: 0 },
     { scene: this.galleryScene, centre: this.origin, radius: 1.2, dist: 0 },
   ];
   /** UTC start of the simulated year (cached: recomputed only when the year changes). */
@@ -198,7 +204,7 @@ class EarthExperience implements Experience {
     };
     if (id !== 'iss' && this.warp === 1) this.setWarp(60);
     // Leaving a historical/future moment (Pale Blue Dot, eclipse) returns to the time we left from.
-    if (id !== 'voyager' && id !== 'eclipse' && this.prePbdMs !== null) {
+    if (id !== 'voyager' && id !== 'eclipse' && id !== 'moon' && this.prePbdMs !== null) {
       this.setTime(this.prePbdMs);
       this.prePbdMs = null;
     }
@@ -235,8 +241,16 @@ class EarthExperience implements Experience {
         this.ctx.ui.toast('Real time · 7.66 km/s · 92 minutes per orbit');
         break;
       case 'moon': {
-        // Earthrise, as from Apollo 8: low lunar orbit (~120 km), the Earth a few degrees above the
-        // lunar horizon, on the side of the Moon the Sun is lighting.
+        // Earthrise, at the moment of Apollo 8's photograph (AS08-14-2383, 24 December 1968, 16:40 UT;
+        // launch 12:51 UT on the 21st + 75 h 49 m): the Earth three-quarters lit, rising over the lit
+        // lunar terrain. (At a full Moon the Earth seen from the Moon is 'new', beside the Sun, over
+        // unlit ground — so the view keeps its own date, like the eclipse and the Pale Blue Dot.)
+        if (this.prePbdMs === null) this.prePbdMs = this.simMs;
+        this.setTime(APOLLO8_EARTHRISE);
+        this.setWarp(60);
+        this.ctx.ui.toast('Earthrise · Apollo 8 · 24 December 1968');
+        // Camera in lunar orbit (~900 km up), the Earth a few degrees above the lunar horizon, on the
+        // side of the Moon the Sun is lighting.
         const e = this.tmp2.copy(this.moonPos).negate().normalize();
         const p = this.tmp.copy(this.sunDir).addScaledVector(e, -this.sunDir.dot(e));
         if (p.length() < 0.25) p.set(0, 1, 0).addScaledVector(e, -e.y);
@@ -676,7 +690,7 @@ class EarthExperience implements Experience {
     const time = ui.section('Time');
     this.pauseBtn = time.button({ label: 'Pause', onClick: () => this.setPaused(!this.paused) });
     time.buttons([
-      { label: 'Now', onClick: () => this.setTime(Date.now()) },
+      { label: 'Now', onClick: () => this.goNow() },
       { label: 'Solstice', onClick: () => this.jumpSeason(5, 21) },
       { label: 'Equinox', onClick: () => this.jumpSeason(8, 23) },
     ]);
@@ -718,7 +732,7 @@ class EarthExperience implements Experience {
     lay.toggle({ label: 'Aurora & airglow', value: true, onChange: (v) => this.setLayer('aurora', v) });
     lay.toggle({ label: 'The Moon', value: true, onChange: (v) => this.setLayer('moon', v) });
     lay.slider({ label: 'Relief', min: 0, max: 12, value: 6, format: (v) => `×${v.toFixed(1)}`, onChange: (v) => this.earth.setOptions({ relief: v }), help: 'Vertical exaggeration of GEBCO terrain shading' });
-    lay.text('Night lights are shown ~10⁴× brighter than a daylight exposure would record them, as in every night image of Earth.');
+    lay.text(`Night lights, aurora and airglow are shown ~${nightGainText()}× brighter than a daylight exposure would record them, as in every night image of Earth.`);
 
     const wsec = ui.section('Other worlds');
     this.worldCtl = wsec.select({
@@ -765,7 +779,7 @@ class EarthExperience implements Experience {
         i = THREE.MathUtils.clamp(i + (k === 'BracketRight' ? 1 : -1), 0, WARPS.length - 1);
         this.setWarp(WARPS[i]);
         this.ctx.ui.toast(`Time warp ${warpLabel(WARPS[i])}`);
-      } else if (k === 'KeyN') this.setTime(Date.now());
+      } else if (k === 'KeyN') this.goNow();
     });
   }
 
@@ -790,6 +804,12 @@ class EarthExperience implements Experience {
     this.rSun = ui.readout('Sun overhead');
     this.rMoon = ui.readout('Moon');
     this.readouts.push(this.rAlt, this.rUtc, this.rSun, this.rMoon);
+  }
+
+  /** Back to the present: also forget a historical view's saved time, so leaving it does not jump back. */
+  private goNow(): void {
+    this.prePbdMs = null;
+    this.setTime(Date.now());
   }
 
   private jumpSeason(month: number, day: number): void {

@@ -50,7 +50,9 @@ void main() {
   float ridge = pow(1.0 - abs(snoise(q * 60.0 + uSeed)), 12.0);
   vec3 snow = vec3(0.9, 0.93, 0.97);
   vec3 blueIce = vec3(0.55, 0.72, 0.86);
-  vec3 alb = mix(snow, blueIce, scour * 0.55) * (1.0 - 0.15 * ridge);
+  // (Ridges and leads are kilometres wide: from orbit they are a faint texture, not dark cracks —
+  // at full contrast the cells read as a dried-mud desert under a red dwarf's low light.)
+  vec3 alb = mix(snow, blueIce, scour * 0.55) * (1.0 - 0.06 * ridge);
   alb = mix(alb, vec3(0.5, 0.6, 0.68), floes * 0.8);
   // Snow/ice: Lambertian with a gentle forward lobe.
   float lit = max(mu, 0.0);

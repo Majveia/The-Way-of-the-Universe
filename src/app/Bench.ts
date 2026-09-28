@@ -399,6 +399,13 @@ function verdict(r: BenchWorldResult, refreshHz: number): 'good' | 'ok' | 'bad' 
   return 'bad';
 }
 
+/** Resolution the GPU-time controller would settle on (12.5 ms budget; cost ∝ pixels). */
+function autoRes(r: BenchWorldResult): string {
+  if (!r.gpuMs) return '—';
+  const scale = Math.min(1, Math.max(0.4, Math.sqrt(12.5 / Math.max(r.gpuMs.median, 0.01))));
+  return `${Math.round(r.height * scale)}p`;
+}
+
 export class BenchOverlay {
   readonly el: HTMLElement;
   private progressEl: HTMLElement;
@@ -449,7 +456,7 @@ export class BenchOverlay {
     const scroll = document.createElement('div');
     scroll.className = 'bench-scroll';
     const table = document.createElement('table');
-    table.innerHTML = `<thead><tr><th>World</th><th>FPS</th><th>Frame ms</th><th>p95</th><th>GPU ms</th><th>CPU ms</th><th>Draws</th><th>Load s</th></tr></thead>`;
+    table.innerHTML = `<thead><tr><th>World</th><th>FPS</th><th>Frame ms</th><th>p95</th><th>GPU ms</th><th>CPU ms</th><th>Draws</th><th>Auto res</th><th>Load s</th></tr></thead>`;
     const tb = document.createElement('tbody');
     for (const r of report.results) {
       const tr = document.createElement('tr');
@@ -457,8 +464,8 @@ export class BenchOverlay {
       // Effective rate: the slower of presentation and GPU completion.
       const eff = r.gpuMs ? Math.min(r.fps, 1000 / Math.max(r.gpuMs.median, 0.001)) : r.fps;
       const cells = r.ok
-        ? [eff >= 10 ? eff.toFixed(0) : eff.toFixed(1), r.frameMs.median.toFixed(1), r.frameMs.p95.toFixed(1), r.gpuMs ? r.gpuMs.median.toFixed(1) : '—', r.cpuMs.median.toFixed(1), String(r.drawCalls), (r.loadMs / 1000).toFixed(1)]
-        : ['—', '—', '—', '—', '—', '—', (r.loadMs / 1000).toFixed(1)];
+        ? [eff >= 10 ? eff.toFixed(0) : eff.toFixed(1), r.frameMs.median.toFixed(1), r.frameMs.p95.toFixed(1), r.gpuMs ? r.gpuMs.median.toFixed(1) : '—', r.cpuMs.median.toFixed(1), String(r.drawCalls), autoRes(r), (r.loadMs / 1000).toFixed(1)]
+        : ['—', '—', '—', '—', '—', '—', '—', (r.loadMs / 1000).toFixed(1)];
       const name = document.createElement('td');
       const dot = document.createElement('span');
       dot.className = `bench-dot ${v}`;

@@ -30,6 +30,34 @@ export function budgetFor(detail: number) {
   return { skeleton, tracers };
 }
 
+/**
+ * GPU work the integrator may submit per frame, in skeleton pair interactions (~20 flops each).
+ * A step costs N_sk² pairs for the direct force pass plus the tracer sub-steps: each tracer
+ * sub-step evaluates both smooth galaxy models and the star-formation grid (~300 flops ≈ 15
+ * pairs), i.e. 15 · substeps · N_tr. 2.7×10⁸ ≈ 3.5 steps of the 'high' budget (8k skeleton,
+ * 196k tracers), ~4–5 ms on a 2.5 TFLOPS laptop GPU; beyond that a fast rate slows down instead
+ * of the frame.
+ */
+const STEP_BUDGET = 2.7e8;
+/** Fast-forward (loading, timeline jumps) may spend twice that per frame (then adapts to the GPU). */
+const WARM_BUDGET = 5.4e8;
+export const TRACER_PAIR_COST = 15;
+export function stepCost(skeleton: number, tracers = 0, substeps = 4): number {
+  return skeleton * skeleton + TRACER_PAIR_COST * substeps * tracers;
+}
+export function stepsPerFrame(skeleton: number, budget = STEP_BUDGET, max = 10, tracers = 0, substeps = 4): number {
+  return Math.max(1, Math.min(max, Math.floor(budget / stepCost(skeleton, tracers, substeps))));
+}
+/**
+ * Fast-forward chunk control: the GPU runs the steps asynchronously, so the only honest measure of
+ * their cost is the frame interval they produce. Aim for ~33 ms frames (≥ 30 fps with progress on
+ * screen): shrink the chunk when frames run long, grow it when they are short.
+ */
+export function adaptChunk(chunk: number, frameMs: number, max: number): number {
+  const next = frameMs > 50 ? chunk * 0.6 : frameMs > 36 ? chunk * 0.85 : frameMs < 24 ? chunk * 1.25 : chunk;
+  return Math.max(1, Math.min(max, Math.round(next)));
+}
+
 type ViewName = 'orbit' | 'edge-on' | 'oblique' | 'default';
 const FOLLOW_OPTIONS = [
   { value: 'pair', label: 'Both galaxies' },
@@ -324,18 +352,27 @@ export class CollisionExperience implements Experience {
     });
   }
 
+  /** Yield to the frame loop: the next animation frame (so every chunk is shown), or a task in shot mode. */
   private yieldFrame(): Promise<void> {
-    return new Promise((r) => setTimeout(r, 0));
+    if (this.ctx.engine.shotMode || typeof requestAnimationFrame !== 'function') return new Promise((r) => setTimeout(r, 0));
+    return new Promise((r) => requestAnimationFrame(() => r()));
   }
 
-  /** Integrate to time t in chunks sized to ~30 ms, yielding to the frame loop in between. */
+  /**
+   * Integrate to time t in per-frame chunks sized by GPU work (WARM_BUDGET), yielding to the frame
+   * loop in between so the progress and the evolving system stay on screen. (Chunks sized by CPU
+   * submission time would say nothing about the GPU, which runs the work asynchronously.)
+   */
   private async integrate(sim: NBodySystem, t: number, gen: number, progress: (f: number) => void): Promise<void> {
     const t0 = sim.time;
-    let chunk = this.ctx.engine.shotMode ? 64 : 4;
+    const shot = this.ctx.engine.shotMode;
+    const cap = shot ? 64 : stepsPerFrame(sim.skeletonCount, WARM_BUDGET, 64, sim.tracerCount, sim.substeps);
+    // Start at a quarter of the budget cap and let the measured frame interval steer it.
+    let chunk = shot ? 64 : Math.max(1, Math.round(cap / 4));
+    let tFrame = performance.now();
     while (sim.time < t - 0.5 * sim.dt) {
       if (gen !== this.gen || this.disposed) return;
       const n = Math.min(chunk, Math.round((t - sim.time) / sim.dt));
-      const w0 = performance.now();
       for (let i = 0; i < n; i += 8) {
         sim.step(Math.min(8, n - i));
         sim.requestDiskRefit();
@@ -343,12 +380,11 @@ export class CollisionExperience implements Experience {
       sim.requestGalaxies();
       sim.requestStarFormationRate();
       this.trackEvents(true);
-      // Fast-forward shows every chunk: aim for ~30 ms of submitted work per frame (≤ 16 steps).
-      // Shot mode (software GL) renders frames slowly, so integrate in big chunks there.
-      const w = performance.now() - w0;
-      chunk = this.ctx.engine.shotMode ? 64 : Math.max(2, Math.min(16, Math.round(chunk * (w > 40 ? 0.7 : w < 20 ? 1.4 : 1))));
       progress((sim.time - t0) / Math.max(1e-9, t - t0));
       await this.yieldFrame();
+      const now = performance.now();
+      if (!shot && !document.hidden) chunk = adaptChunk(chunk, now - tFrame, cap);
+      tFrame = now;
     }
     sim.requestDiagnostics();
     sim.requestGalaxies();
@@ -365,7 +401,7 @@ export class CollisionExperience implements Experience {
     if (this.busy === null) {
       this.frameCount++;
       if (!this.paused) this.owed += this.rate * f.dt;
-      const maxSteps = 10;
+      const maxSteps = stepsPerFrame(sim.skeletonCount, STEP_BUDGET, 10, sim.tracerCount, sim.substeps);
       let n = Math.floor(this.owed / sim.dt);
       if (n > maxSteps) {
         n = maxSteps;

@@ -66,7 +66,7 @@ void main() {
   float L, T;
   particleState(a0, a1, a2, uTime, P, L, T);
   if (uMode > 0.5) {
-    int id = gl_VertexID;
+    int id = int(a2.w + 0.5); // particle index (gl_VertexID would depend on the draw range and on ANGLE honouring its first offset)
     P = texelFetch(uStatePos, ivec2(id % uStateW, id / uStateW), 0).xyz;
     if (floor((uSwitchTime + off) / Tc) != floor(tt / Tc)) L = 0.0;
   }

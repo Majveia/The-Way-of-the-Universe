@@ -46,6 +46,19 @@ export interface Readout {
   remove(): void;
 }
 
+/** Keys the shell handles globally (see onKey). */
+const GLOBAL_CODES = new Set(['Escape', 'Backquote', 'KeyM', 'KeyH', 'KeyP']);
+
+/** Elements where a key press is text entry, not a command. Pure DOM check. */
+export function isTypingTarget(t: EventTarget | null): boolean {
+  const e = t as HTMLElement | null;
+  if (!e || typeof e.tagName !== 'string') return false;
+  if (e.isContentEditable || e.tagName === 'TEXTAREA') return true;
+  if (e.tagName !== 'INPUT') return false;
+  const type = ((e as HTMLInputElement).type || 'text').toLowerCase();
+  return !['range', 'checkbox', 'radio', 'button', 'submit', 'reset', 'color', 'file', 'image'].includes(type);
+}
+
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, html?: string): HTMLElementTagNameMap[K] => {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -85,6 +98,8 @@ export class UI {
   private lastActivity = performance.now();
   private overUI = false;
   menuOpen = false;
+  /** Called when the full-screen worlds menu opens/closes (App pauses the world behind it). */
+  onMenuChange?: (open: boolean) => void;
   private meta: ExperienceMeta | null = null;
   private hintText = '';
   private shortcutSets = new Set<Shortcut[]>();
@@ -97,6 +112,9 @@ export class UI {
   private statsOn = false;
   private statsClock = 0;
   private menuReturn: HTMLElement | null = null;
+  private topEl: HTMLElement;
+  private bottomEl: HTMLElement;
+  private soundShown: boolean | null = null;
 
   constructor(root: HTMLElement, private experiences: ExperienceMeta[], private handlers: UIHandlers) {
     this.root = root;
@@ -129,6 +147,7 @@ export class UI {
     const menuBtn = this.iconButton(ICONS.menu, 'Menu (M)', () => this.toggleMenu());
     actions.append(this.panelBtn, this.soundBtn, hideBtn, this.fsBtn, menuBtn);
     top.append(left, actions);
+    this.topEl = top;
 
     // Bottom.
     const bottom = el('footer', 'ui-bottom');
@@ -137,6 +156,7 @@ export class UI {
     this.hintEl.setAttribute('role', 'status');
     this.bottomRight = el('div', 'ui-bottom-right chrome');
     bottom.append(this.readoutsEl, this.hintEl, this.bottomRight);
+    this.bottomEl = bottom;
 
     this.overlay = el('div', 'ui-overlay');
     this.infoEl = el('div', 'info-card chrome');
@@ -181,11 +201,15 @@ export class UI {
     this.palette = new Palette(root, () => this.commands());
     this.palette.onToggle = (open) => {
       this.root.classList.toggle('palette-open', open);
+      this.updateInert();
       this.uiSound(open ? 'ui-open' : 'ui-close');
     };
     this.palette.onMove = () => this.uiSound('ui-move');
     this.help = new Help(root);
-    this.help.onToggle = (open) => this.root.classList.toggle('help-open', open);
+    this.help.onToggle = (open) => {
+      this.root.classList.toggle('help-open', open);
+      this.updateInert();
+    };
     this.intro = new Intro(root);
     this.panel.onVisibilityChange = (open) => {
       this.panelBtn.classList.toggle('is-active', open);
@@ -197,6 +221,17 @@ export class UI {
       e.addEventListener('pointerenter', () => (this.overUI = true));
       e.addEventListener('pointerleave', () => (this.overUI = false));
     }
+    // A mouse/touch click leaves focus on the button it hit; the next Space (pause in many worlds)
+    // would then also "press" that button again. Drop focus after pointer clicks on shell buttons;
+    // keyboard activation (click.detail === 0) keeps it. Dialogs manage their own focus.
+    root.addEventListener('click', (e) => {
+      if (e.detail === 0) return;
+      const b = (e.target as Element | null)?.closest?.('button');
+      if (!b || b.closest('.menu, .palette-scrim, .help-scrim, .intro, .sound-menu, .error-card')) return;
+      window.setTimeout(() => {
+        if (document.activeElement === b) b.blur();
+      }, 0);
+    });
     window.addEventListener('pointermove', () => this.activity(), { passive: true });
     window.addEventListener('pointerdown', () => this.activity(), { passive: true });
     // Capture phase: runs before experience key handlers, so open dialogs can swallow keys.
@@ -205,6 +240,16 @@ export class UI {
       this.fsBtn.innerHTML = document.fullscreenElement ? ICONS.collapse : ICONS.expand;
     });
     this.syncSound(handlers.soundOn());
+    // Keep-out bands for the info card: the real heights of the title block and the footer
+    // (readouts + hint wrap differently per world and viewport). Fires only on size changes.
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => {
+        root.style.setProperty('--top-h', `${Math.ceil(top.offsetHeight)}px`);
+        root.style.setProperty('--bottom-h', `${Math.ceil(bottom.offsetHeight)}px`);
+      });
+      ro.observe(top);
+      ro.observe(bottom);
+    }
   }
 
   private iconButton(icon: string, label: string, onClick: () => void): HTMLButtonElement {
@@ -217,11 +262,20 @@ export class UI {
   }
 
   private syncSound(on: boolean): void {
+    if (on === this.soundShown) return; // onChange fires on every volume tick: only touch the DOM on a real change
+    this.soundShown = on;
     this.soundBtn.innerHTML = on ? ICONS.soundOn : ICONS.soundOff;
     this.soundBtn.classList.toggle('is-active', on);
     const label = this.handlers.sound ? `Sound ${on ? 'on' : 'off'} — settings` : on ? 'Mute sound' : 'Play sound';
     this.soundBtn.setAttribute('aria-label', label);
     this.soundBtn.title = label;
+  }
+
+  /** Close the sound popover from the keyboard and put focus back on its button. */
+  private closeSoundMenu(): void {
+    const inside = this.soundMenu?.el.contains(document.activeElement);
+    this.soundMenu?.close();
+    if (inside) this.soundBtn.focus({ preventScroll: true });
   }
 
   toggleFullscreen(): void {
@@ -233,6 +287,7 @@ export class UI {
     const m = el('div', 'menu');
     m.hidden = true;
     m.setAttribute('role', 'dialog');
+    m.setAttribute('aria-modal', 'true');
     m.setAttribute('aria-label', 'Experiences');
     const inner = el('div', 'menu-inner');
     const intro = el('div', 'menu-intro');
@@ -318,9 +373,12 @@ export class UI {
       this.uiSound('ui-open');
     }
     this.soundMenu?.close();
+    const was = this.menuOpen;
     this.menuOpen = true;
     this.menuEl.hidden = false;
     this.root.classList.add('menu-open');
+    this.updateInert();
+    if (!was) this.onMenuChange?.(true);
     const first = this.menuEl.querySelector<HTMLButtonElement>('.menu-item.is-current') ?? this.menuEl.querySelector<HTMLButtonElement>('.menu-item');
     first?.focus({ preventScroll: true });
   }
@@ -329,6 +387,8 @@ export class UI {
     this.menuOpen = false;
     this.menuEl.hidden = true;
     this.root.classList.remove('menu-open');
+    this.updateInert();
+    this.onMenuChange?.(false);
     this.uiSound('ui-close');
     const r = this.menuReturn;
     this.menuReturn = null;
@@ -340,9 +400,29 @@ export class UI {
     else this.openMenu();
   }
 
+  /**
+   * Keyboard/AT containment without a focus-trap library: while a modal (palette, help, menu) is
+   * open everything else in the shell is `inert` (not focusable, not clickable, hidden from screen
+   * readers); while the interface is hidden (H) the invisible chrome is inert too, so Tab never
+   * lands on a button nobody can see.
+   */
+  private updateInert(): void {
+    const modal = this.palette?.isOpen ? this.palette.el : this.help?.isOpen ? this.help.el : this.menuOpen ? this.menuEl : null;
+    const chrome = [this.topEl, this.bottomEl, this.infoEl, this.panel?.el];
+    for (const c of Array.from(this.root.children)) {
+      const e = c as HTMLElement;
+      if (e === modal || e.classList.contains('intro') || e === this.toastEl || e === this.statsEl) {
+        e.inert = false;
+        continue;
+      }
+      e.inert = modal !== null || (this.hidden && chrome.includes(e));
+    }
+  }
+
   setHidden(h: boolean): void {
     this.hidden = h;
     this.root.classList.toggle('is-hidden', h);
+    this.updateInert();
     if (h) this.toast('Interface hidden — press H to show');
   }
 
@@ -357,10 +437,14 @@ export class UI {
     }
     if (this.palette.isOpen) return; // its input handles navigation (experiences ignore input targets)
     const t = e.target as HTMLElement | null;
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) {
-      if (e.code === 'Escape' && this.soundMenu?.isOpen) this.soundMenu.close();
+    if (isTypingTarget(t)) {
+      if (e.code === 'Escape' && this.soundMenu?.isOpen) this.closeSoundMenu();
       return;
     }
+    // A focused slider/switch/select keeps its own keys (arrows, Space, Home/End…); the global
+    // letter keys still work, so clicking a panel control never leaves the shortcuts dead.
+    if (t?.tagName === 'SELECT' && e.code !== 'Escape') return; // letters pick options in a select
+    if (t?.tagName === 'INPUT' && !GLOBAL_CODES.has(e.code) && e.key !== '?') return;
     if (mod || e.altKey) return;
     if (this.help.isOpen) {
       if (e.code === 'Escape' || e.key === '?' || e.code === 'KeyH') {
@@ -371,7 +455,7 @@ export class UI {
       return;
     }
     if (e.code === 'Escape') {
-      if (this.soundMenu?.isOpen) this.soundMenu.close();
+      if (this.soundMenu?.isOpen) this.closeSoundMenu();
       else if (this.menuOpen) this.closeMenu();
       else if (this.panel.open) this.panel.setOpen(false);
       else if (this.hidden) this.setHidden(false);
@@ -471,7 +555,8 @@ export class UI {
   /** Everything the palette can do right now. */
   private commands(): Command[] {
     const out: Command[] = [];
-    for (const set of this.commandSets) for (const c of set) out.push({ group: 'Destinations', ...c });
+    const tools: Command[] = []; // app-level utilities (benchmark…) list after the worlds and view actions
+    for (const set of this.commandSets) for (const c of set) (c.group === 'Tools' ? tools : out).push({ group: 'Destinations', ...c });
     // Controls already on the panel (preset chips, buttons, short selects) — free destinations.
     for (const sec of this.panel.el.querySelectorAll<HTMLElement>('.pnl-section')) {
       const title = sec.querySelector('.pnl-title')?.textContent ?? '';
@@ -529,6 +614,7 @@ export class UI {
     if (this.handlers.stats) out.push({ label: 'Frame rate and quality', group: 'View', hint: '`', keywords: 'fps diagnostics performance', run: () => this.toggleStats() });
     out.push({ label: 'Worlds menu', group: 'View', hint: 'M', run: () => this.openMenu() });
     out.push({ label: 'Replay the title sequence', group: 'View', keywords: 'intro opening', run: () => void this.playIntro({ force: true }) });
+    out.push(...tools);
     return out;
   }
 
@@ -627,6 +713,7 @@ export class UI {
     }
     this.infoEl.hidden = false;
     this.infoEl.innerHTML = '';
+    this.infoEl.scrollTop = 0;
     const close = this.iconButton(ICONS.close, 'Close', () => (this.infoEl.hidden = true));
     close.classList.add('info-close');
     const h = el('h2', 'info-title');

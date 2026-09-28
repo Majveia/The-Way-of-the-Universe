@@ -13,13 +13,18 @@ export interface QualityProfile {
   detail: number;
   /** Lowest dynamic render scale the engine may choose. */
   minRenderScale: number;
+  /**
+   * Starting pixel budget for the HDR target (device pixels). A 2560×1440 screen at DPR 1.5 is
+   * 8.3 MP; we start at this budget and let the GPU-time controller raise or lower the scale.
+   */
+  startPixels: number;
 }
 
 export const QUALITY: Record<QualityTier, QualityProfile> = {
-  low: { tier: 'low', maxPixelRatio: 1, msaa: 0, detail: 0.35, minRenderScale: 0.5 },
-  medium: { tier: 'medium', maxPixelRatio: 1.5, msaa: 0, detail: 0.7, minRenderScale: 0.5 },
-  high: { tier: 'high', maxPixelRatio: 2, msaa: 4, detail: 1, minRenderScale: 0.55 },
-  ultra: { tier: 'ultra', maxPixelRatio: 3, msaa: 4, detail: 1.6, minRenderScale: 0.6 },
+  low: { tier: 'low', maxPixelRatio: 1, msaa: 0, detail: 0.35, minRenderScale: 0.5, startPixels: 1.2e6 },
+  medium: { tier: 'medium', maxPixelRatio: 1.5, msaa: 0, detail: 0.7, minRenderScale: 0.5, startPixels: 2.4e6 },
+  high: { tier: 'high', maxPixelRatio: 2, msaa: 4, detail: 1, minRenderScale: 0.4, startPixels: 4.2e6 },
+  ultra: { tier: 'ultra', maxPixelRatio: 3, msaa: 4, detail: 1.6, minRenderScale: 0.5, startPixels: 9e6 },
 };
 
 export interface FrameInfo {
@@ -76,6 +81,12 @@ export class Engine {
   private onFrame: ((f: FrameInfo) => void) | null = null;
   /** Optional instrumentation around each whole frame (benchmark harness). */
   probe: { begin(): void; end(): void } | null = null;
+  /** GPU milliseconds per frame (EMA) when EXT_disjoint_timer_query_webgl2 is available, else null. */
+  gpuMs: number | null = null;
+  /** GPU frame budget the resolution controller aims for (ms). */
+  gpuBudgetMs = 12.5;
+  private gpuTimer: GpuFrameTimer | null = null;
+  private lastScaleChange = 0;
   private resizeListeners = new Set<(w: number, h: number) => void>();
   private resizeObserver: ResizeObserver;
 
@@ -99,6 +110,7 @@ export class Engine {
     r.setClearColor(0x000000, 1);
     this.halfFloat = r.extensions.has('EXT_color_buffer_float') || r.extensions.has('EXT_color_buffer_half_float');
     this.post = new Post(r);
+    this.gpuTimer = GpuFrameTimer.create(r.getContext() as WebGL2RenderingContext);
     this.hdr = this.makeHDR(1, 1);
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(canvas);
@@ -135,6 +147,19 @@ export class Engine {
     this.dpr = Math.min(window.devicePixelRatio || 1, this.quality.maxPixelRatio);
     this.renderer.setPixelRatio(this.dpr);
     this.renderer.setSize(w, h, false);
+    this.applyRenderScale();
+  }
+
+  /** Render scale that fits the tier's starting pixel budget for the current canvas. */
+  budgetScale(): number {
+    const px = this.cssWidth * this.cssHeight * this.dpr * this.dpr;
+    return THREE.MathUtils.clamp(Math.sqrt(this.quality.startPixels / Math.max(px, 1)), this.quality.minRenderScale, 1);
+  }
+
+  /** Reset to the pixel-budget scale (called when a new world mounts). */
+  resetRenderScale(): void {
+    this.renderScale = Math.round(this.budgetScale() * 20) / 20;
+    this.lastScaleChange = this.time;
     this.applyRenderScale();
   }
 
@@ -177,9 +202,18 @@ export class Engine {
     this.frame++;
     this.dtEMA += (dt - this.dtEMA) * 0.05;
     this.fps = 1 / this.dtEMA;
-    if (this.dynamicResolution) this.adapt(dt);
+    if (this.dynamicResolution) {
+      if (this.gpuTimer && this.gpuMs !== null) this.adaptGpu();
+      else this.adapt(dt);
+    }
 
     const r = this.renderer;
+    const timing = this.gpuTimer && !this.probe;
+    if (timing) {
+      const ms = this.gpuTimer!.poll();
+      if (ms !== null) this.gpuMs = this.gpuMs === null ? ms : this.gpuMs + (ms - this.gpuMs) * 0.1;
+      this.gpuTimer!.begin();
+    }
     this.probe?.begin();
     r.setRenderTarget(this.hdr);
     r.setClearColor(0x000000, 1);
@@ -187,6 +221,26 @@ export class Engine {
     this.onFrame?.({ dt, time: this.time, frame: this.frame });
     this.post.render(this.hdr, this.time);
     this.probe?.end();
+    if (timing) this.gpuTimer!.end();
+  }
+
+  /**
+   * GPU-time-driven dynamic resolution: pixel cost scales with renderScale², so step the scale by
+   * √(budget / measured) toward the frame budget, at most once per 1.5 s (each change reallocates
+   * render targets), in 5 % steps, between the tier's minimum and native resolution.
+   */
+  private adaptGpu(): void {
+    const ms = this.gpuMs!;
+    if (this.frame < 20 || this.time - this.lastScaleChange < 1.5) return;
+    const budget = this.gpuBudgetMs;
+    let next = this.renderScale;
+    if (ms > budget * 1.12) next = this.renderScale * Math.max(0.75, Math.sqrt(budget / ms));
+    else if (ms < budget * 0.62 && this.renderScale < 1) next = this.renderScale * Math.min(1.12, Math.sqrt((budget * 0.8) / ms));
+    next = THREE.MathUtils.clamp(Math.round(next * 20) / 20, this.quality.minRenderScale, 1);
+    if (Math.abs(next - this.renderScale) < 0.049) return;
+    this.renderScale = next;
+    this.lastScaleChange = this.time;
+    this.applyRenderScale();
   }
 
   /** Dynamic resolution with hysteresis: drop quickly under 45 fps, recover slowly above 57. */
@@ -220,5 +274,49 @@ export class Engine {
     this.post.dispose();
     this.hdr.dispose();
     this.renderer.dispose();
+  }
+}
+
+/** Whole-frame GPU timer (EXT_disjoint_timer_query_webgl2); results arrive a few frames late. */
+class GpuFrameTimer {
+  private pending: WebGLQuery[] = [];
+  private free: WebGLQuery[] = [];
+  private active = false;
+  private constructor(private gl: WebGL2RenderingContext, private ext: { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number }) {}
+
+  static create(gl: WebGL2RenderingContext): GpuFrameTimer | null {
+    const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2') as { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number } | null;
+    return ext ? new GpuFrameTimer(gl, ext) : null;
+  }
+
+  begin(): void {
+    if (this.pending.length >= 6) return;
+    const q = this.free.pop() ?? this.gl.createQuery();
+    if (!q) return;
+    this.gl.beginQuery(this.ext.TIME_ELAPSED_EXT, q);
+    this.pending.push(q);
+    this.active = true;
+  }
+
+  end(): void {
+    if (!this.active) return;
+    this.gl.endQuery(this.ext.TIME_ELAPSED_EXT);
+    this.active = false;
+  }
+
+  /** Latest completed frame time in ms, or null if none finished since the last poll. */
+  poll(): number | null {
+    const gl = this.gl;
+    let out: number | null = null;
+    const disjoint = gl.getParameter(this.ext.GPU_DISJOINT_EXT) as boolean;
+    while (this.pending.length > (this.active ? 1 : 0)) {
+      const q = this.pending[0];
+      if (!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) break;
+      const ns = gl.getQueryParameter(q, gl.QUERY_RESULT) as number;
+      this.pending.shift();
+      this.free.push(q);
+      if (!disjoint) out = ns / 1e6;
+    }
+    return out;
   }
 }

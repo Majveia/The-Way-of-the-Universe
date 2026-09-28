@@ -336,3 +336,175 @@ describe('optical depths that set the look', () => {
     expect(src[2]).toBeLessThan(0.35); // no nearer to us than the horse (z = 0.35)
   });
 });
+
+// ——— Review additions: bake and integrator replicas, tier costs, readouts, constants ———————————
+import { qualityFor, LSUN_AT_1PC_EM } from '../src/worlds/nebula/NebulaVolume';
+import { blackbodyVisibleFraction, shellVelocityKmS, alphaB as alphaB2, HBETA_EMISSIVITY, PC_CM } from '../src/physics/nebulae';
+import { L_SUN } from '../src/physics/constants';
+
+describe('photon-conserving ionization bake (CPU replica of LIGHT_FRAGMENT, radial)', () => {
+  // Mirrors the shader: march from the star to the voxel's inner edge with steps of `lightStep`
+  // voxels, then two half-voxel segments; n_eff² = ΔC / (K (r_b³ − r_a³)/3).
+  function bake(n: (r: number) => number, Q: number, half: number, N: number, stepVox = 0.75) {
+    const K = photonBudgetK(Q);
+    const voxel = (2 * half) / N;
+    const h = 0.5 * voxel;
+    const out: Array<{ r: number; neff: number; ra: number; rb: number }> = [];
+    for (let i = 0; i < N / 2; i++) {
+      const r = (i + 0.5) * voxel;
+      const ra = Math.max(r - h, 0);
+      const rb = r + h;
+      const len = ra;
+      const stepLen = Math.max(stepVox * voxel, len / 320);
+      const M = Math.ceil(len / stepLen);
+      const du = len / Math.max(M, 1);
+      let C = 0;
+      for (let k = 0; k < M; k++) {
+        const u = (k + 0.5) * du;
+        C += n(u) ** 2 * u * u * du;
+      }
+      const Cin = C * K;
+      const u1 = 0.5 * (ra + r);
+      const u2 = r + 0.5 * h;
+      const Cx = Cin + (K * n(u1) ** 2 * (r ** 3 - ra ** 3)) / 3;
+      const Cout = Cx + (K * n(u2) ** 2 * (rb ** 3 - r ** 3)) / 3;
+      const vol = (rb ** 3 - ra ** 3) / 3;
+      const g2 = (Math.min(Cout, 1) - Math.min(Cin, 1)) / (K * vol);
+      out.push({ r, neff: Math.sqrt(Math.max(g2, 0)), ra, rb });
+    }
+    return out;
+  }
+
+  it('uniform gas: n_eff = n inside R_S, 0 beyond, and the recombinations add up to Q', () => {
+    const Q = 1e49;
+    const n0 = 100;
+    const rs = stromgrenRadiusPc(Q, n0); // 3.15 pc
+    const vox = bake(() => n0, Q, 6, 128);
+    const inner = vox.filter((v) => v.rb < rs * 0.97);
+    const outer = vox.filter((v) => v.ra > rs * 1.03);
+    for (const v of inner) expect(v.neff / n0).toBeCloseTo(1, 2);
+    for (const v of outer) expect(v.neff).toBe(0);
+    // Σ α n_eff² dV = Q (photon conservation, independent of where the front falls in a voxel).
+    const rate = vox.reduce((a, v) => a + alphaB2(1e4) * v.neff ** 2 * ((4 * Math.PI) / 3) * (v.rb ** 3 - v.ra ** 3) * PC_CM ** 3, 0);
+    expect(rate / Q).toBeGreaterThan(0.97);
+    expect(rate / Q).toBeLessThan(1.03);
+  });
+
+  it('a dense clump uses up its share of photons and shadows the gas behind it', () => {
+    const Q = 1e49;
+    const clump = (r: number) => (r > 1 && r < 1.2 ? 3000 : 50);
+    const vox = bake(clump, Q, 6, 128);
+    // Without the clump, n = 50 would be ionized out to R_S(50) ≈ 5 pc.
+    expect(stromgrenRadiusPc(Q, 50)).toBeGreaterThan(4.5);
+    const behind = vox.filter((v) => v.ra > 1.5);
+    expect(Math.max(...behind.map((v) => v.neff))).toBe(0);
+  });
+});
+
+describe('ray-march integrator (CPU replica of the march loop)', () => {
+  // Front-to-back with geometric spacing computed incrementally and energy-conserving segment
+  // weights (1 − e^{−Δτ})/Δτ sharing e^{−Δτ} with the running transmittance.
+  function march(j: number, sigma: number, tn: number, tf: number, steps: number, jit: number, near: number) {
+    const c = Math.max(tn, near);
+    const beta = Math.max(Math.log(1 + (tf - tn) / c), 1e-4);
+    const eb = Math.exp(beta) - 1;
+    const span = (tf - tn) / eb;
+    const rStep = Math.exp(beta / steps);
+    const rJit = Math.exp((beta * jit) / steps);
+    let E = 1;
+    let T = 1;
+    let I = 0;
+    let maxErr = 0;
+    for (let i = 0; i < steps; i++) {
+      const E1 = E * rStep;
+      const ta = tn + span * (E - 1);
+      const tb = tn + span * (E1 - 1);
+      const ts = tn + span * (E * rJit - 1);
+      const direct = tn + ((tf - tn) * (Math.exp((beta * (i + jit)) / steps) - 1)) / eb;
+      maxErr = Math.max(maxErr, Math.abs(ts - direct) / (tf - tn));
+      E = E1;
+      const dt = tb - ta;
+      const x = sigma * dt;
+      const e = Math.exp(-x);
+      const w = x < 1e-3 ? 1 - 0.5 * x : (1 - e) / x;
+      I += j * w * T * dt;
+      T *= e;
+    }
+    return { I, T, maxErr, end: tn + span * (E - 1) };
+  }
+
+  it('is exact for a uniform slab at any step count (no step-size bias), incl. optically thick', () => {
+    for (const [sigma, steps] of [
+      [0.05, 16],
+      [0.8, 32],
+      [6, 64],
+    ]) {
+      const L = 7;
+      const m = march(2, sigma, 3, 3 + L, steps, 0.37, 0.1);
+      expect(m.I / ((2 * (1 - Math.exp(-sigma * L))) / sigma)).toBeCloseTo(1, 4);
+      expect(m.T).toBeCloseTo(Math.exp(-sigma * L), 6);
+    }
+  });
+
+  it('incremental sample spacing matches e^{βu} and ends exactly at the far face', () => {
+    const m = march(1, 0.1, 0.02, 9, 256, 0.9, 0.001); // camera inside: steep geometric spacing
+    expect(m.maxErr).toBeLessThan(1e-9);
+    expect(m.end).toBeCloseTo(9, 8);
+  });
+});
+
+describe('quality tiers (GPU cost scales)', () => {
+  // The march dominates: cost ∝ low-res pixels × steps. HDR target sizes follow the engine's
+  // per-tier starting pixel budgets on a 1920×1080 screen (Engine.QUALITY.startPixels).
+  const marchSamples = (detail: number, targetPx: number) => {
+    const q = qualityFor(detail);
+    const low = Math.min(targetPx * q.scale * q.scale, q.maxLowPixels);
+    return low * q.steps;
+  };
+  const px1080 = 1920 * 1080;
+  it('low ≤ ¼ of high, medium between, ultra above', () => {
+    const low = marchSamples(0.35, Math.min(px1080, 1.2e6));
+    const med = marchSamples(0.7, Math.min(px1080, 2.4e6));
+    const high = marchSamples(1, px1080);
+    const ultra = marchSamples(1.6, px1080);
+    expect(low / high).toBeLessThan(0.25);
+    expect(med).toBeGreaterThan(low);
+    expect(med).toBeLessThan(high);
+    expect(ultra).toBeGreaterThan(high);
+    // High at 1080p: ≤ 20 M samples per frame (≈ 9–12 ms of march on an M1 / GTX 1650 class GPU).
+    expect(high).toBeLessThan(20e6);
+  });
+  it('grids are multiples of the occupancy block and steps fit the shader loop', () => {
+    for (const d of [0.35, 0.7, 1, 1.6]) {
+      const q = qualityFor(d);
+      expect(q.N % 4).toBe(0);
+      expect(q.steps).toBeLessThanOrEqual(256);
+      expect(q.scale).toBeLessThan(0.6);
+    }
+  });
+});
+
+describe('radiometric constants and readouts', () => {
+  it('1 L☉ at 1 pc is ≈ 1050 Hβ emission-measure units; the star shader constant 141.6 follows', () => {
+    const hbPerEm = (HBETA_EMISSIVITY / (4 * Math.PI)) * PC_CM;
+    const flux = (L_SUN * 1e7) / (4 * Math.PI * PC_CM * PC_CM);
+    expect(LSUN_AT_1PC_EM).toBeCloseTo(flux / hbPerEm, 6);
+    expect(LSUN_AT_1PC_EM).toBeGreaterThan(1030);
+    expect(LSUN_AT_1PC_EM).toBeLessThan(1070);
+    // NebulaStars: fluxEM = 141.6 · 10^{−0.4 (M_V − 4.83)} / d² (V-band luminance share of the Sun).
+    expect(LSUN_AT_1PC_EM * blackbodyVisibleFraction(5772)).toBeCloseTo(141.6, -1);
+  });
+
+  it('shell speed: homologous shells coast at v₀ at every age; Sedov decelerates as t^{−3/5}', () => {
+    // Regression: the readout used v₀ (R/R₀)(t₀/t) with R clamped at 5 % of t₀, which reported
+    // a 1-yr-old Crab expanding at ~50× its real 1500 km/s.
+    expect(shellVelocityKmS(false, 1500, 1, 970)).toBe(1500);
+    expect(shellVelocityKmS(false, 1500, 5000, 970)).toBe(1500);
+    expect(shellVelocityKmS(true, 150, 21000, 21000)).toBeCloseTo(150, 9);
+    expect(shellVelocityKmS(true, 150, 42000, 21000)).toBeCloseTo(150 * Math.pow(2, -0.6), 9);
+    // Same law as the Sedov solution itself: v(2t)/v(t) = 2^{−3/5}.
+    expect(sedovVelocityKmS(1e51, 1, 2e4) / sedovVelocityKmS(1e51, 1, 1e4)).toBeCloseTo(Math.pow(2, -0.6), 6);
+    // Clamped like the renderer's expansion factor (no divergence at t → 0).
+    expect(shellVelocityKmS(true, 150, 0, 21000)).toBeCloseTo(150 * Math.pow(0.05, -0.6), 9);
+  });
+});
