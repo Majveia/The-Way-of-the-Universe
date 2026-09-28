@@ -77,7 +77,7 @@
   font-size: 9.5px;
   letter-spacing: 0.3em;
   text-transform: uppercase;
-  color: var(--ink-4);
+  color: var(--ink-3);
 }
 .ui .intro .intro-sound {
   display: inline-flex;
@@ -178,8 +178,6 @@
   border: 1px solid var(--line-strong);
   border-radius: 10px;
   box-shadow: 0 40px 120px rgba(0, 0, 0, 0.9);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
   animation: ov-rise 0.32s var(--ease);
   overflow: hidden;
 }
@@ -371,8 +369,6 @@
   border: 1px solid var(--line);
   border-radius: 8px;
   pointer-events: auto;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
   animation: ov-fade 0.25s var(--ease);
 }
 .snd-row {

@@ -64,6 +64,12 @@ export class App {
       { label: 'Benchmark this device', group: 'Tools', keywords: 'performance fps gpu speed test benchmark', run: () => void this.runBench() },
     ]);
     this.ui.addMenuAction('Benchmark this device', () => void this.runBench());
+    // The menu is a 90 %-black full-screen veil: freeze the world behind it (the last frame stays on
+    // the canvas) instead of spending a full GPU frame per refresh on something 10 % visible.
+    // Not in shot mode (the harness counts frames) and never during a benchmark.
+    this.ui.onMenuChange = (open) => {
+      this.engine.paused = open && !this.engine.shotMode && !this.benchRunning;
+    };
     if (this.params.has('noui')) uiRoot.style.display = 'none';
     if (shot) this.ui.neverIdle = true;
     this.debug = { frames: 0, framesSinceReady: 0, ready: false, fps: 0, experienceId: null, experience: null, errors: [], app: this };
@@ -155,6 +161,9 @@ export class App {
   async go(id: string): Promise<void> {
     const def = EXPERIENCES.find((e) => e.id === id) ?? EXPERIENCES.find((e) => e.id === DEFAULT_EXPERIENCE)!;
     const token = ++this.nav;
+    // Browser back/forward while the menu is up: the world behind it is paused (see onMenuChange),
+    // so the fade would never advance — close the menu and let the navigation play.
+    this.ui.closeMenu();
     if (this.current) await this.fadeTo(0, this.engine.shotMode ? 0 : 0.5);
     if (token !== this.nav) return;
     this.unmount();

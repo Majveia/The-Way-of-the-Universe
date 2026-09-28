@@ -279,3 +279,388 @@ describe('help from hint lines', () => {
     expect(hintToShortcuts('')).toEqual([]);
   });
 });
+
+// ——— Review additions: FDN dynamics, audio bus lifecycle, interface contract ———
+
+describe('FDN as wired (self-feedback + shared −2/N sum)', () => {
+  /** Sample-level model of FDNReverb's node graph with pure gains (no damping filters). */
+  function simulate(sumGain: number, rt60: number, sr = 8000, seconds = 1.6): Float64Array {
+    const n = 8;
+    const D = fdnDelays(n, 1.25, sr).map((d) => Math.round(d * sr));
+    const g = D.map((d) => fdnGain(d / sr, rt60));
+    const N = Math.round(seconds * sr);
+    const lineIn = D.map(() => new Float64Array(N));
+    const energy = new Float64Array(N);
+    const v = new Float64Array(n);
+    for (let t = 0; t < N; t++) {
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        v[i] = t >= D[i] ? g[i] * lineIn[i][t - D[i]] : 0;
+        sum += v[i];
+      }
+      let e = 0;
+      for (let i = 0; i < n; i++) {
+        lineIn[i][t] = (t === 0 ? 1 : 0) + v[i] + sumGain * sum; // x + A·v with A = I + sumGain·11ᵀ
+        e += v[i] * v[i];
+      }
+      energy[t] = e;
+    }
+    return energy;
+  }
+  const windowDb = (e: Float64Array, t0: number, t1: number, sr = 8000) => {
+    let s = 0;
+    for (let i = Math.round(t0 * sr); i < Math.round(t1 * sr); i++) s += e[i];
+    return 10 * Math.log10(s / ((t1 - t0) * sr));
+  };
+  it('decays 60 dB per RT60 (energy envelope), independent of line length', () => {
+    const rt = 1.2;
+    const e = simulate(-2 / 8, rt);
+    const a = windowDb(e, 0.2, 0.4);
+    const b = windowDb(e, 0.2 + rt / 2, 0.4 + rt / 2);
+    expect(a - b).toBeGreaterThan(27);
+    expect(a - b).toBeLessThan(33);
+  });
+  it('the −2/N sign is what keeps it stable (+2/N would blow up)', () => {
+    const e = simulate(+2 / 8, 1.2, 8000, 0.8);
+    expect(windowDb(e, 0.6, 0.8)).toBeGreaterThan(windowDb(e, 0.1, 0.3));
+  });
+});
+
+describe('physics constants behind the keys', () => {
+  it('Wien frequency constant = x·k/h with x = 2.821439372 (CODATA 2018 exact k, h)', async () => {
+    const k = 1.380649e-23;
+    const h = 6.62607015e-34;
+    expect(WIEN_FREQ / ((2.821439372122 * k) / h)).toBeCloseTo(1, 7);
+  });
+  it('ISCO: BPT closed form matches the defining condition (E″ = 0 ⇔ r² − 6r + 8a√r − 3a² = 0)', () => {
+    for (const a of [0, 0.3, 0.7, 0.9, 0.998]) {
+      const r = iscoRadiusBPT(a);
+      expect(r * r - 6 * r + 8 * a * Math.sqrt(r) - 3 * a * a).toBeCloseTo(0, 8);
+    }
+    // retrograde branch (a < 0 in this convention): 9 M at the extremal limit
+    expect(iscoRadiusBPT(-0.9999)).toBeGreaterThan(8.9);
+  });
+  it('Kerr ISCO frequency Ω = c³ / (GM (r^{3/2} + a)): spin 0.998 is ≈ 6.2 × faster than Schwarzschild', () => {
+    const r = iscoRadiusBPT(0.998);
+    const ratio = iscoOrbitalFrequency(1, 0.998) / iscoOrbitalFrequency(1, 0);
+    expect(ratio).toBeCloseTo(Math.pow(6, 1.5) / (Math.pow(r, 1.5) + 0.998), 10);
+    expect(ratio).toBeGreaterThan(6);
+    expect(ratio).toBeLessThan(6.5);
+  });
+  it('named keys: Sgr A* → C, CMB peak → D, solar ν_max 3.09 mHz → A♭ (101.25 Hz after 15 octaves)', () => {
+    const pc = (m: number) => ((m % 12) + 12) % 12;
+    expect(pc(resolveMood('gargantua', { mass: 4.3e6 }).tonic)).toBe(0);
+    expect(pc(resolveMood('cosmos').tonic)).toBe(2);
+    expect(pc(resolveMood('solar').tonic)).toBe(8);
+    expect(resolveMood('solar').key).toMatch(/^A♭ /);
+    expect(resolveMood('cosmos').origin).toMatch(/lowered 31 octaves/);
+  });
+  it('Doppler shift is monotonic, zero at rest and capped (no runaway pitch near c)', () => {
+    expect(resolveMood('voyage', { speed: 0 }).bellShift).toBe(0);
+    expect(resolveMood('voyage', { speed: 0.3 }).bellShift).toBeLessThan(resolveMood('voyage', { speed: 0.6 }).bellShift);
+    expect(resolveMood('voyage', { speed: 0.9999 }).bellShift).toBeLessThanOrEqual(1.5);
+    expect(Number.isFinite(resolveMood('voyage', { speed: 1 }).bellShift)).toBe(true);
+  });
+  it('bad params never produce NaN keys', () => {
+    for (const p of [{ mass: NaN }, { mass: -5 }, { teff: Infinity }, { speed: NaN }, { z: -1 }, { separation: NaN }]) {
+      for (const id of MOOD_IDS) {
+        const s = resolveMood(id, p as never);
+        expect(Number.isFinite(s.tonic)).toBe(true);
+        expect(Number.isFinite(s.brightness)).toBe(true);
+        expect(Number.isFinite(s.bellShift)).toBe(true);
+      }
+    }
+  });
+});
+
+describe('AudioBus lifecycle', () => {
+  /** Minimal Web Audio stand-in: enough for AudioBus (the engine is injected). */
+  function installFakeAudio() {
+    const param = () => ({ value: 0, cancelScheduledValues() {}, setTargetAtTime() {} });
+    const node = () => {
+      const n: Record<string, unknown> = { gain: param(), threshold: param(), ratio: param(), disconnect() {} };
+      n.connect = (d: unknown) => d;
+      return n;
+    };
+    let contexts = 0;
+    class FakeAC {
+      currentTime = 0;
+      state = 'running';
+      destination = node();
+      constructor() {
+        contexts++;
+      }
+      createGain = node;
+      createDynamicsCompressor = node;
+      resume = async () => undefined;
+      suspend = async () => undefined;
+    }
+    const w = globalThis as unknown as Record<string, unknown>;
+    const prev = w.window;
+    w.window = { AudioContext: FakeAC, setTimeout: () => 0, localStorage: undefined };
+    return { contexts: () => contexts, restore: () => void (w.window = prev) };
+  }
+
+  it('on → off → on while the engine is still loading builds exactly one engine', async () => {
+    const fake = installFakeAudio();
+    try {
+      const { AudioBus } = await import('../src/audio/AudioBus');
+      const bus = new AudioBus();
+      let built = 0;
+      let started = 0;
+      bus.setEngineFactory(async () => {
+        built++;
+        await new Promise((r) => setTimeout(r, 5));
+        return { start: () => void started++, setMood() {}, event() {}, update() {}, stop() {} };
+      });
+      const a = bus.enable();
+      bus.disable();
+      const b = bus.enable();
+      const c = bus.enable();
+      await Promise.all([a, b, c]);
+      expect(built).toBe(1);
+      expect(started).toBe(1);
+      expect(fake.contexts()).toBe(1);
+      expect(bus.enabled).toBe(true);
+    } finally {
+      fake.restore();
+    }
+  });
+
+  it('setMood before enable is remembered and handed to the engine', async () => {
+    const fake = installFakeAudio();
+    try {
+      const { AudioBus } = await import('../src/audio/AudioBus');
+      const bus = new AudioBus();
+      const got: string[] = [];
+      bus.setEngineFactory(async () => ({ start() {}, setMood: (n: string) => void got.push(n), event() {}, update() {}, stop() {} }));
+      bus.setMood('blackhole', { mass: 1e8 });
+      await bus.enable();
+      expect(got).toEqual(['blackhole']);
+      expect(bus.describe().key).toMatch(/^[A-G]/);
+    } finally {
+      fake.restore();
+    }
+  });
+});
+
+describe('interface contract', () => {
+  // Node's fs without Node typings (tsconfig types = vite/client only).
+  type FS = { readFileSync(u: URL, enc: 'utf8'): string; existsSync(u: URL): boolean };
+  const fs = async () => (await import(/* @vite-ignore */ 'node:fs' as string)) as FS;
+  const read = async (p: string) => (await fs()).readFileSync(new URL(p, import.meta.url), 'utf8');
+
+  /** WCAG 2.x relative luminance of an sRGB colour (0–255 channels). */
+  const lum = (r: number, g: number, b: number) => {
+    const f = (c: number) => {
+      const x = c / 255;
+      return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+  };
+  const onBlack = (css: string) => {
+    const m = /rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/.exec(css);
+    let rgb: number[];
+    if (m) {
+      const a = m[4] === undefined ? 1 : Number(m[4]);
+      rgb = [Number(m[1]) * a, Number(m[2]) * a, Number(m[3]) * a]; // composited over #000
+    } else {
+      const h = /#([0-9a-f]{6})/i.exec(css)![1];
+      rgb = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+    }
+    return (lum(rgb[0], rgb[1], rgb[2]) + 0.05) / 0.05;
+  };
+
+  it('text tokens meet WCAG contrast on the OLED ground (#000)', async () => {
+    const css = await read('../src/ui/style.css');
+    const token = (name: string) => new RegExp(`--${name}:\\s*([^;]+);`).exec(css)![1];
+    expect(token('ground').trim()).toBe('#000000');
+    for (const t of ['ink', 'ink-2', 'ink-3', 'accent', 'cool']) expect(onBlack(token(t))).toBeGreaterThanOrEqual(4.5);
+    expect(onBlack(token('ink-4'))).toBeGreaterThanOrEqual(3);
+  });
+
+  it('nothing is fetched from the network at runtime (fonts are bundled)', async () => {
+    const html = await read('../index.html');
+    expect(html).not.toMatch(/<link[^>]+https?:\/\//i);
+    for (const f of ['../src/ui/style.css', '../src/ui/overlays.css']) {
+      const css = await read(f);
+      expect(css).not.toMatch(/url\(\s*['"]?https?:/i);
+      expect(css).not.toMatch(/@import\s+url\(\s*['"]?https?:/i);
+    }
+    const css = await read('../src/ui/style.css');
+    const refs = [...css.matchAll(/url\('\.\/(fonts\/[^']+)'\)/g)].map((m) => `../src/ui/${m[1]}`);
+    expect(refs.length).toBeGreaterThanOrEqual(3);
+    const { existsSync } = await fs();
+    for (const r of refs) expect(existsSync(new URL(r, import.meta.url))).toBe(true);
+    expect(css).toMatch(/font-display:\s*swap/);
+  });
+
+  it('backdrop blur is never applied unconditionally (phones re-blur the live canvas every frame)', async () => {
+    for (const f of ['../src/ui/style.css', '../src/ui/overlays.css']) {
+      const css = (await read(f)).replace(/\/\*[\s\S]*?\*\//g, '');
+      // every backdrop-filter must sit inside a (pointer: fine) media block
+      const re = /backdrop-filter\s*:/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(css))) {
+        const before = css.slice(0, m.index);
+        const open = before.lastIndexOf('@media');
+        expect(open).toBeGreaterThanOrEqual(0);
+        expect(before.slice(open, open + 60)).toMatch(/pointer:\s*fine/);
+      }
+    }
+  });
+
+  it('only text entry swallows the global keys', async () => {
+    const { isTypingTarget } = await import('../src/ui/UI');
+    const input = (type: string) => ({ tagName: 'INPUT', type, isContentEditable: false }) as unknown as EventTarget;
+    expect(isTypingTarget(input('text'))).toBe(true);
+    expect(isTypingTarget(input('search'))).toBe(true);
+    expect(isTypingTarget(input('range'))).toBe(false);
+    expect(isTypingTarget(input('checkbox'))).toBe(false);
+    expect(isTypingTarget({ tagName: 'TEXTAREA', isContentEditable: false } as unknown as EventTarget)).toBe(true);
+    expect(isTypingTarget({ tagName: 'DIV', isContentEditable: true } as unknown as EventTarget)).toBe(true);
+    expect(isTypingTarget({ tagName: 'CANVAS', isContentEditable: false } as unknown as EventTarget)).toBe(false);
+    expect(isTypingTarget(null)).toBe(false);
+  });
+});
+
+describe('sound engine graph (fake Web Audio)', () => {
+  interface FNode {
+    kind: string;
+    out: Set<FNode>;
+    connect(d: FNode | FParam): FNode | FParam;
+    disconnect(d?: FNode): void;
+    [k: string]: unknown;
+  }
+  interface FParam {
+    kind: 'param';
+    owner: FNode;
+    value: number;
+  }
+  function fakeContext() {
+    const all: FNode[] = [];
+    const param = (owner: FNode): FParam => {
+      const p = { kind: 'param' as const, owner, value: 0 } as FParam & Record<string, unknown>;
+      for (const m of ['setValueAtTime', 'setTargetAtTime', 'linearRampToValueAtTime', 'exponentialRampToValueAtTime', 'cancelScheduledValues']) p[m] = () => p;
+      return p;
+    };
+    const node = (kind: string, params: string[] = []): FNode => {
+      const n = { kind, out: new Set<FNode>() } as FNode;
+      n.connect = (d) => {
+        n.out.add((d as FParam).kind === 'param' ? (d as FParam).owner : (d as FNode));
+        return d;
+      };
+      n.disconnect = (d) => {
+        if (d) n.out.delete(d);
+        else n.out.clear();
+      };
+      for (const p of params) n[p] = param(n);
+      n.start = () => undefined;
+      n.stop = () => undefined;
+      n.setPeriodicWave = () => undefined;
+      all.push(n);
+      return n;
+    };
+    const ctx = {
+      sampleRate: 8000,
+      currentTime: 0,
+      state: 'running',
+      destination: node('destination'),
+      createGain: () => node('gain', ['gain']),
+      createOscillator: () => node('osc', ['frequency', 'detune']),
+      createBiquadFilter: () => node('biquad', ['frequency', 'Q', 'gain']),
+      createStereoPanner: () => node('pan', ['pan']),
+      createDelay: () => node('delay', ['delayTime']),
+      createChannelMerger: () => node('merger'),
+      createBufferSource: () => node('buffer'),
+      createPeriodicWave: () => ({}),
+      createBuffer: (_c: number, n: number) => ({ getChannelData: () => new Float32Array(n) }),
+    };
+    return { ctx, all };
+  }
+  /** Can `from` reach `to` without passing through `avoid`? */
+  const reaches = (from: FNode, to: FNode, avoid?: FNode) => {
+    const seen = new Set<FNode>();
+    const stack = [from];
+    while (stack.length) {
+      const n = stack.pop()!;
+      if (n === to) return true;
+      if (seen.has(n) || n === avoid) continue;
+      seen.add(n);
+      stack.push(...n.out);
+    }
+    return false;
+  };
+
+  async function engineWith(opts: { music: boolean; ambience: boolean; ui: boolean }) {
+    const w = globalThis as unknown as Record<string, unknown>;
+    const prev = w.window;
+    w.window = { setInterval: () => 0, clearInterval: () => undefined };
+    class PW {}
+    const prevPW = w.PeriodicWave;
+    w.PeriodicWave = PW;
+    const { createSoundEngine } = await import('../src/audio/engine');
+    const { ctx } = fakeContext();
+    ctx.createPeriodicWave = () => new PW();
+    const eng = createSoundEngine() as unknown as Record<string, unknown> & import('../src/audio/AudioBus').SoundEngine;
+    const out = ctx.createGain();
+    out.connect(ctx.destination);
+    eng.start(ctx as unknown as AudioContext, out as unknown as AudioNode);
+    eng.configure!(opts);
+    eng.setMood('prelude', { intensity: 0.4 });
+    return {
+      eng,
+      ctx,
+      restore: () => {
+        w.window = prev;
+        w.PeriodicWave = prevPW;
+      },
+    };
+  }
+
+  it('event chimes and UI ticks still sound with Ambience off; the ambient bus is parked', async () => {
+    const { eng, ctx, restore } = await engineWith({ music: false, ambience: false, ui: true });
+    try {
+      const ambient = eng.ambient as FNode;
+      ctx.currentTime = 10; // past the 4 s park delay
+      eng.update(0.1);
+      const bells = eng.bells as Array<{ pan: FNode }>;
+      eng.event('arrive');
+      const woken = bells.filter((b) => b.pan.out.size > 0);
+      expect(woken.length).toBeGreaterThan(0);
+      for (const b of woken) expect(reaches(b.pan, ctx.destination as FNode, ambient)).toBe(true);
+      // ambient layers are disconnected from the mix while off
+      expect(reaches(ambient, ctx.destination as FNode)).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+
+  it('the jazz bus is parked while the music is off and reaches the output when on', async () => {
+    const { eng, ctx, restore } = await engineWith({ music: false, ambience: true, ui: false });
+    try {
+      const jazz = eng.jazzBus as FNode;
+      ctx.currentTime = 10;
+      eng.update(0.1);
+      expect(reaches(jazz, ctx.destination as FNode)).toBe(false);
+      eng.configure!({ music: true });
+      expect(reaches(jazz, ctx.destination as FNode)).toBe(true);
+      expect(reaches(eng.ambient as FNode, ctx.destination as FNode)).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('re-sending an identical mood is a no-op (no re-resolve)', async () => {
+    const { eng, restore } = await engineWith({ music: false, ambience: true, ui: false });
+    try {
+      const spec = eng.spec;
+      eng.setMood('prelude', { intensity: 0.4 });
+      expect(eng.spec).toBe(spec);
+      eng.setMood('prelude', { intensity: 0.5 });
+      expect(eng.spec).not.toBe(spec);
+    } finally {
+      restore();
+    }
+  });
+});
