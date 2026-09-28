@@ -643,6 +643,21 @@ class MilkyWay implements Experience {
     this.updateOverlay();
   }
 
+  /** Place a screen marker over a render-frame point (hidden behind the camera or off-screen). */
+  private placeMark(el: HTMLElement, p: THREE.Vector3, visible: boolean, minDist: number, w: number, h: number): void {
+    const cam = this.camera;
+    const v = this.v1.copy(p).project(cam);
+    const d = cam.position.distanceTo(p);
+    const on = visible && v.z < 1 && Math.abs(v.x) < 1.1 && Math.abs(v.y) < 1.1 && d > minDist;
+    const op = on ? '1' : '0';
+    if (el.style.opacity !== op) el.style.opacity = op;
+    if (!on) return;
+    const x = (v.x + 1) * 0.5 * w;
+    // Caption on the side with room for it (narrow screens: whichever half has more space).
+    el.classList.toggle('is-left', w < 720 ? x > 0.5 * w : x > w - 230);
+    el.style.transform = `translate(${x.toFixed(1)}px, ${((1 - v.y) * 0.5 * h).toFixed(1)}px)`;
+  }
+
   private updateOverlay(): void {
     const w = this.ctx.canvas.clientWidth;
     const h = this.ctx.canvas.clientHeight;
@@ -651,22 +666,12 @@ class MilkyWay implements Experience {
     const params = this.layer.params;
 
     // Sun and Sgr A* markers.
-    const place = (el: HTMLElement, p: THREE.Vector3, visible: boolean, minDist = 0) => {
-      const v = this.v1.copy(p).project(cam);
-      const d = camPos.distanceTo(p);
-      const on = visible && v.z < 1 && Math.abs(v.x) < 1.1 && Math.abs(v.y) < 1.1 && d > minDist;
-      el.style.opacity = on ? '1' : '0';
-      if (!on) return;
-      const x = (v.x + 1) * 0.5 * w;
-      el.classList.toggle('is-left', x > w - 230);
-      el.style.transform = `translate(${x.toFixed(1)}px, ${((1 - v.y) * 0.5 * h).toFixed(1)}px)`;
-    };
     // With the halo removed the orbits are integrated, so the analytic Sun and arm loci no longer apply.
     const dm = this.layer.darkMatter;
-    place(this.sunMark, this.sunPos, this.showSun && !!params.sun && dm, 20);
+    this.placeMark(this.sunMark, this.sunPos, this.showSun && !!params.sun && dm, 20, w, h);
     this.v2.set(0, 0, 0);
     const dGC = camPos.length();
-    place(this.bhMark, this.v2, this.showLabels && params.id === 'milkyway' && dGC > 300 && dGC < 16000 && (Math.abs(camPos.y) > 800 || dGC < 3000));
+    this.placeMark(this.bhMark, this.v2, this.showLabels && params.id === 'milkyway' && dGC > 300 && dGC < 16000 && (Math.abs(camPos.y) > 800 || dGC < 3000), 0, w, h);
 
     // Arm names (Milky Way), riding with the pattern.
     const k = this.layer.kin;

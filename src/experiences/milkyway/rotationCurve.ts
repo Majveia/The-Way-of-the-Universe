@@ -189,6 +189,7 @@ export const MILKYWAY_CSS = /* css */ `
 .mw-mark .txt small { display: block; font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0; color: var(--ink-3); margin-top: 1px; }
 .mw-mark.is-left .tick { left: -25px; }
 .mw-mark.is-left .txt { left: auto; right: 30px; text-align: right; }
+@media (max-width: 560px) { .mw-mark .txt small { display: none; } }
 .mw-mark.is-bh .ring { border-color: var(--ink-2); width: 8px; height: 8px; left: -4px; top: -4px; }
 .mw-mark.is-bh .tick { border-top-color: var(--ink-4); left: 6px; }
 .mw-arm { position: absolute; left: 0; top: 0; font-size: 10px; letter-spacing: .22em; text-transform: uppercase; color: var(--ink-3);
