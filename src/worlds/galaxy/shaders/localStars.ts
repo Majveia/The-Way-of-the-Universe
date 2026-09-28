@@ -23,7 +23,8 @@ uniform int uTier;
 uniform float uCell;
 uniform int uN;
 uniform int uMaxPer;
-uniform vec3 uCamCell;      // integer cell of the camera (model frame)
+uniform vec3 uCamCell;      // integer cell of the camera (co-rotating frame)
+uniform vec2 uLocalRot;     // cos, sin of the co-rotation angle Ω_ref · t (the field turns with the local standard of rest)
 uniform vec4 uTierL;        // lLo, lHi, n0, giant fraction
 uniform float uRadius;      // fade-out distance (pc)
 uniform float uBeta;        // luminosity-function slope in the tier
@@ -106,6 +107,8 @@ void main() {
   L *= boost;
 
   vec3 P = (vec3(ic) + vec3(fx, fy, fz)) * C;
+  // Co-rotating cell frame → model frame (the density is axisymmetric, so the count is unchanged).
+  P.xy = vec2(uLocalRot.x * P.x - uLocalRot.y * P.y, uLocalRot.y * P.x + uLocalRot.x * P.y);
   vec3 d = P - uCamModel;
   float dist = length(d);
   float fade = 1.0 - smoothstep(0.7 * uRadius, uRadius, dist);

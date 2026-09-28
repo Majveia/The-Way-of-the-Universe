@@ -91,6 +91,13 @@ class MilkyWay implements Experience {
   private readonly sunPos = new THREE.Vector3();
   private readonly renderOpts = { exposure: 1, frame: 0 };
   private readonly plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  /**
+   * Sun-centred views ride along with the Sun: it moves at 230 km/s (≈ 470 pc per second at the
+   * default warp), so a fixed camera would lose it within a fraction of a second. The rig is
+   * co-rotated about the Galactic Centre by the Sun's change in azimuth every frame.
+   */
+  private followSun = false;
+  private sunAz = NaN;
   private cursorR = NaN;
   private pointerSeen = false;
   private shotMode = false;
@@ -141,10 +148,11 @@ class MilkyWay implements Experience {
     if (Number.isFinite(lum) && lum > 0) {
       // Looking at a galaxy: adapt to the bright parts it is made of.
       const outside = base * THREE.MathUtils.clamp(Math.pow(1.08 / lum, 0.7), 0.25, 1.1);
-      // Surrounded by sky (inside the disk): keep the typical background dark (scene ≈ 0.03, ≈ 12 %
+      // Surrounded by sky (inside the disk): keep the typical background dark (scene ≈ 0.02, ≈ 8 %
       // grey after the tone curve) so the band glows and the stars stand out, as in an unprocessed
-      // dark-site photograph; brighter than that the whole OLED frame turns into a grey-brown haze.
-      const inside = Number.isFinite(sky) && sky > 0 ? THREE.MathUtils.clamp(0.03 / sky, 0.1 * base, 1.5 * base) : outside;
+      // dark-site photograph; brighter than that the whole OLED frame turns into a grey-brown haze
+      // (the diffuse light at |b| ≈ 30° really is ~⅓ of the band's, so it cannot be black).
+      const inside = Number.isFinite(sky) && sky > 0 ? THREE.MathUtils.clamp(0.02 / sky, 0.1 * base, 1.5 * base) : outside;
       target = THREE.MathUtils.lerp(outside, inside, THREE.MathUtils.smoothstep(lit, 0.85, 0.99));
     }
     const tau = this.shotMode ? 0.12 : 1.1;
@@ -174,6 +182,29 @@ class MilkyWay implements Experience {
 
   private plotRadius(p: GalaxyParams): number {
     return p.id === 'milkyway' ? 25000 : Math.min(40000, Math.max(10000, p.rMax));
+  }
+
+  /** The Sun (render frame) at time t, Myr: its guiding centre turns at Ω(R⊙) of the equilibrium galaxy. */
+  private sunAt(t: number, out: THREE.Vector3): THREE.Vector3 {
+    const s = this.layer.params.sun;
+    if (!s) return out.set(0, 0, 0);
+    const phi = s.phi + this.layer.kin.potential.omega(s.R, true) * t;
+    this.layer.kin.toRender(s.R * Math.cos(phi), s.R * Math.sin(phi), s.z, out);
+    return out;
+  }
+
+  /** Co-rotate the orbit rig about the Galactic Centre by the Sun's change of azimuth. */
+  private followTheSun(): void {
+    const az = Math.atan2(this.sunPos.x, this.sunPos.z);
+    let d = Number.isFinite(this.sunAz) ? az - this.sunAz : 0;
+    this.sunAz = az;
+    if (!this.followSun || this.flying || this.orbit.animating || !this.layer.params.sun) return;
+    d -= 2 * Math.PI * Math.round(d / (2 * Math.PI));
+    if (d === 0) return;
+    rotateY(this.orbit.target, d);
+    rotateY(this.orbit.goal.target, d);
+    this.orbit.yaw += d;
+    this.orbit.goal.yaw += d;
   }
 
   private setSunPosition(): void {
@@ -441,12 +472,16 @@ class MilkyWay implements Experience {
       this.controls.fly?.set(false);
     }
     this.setSunPosition();
-    const target = v.target === 'sun' ? this.sunPos.clone() : new THREE.Vector3(...(v.target ?? [0, 0, 0]));
+    this.followSun = v.target === 'sun';
+    let target: THREE.Vector3;
     let yaw = v.yaw;
     if (v.target === 'sun') {
-      // Look from behind the Sun toward the Galactic Centre (the Sun's azimuth moves with time).
-      yaw = Math.atan2(this.sunPos.x, this.sunPos.z) + (name === 'neighbourhood' ? -0.55 : 0);
-    }
+      // Aim where the Sun will be when the flight ends (it keeps orbiting meanwhile), from behind
+      // it toward the Galactic Centre; from then on the rig follows it (see followTheSun).
+      const tEnd = this.layer.time + (this.paused ? 0 : this.warp * duration);
+      target = this.sunAt(tEnd, new THREE.Vector3());
+      yaw = Math.atan2(target.x, target.z) + (name === 'neighbourhood' ? -0.55 : 0);
+    } else target = new THREE.Vector3(...(v.target ?? [0, 0, 0]));
     const to = { target, distance: this.viewDistance(v, this.layer.params), yaw, pitch: v.pitch };
     this.fovGoal = v.fov ?? 50;
     if (duration > 0) this.orbit.flyTo(to, duration);
@@ -580,14 +615,15 @@ class MilkyWay implements Experience {
 
   update(f: FrameInfo): void {
     this.frame = f.frame;
+    if (!this.paused) this.layer.advance(this.warp * f.dt);
+    this.setSunPosition();
+    this.followTheSun();
     if (this.flying && this.fly) this.fly.update(f.dt);
     else this.orbit.update(f.dt);
     this.fov += (this.fovGoal - this.fov) * (1 - Math.exp(-f.dt / 0.5));
     if (!this.exposureLocked) this.adaptExposure(f.dt);
-    if (!this.paused) this.layer.advance(this.warp * f.dt);
     this.fadeIn = Math.min(1, this.fadeIn + f.dt / 0.8);
     this.layer.radianceScale = this.fadeIn * this.fadeIn * (3 - 2 * this.fadeIn);
-    this.setSunPosition();
   }
 
   render(target: THREE.WebGLRenderTarget): void {
@@ -696,6 +732,14 @@ class MilkyWay implements Experience {
     for (const a of this.armLabels) a.el.remove();
     this.armLabels = [];
   }
+}
+
+/** Rotate v about the y axis (the Galactic pole) by a radians: azimuth atan2(x, z) grows by a. */
+function rotateY(v: THREE.Vector3, a: number): void {
+  const c = Math.cos(a), s = Math.sin(a);
+  const x = v.x, z = v.z;
+  v.x = x * c + z * s;
+  v.z = -x * s + z * c;
 }
 
 export default () => new MilkyWay();

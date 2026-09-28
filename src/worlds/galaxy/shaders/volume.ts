@@ -60,6 +60,20 @@ uniform float uEncode;     // > 0 only without float render targets: store y = x
 uniform int uMask;         // component bits: 1 disk, 2 thick, 4 bulge, 8 bar, 16 young, 32 HII, 64 scattering, 128 dust
 
 // sech²x = 4e/(1 + e)² with e = exp(−2|x|): one exp instead of cosh's two, no overflow.
+// localDustRho (ismGlsl) with the squared radius scaled by k (ragged outlines).
+float localDustRhoRagged(vec3 m, float k) {
+  float rho = 0.0;
+  for (int i = 0; i < 8; i++) {
+    if (i >= uCloudCount) break;
+    vec4 c = uClouds[i];
+    vec3 d = m - c.xyz;
+    d.z /= CLOUD_FLAT;
+    float r2 = k * dot(d, d) / (c.w * c.w);
+    if (r2 < 9.0) rho += uCloudTau[i] / (1.772 * c.w) * exp(-r2);
+  }
+  return rho;
+}
+
 float sech2(float x) { float e = exp(-2.0 * min(abs(x), 30.0)); float d = 1.0 + e; return 4.0 * e / (d * d); }
 
 // Interval of the ray inside the cylinder R < Rmax and slab |H| < Zmax.
@@ -193,7 +207,11 @@ void main() {
     // The Local Bubble and the nearby clouds (8 Gaussians) only exist around the Sun: one distance
     // test instead of nine evaluations on every step of every ray.
     if (uLocalReach > 0.0 && dot(m - uBubble.xyz, m - uBubble.xyz) < uLocalReach * uLocalReach) {
-      rho = rho * bubbleFactor(m) + localDustRho(m);
+      // Nearby clouds are turbulent, not Gaussian balls: the fine noise (≈ 9 pc features) roughens
+      // their outlines (radius scaled by 0.55–1.45) and breaks the interior into clumps and lanes,
+      // keeping the mean column roughly unchanged (star extinction uses the smooth analytic column).
+      float rag = n2.r;
+      rho = rho * bubbleFactor(m) + localDustRhoRagged(m, 0.55 + 0.9 * rag) * (0.15 + 1.9 * smoothstep(0.32, 0.72, rag)) * (0.7 + 0.6 * n2.g);
     }
     if ((uMask & 128) == 0) rho = 0.0;
 

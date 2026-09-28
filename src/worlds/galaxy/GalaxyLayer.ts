@@ -195,6 +195,20 @@ export class GalaxyLayer {
   private readonly tmpV = new THREE.Vector3();
   private readonly camModel = new THREE.Vector3();
   private readonly maxPointSize: number;
+  /** cos, sin of the local field's co-rotation angle (see localRotation). Shared by every tier. */
+  private readonly localRot = { value: new THREE.Vector2(1, 0) };
+
+  /**
+   * The procedural local star field turns rigidly about the centre at Ω(R_ref) — R_ref = R⊙, or
+   * 3 disk scale lengths — as the real solar neighbourhood does (stars near the Sun share its
+   * orbit, ±20 km/s). A field fixed in space would stream past a Sun-following camera at 230 km/s ×
+   * the time warp. Angle 0 at t = 0, so nearestStars is unchanged for a galaxy that does not run.
+   */
+  localRotation(): number {
+    const p = this.params;
+    const R = p.sun?.R ?? Math.max(1000, 3 * p.disk.scaleLength);
+    return this.kin.potential.omega(R, true) * this.time;
+  }
 
   constructor(renderer: THREE.WebGLRenderer, o: GalaxyLayerOptions) {
     this.renderer = renderer;
@@ -405,6 +419,7 @@ export class GalaxyLayer {
           uN: { value: N },
           uMaxPer: { value: per },
           uCamCell: { value: new THREE.Vector3() },
+          uLocalRot: this.localRot,
           uTierL: { value: new THREE.Vector4(tier.lLo, tier.lHi, tier.n0, tier.giants) },
           uRadius: { value: tier.radius },
           uBeta: { value: tier.beta },
@@ -1214,13 +1229,19 @@ export class GalaxyLayer {
       renderer.render(this.starScene, camera);
       if (hiDone) this.stars!.visible = true;
       if (this.localActive) {
+        const th = this.localRotation();
+        const c = Math.cos(th), sn = Math.sin(th);
+        this.localRot.value.set(c, sn);
+        // Camera in the co-rotating frame.
+        const rx = c * cam.x + sn * cam.y;
+        const ry = -sn * cam.x + c * cam.y;
         for (const lt of this.localTiers) {
           const u = lt.mat.uniforms;
           const C = u.uCell.value as number;
           const R = u.uRadius.value as number;
           // Skip tiers whose stars are all out of reach (camera far above or outside the disk).
           lt.pts.visible = Math.abs(cam.z) < R + 2500 && Math.hypot(cam.x, cam.y) < this.dens.trunc * 1.1 + R;
-          (u.uCamCell.value as THREE.Vector3).set(Math.floor(cam.x / C), Math.floor(cam.y / C), Math.floor(cam.z / C));
+          (u.uCamCell.value as THREE.Vector3).set(Math.floor(rx / C), Math.floor(ry / C), Math.floor(cam.z / C));
           u.uGain.value = this.radianceScale;
         }
         renderer.render(this.localScene, camera);
@@ -1235,10 +1256,13 @@ export class GalaxyLayer {
    */
   nearestStars(posPc: THREE.Vector3, k = 16): StarRecord[] {
     const m = this.kin.fromRender(posPc.x, posPc.y, posPc.z, { x: 0, y: 0, z: 0 });
-    const field = nearestLocalStars(this.dens, this.params.seed >>> 0, m.x, m.y, m.z, k);
+    // The field lives in the co-rotating frame (as drawn): query there, rotate the results back.
+    const th = this.localRotation();
+    const c = Math.cos(th), sn = Math.sin(th);
+    const field = nearestLocalStars(this.dens, this.params.seed >>> 0, c * m.x + sn * m.y, -sn * m.x + c * m.y, m.z, k);
     const out: Array<StarRecord & { d: number }> = field.map((f) => {
       const v = new THREE.Vector3();
-      this.kin.toRender(f.x, f.y, f.h, v);
+      this.kin.toRender(c * f.x - sn * f.y, sn * f.x + c * f.y, f.h, v);
       return { id: f.id, position: v, temperatureK: f.temperatureK, luminosity: f.luminosity, massSun: f.massSun, seed: f.seed, kind: 'field' as const, d: v.distanceTo(posPc) };
     });
     const reach = out.length ? out[out.length - 1].d : Infinity;
