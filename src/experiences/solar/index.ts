@@ -23,7 +23,7 @@ import { EVENTS, VIEWS, type ViewPreset, type ViewTarget } from './views';
 import { formatAU, formatLightTime, infoCard } from './info';
 
 /** Interface regions the body labels stay clear of. */
-const KEEP_OUT = ['.readouts', '.ui-bottom-right', '.exp-title', '.info-card'];
+const KEEP_OUT = ['.readouts', '.ui-bottom-right', '.ui-top-left', '.ui-actions', '.info-card'];
 const DEFAULT_WARP = WARP_STEPS.findIndex((w) => w.label === '1 day / s');
 
 class SolarExperience implements Experience {
@@ -189,6 +189,7 @@ class SolarExperience implements Experience {
     });
     this.enlargeSlider.setDisabled(true);
     scale.text('At true scale the planets are specks: Earth is 1/23 000 of an AU across. Enlarged bodies are labelled ×N; the system you fly to returns to true scale.');
+    scale.text('Lighting: sunlight on the worlds fades as 1/r¹·¹ rather than the physical 1/r², and the exposure follows the world in view (as a camera would), so Neptune is not 900× darker than Earth on screen.');
 
     const belt = ui.section('Asteroid belt');
     this.eccSlider = belt.slider({

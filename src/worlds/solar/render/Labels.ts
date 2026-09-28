@@ -135,7 +135,8 @@ export class Labels {
       }
       const lx = left ? c.x - off - e.width : c.x + off;
       const ly = c.y;
-      let ok = this.visible && c.strength > 0.02 && c.x > -40 && c.x < width + 10 && c.y > -10 && c.y < height + 10;
+      // (Kept 10 px inside the top and bottom edges: a label cut in half by the frame edge is just noise.)
+      let ok = this.visible && c.strength > 0.02 && c.x > -40 && c.x < width + 10 && c.y > 10 && c.y < height - 10;
       for (let r = 0; ok && r < this.keepOutCount; r++) {
         const k = this.keepOut[r];
         if (lx < k.x1 && lx + e.width > k.x0 && ly + 8 > k.y0 && ly - 8 < k.y1) ok = false;

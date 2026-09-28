@@ -402,3 +402,84 @@ describe('review: the GPU frequency table', () => {
     }
   });
 });
+
+// ——— Second review: epicycle sense, bar orientation, cost tiers ————————————————————————————————
+import { KIND_BAR, defaultLive } from '../src/worlds/galaxy/model';
+import { galaxyTier } from '../src/worlds/galaxy/GalaxyLayer';
+
+describe('review 2: epicycles and the bar', () => {
+  it('disk epicycles conserve angular momentum to first order (retrograde epicycle, y = −γ·x-phase; B&T eq. 3.94)', () => {
+    // With x = −X cos ψ the tangential offset must be y = +(2Ω/κ) X sin ψ: then R²φ̇ is constant to
+    // O(X²). The opposite sign makes L_z oscillate by ≈ 4 X/R — a sign error invisible in any still image.
+    const p = milkyWay(1);
+    const k = new Kinematics(p, { ...defaultLive(p), arms: 0 });
+    const g = generateParticles(p, 20000);
+    const a: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+    const b: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+    let ratioSum = 0;
+    let n = 0;
+    for (let i = 0; i < g.count && n < 300; i++) {
+      const o = i * STRIDE;
+      if (g.data[o] !== KIND_DISK) continue;
+      const Rg = g.data[o + 1];
+      const X = g.data[o + 3]; // epicycle amplitude / R_g
+      if (Rg < 4000 || Rg > 12000 || X < 0.03 || X > 0.2) continue;
+      const kap = k.lutAt(Rg, 0, 1);
+      const Ls: number[] = [];
+      for (let j = 0; j < 16; j++) {
+        const t = (j / 16) * ((2 * Math.PI) / kap);
+        const dt = 0.01;
+        particleState(k, g.data, i, t - dt, a);
+        particleState(k, g.data, i, t + dt, b);
+        const x = 0.5 * (a.x + b.x), z = 0.5 * (a.z + b.z);
+        Ls.push(z * ((b.x - a.x) / (2 * dt)) - x * ((b.z - a.z) / (2 * dt)));
+      }
+      const mean = Ls.reduce((s, v) => s + v, 0) / Ls.length;
+      const rms = Math.sqrt(Ls.reduce((s, v) => s + (v / mean - 1) ** 2, 0) / Ls.length);
+      ratioSum += rms / X;
+      n++;
+    }
+    expect(n).toBeGreaterThan(50);
+    // Correct sense: rms(ΔL/L) ≈ O(X) · X ≪ X. Wrong sense: ≈ 2.8 X.
+    expect(ratioSum / n).toBeLessThan(0.4);
+  });
+
+  it('bar stars are elongated along the bar major axis at every time (x1 orbits rotate with Ω_b)', () => {
+    const p = milkyWay(1);
+    const k = new Kinematics(p);
+    const g = generateParticles(p, 20000);
+    const s: ParticleState = { x: 0, y: 0, z: 0, lum: 0, temperature: 0 };
+    const m = { x: 0, y: 0, z: 0 };
+    for (const t of [0, 37, 111]) {
+      const ang = p.bar.angle + k.omegaB * t;
+      let along = 0;
+      let across = 0;
+      for (let i = 0; i < g.count; i++) {
+        if (g.data[i * STRIDE] !== KIND_BAR) continue;
+        particleState(k, g.data, i, t, s);
+        k.fromRender(s.x, s.y, s.z, m);
+        const u = m.x * Math.cos(ang) + m.y * Math.sin(ang);
+        const v = -m.x * Math.sin(ang) + m.y * Math.cos(ang);
+        along += u * u;
+        across += v * v;
+      }
+      // Wegg et al. (2015): long bar axis ratio ≈ 0.3–0.5 in the plane.
+      expect(Math.sqrt(across / along)).toBeLessThan(0.7);
+    }
+  });
+});
+
+describe('review 2: quality tiers really scale the ray-march cost', () => {
+  it('low ≤ ~¼ of high per target pixel; ultra is the most expensive', () => {
+    const cost = (d: number) => {
+      const t = galaxyTier(d);
+      return t.volScale ** 2 * t.maxSteps;
+    };
+    expect(cost(0.35) / cost(1)).toBeLessThan(0.27);
+    expect(cost(0.7) / cost(1)).toBeLessThan(0.75);
+    expect(cost(1.6)).toBeGreaterThan(cost(1));
+    // Geometric in-plane steps: coarser on low, never coarser than 7.5 % of the distance.
+    expect(galaxyTier(0.35).stepNear).toBeGreaterThan(galaxyTier(1).stepNear);
+    expect(galaxyTier(0.35).stepNear).toBeLessThanOrEqual(0.075);
+  });
+});

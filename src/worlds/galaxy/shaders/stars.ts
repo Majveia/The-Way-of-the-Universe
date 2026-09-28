@@ -88,7 +88,7 @@ void main() {
   particleState(a0, a1, a2, uTime, P, L, T);
   bool young = a0.x > 2.5 && a0.x < 3.5;
   if (uMode > 0.5) {
-    int id = gl_VertexID;
+    int id = int(a2.w + 0.5); // particle index (gl_VertexID would depend on the draw range and on ANGLE honouring its first offset)
     P = texelFetch(uStatePos, ivec2(id % uStateW, id / uStateW), 0).xyz;
     if (young) {
       // No new clusters are born once the disk is flying apart; the existing ones age out.

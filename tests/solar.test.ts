@@ -604,3 +604,77 @@ describe('readouts', () => {
     expect(formatLightTime(30.07)).toBe('4 h 10 min');
   });
 });
+
+// ————————————————————————————————————————————— review 2: dated events, GPU/CPU frame agreement
+describe('dated events (geometry a physicist can check)', () => {
+  const m = new SolarSystemModel();
+  const sep = (a: THREE.Vector3, b: THREE.Vector3, from: THREE.Vector3) => {
+    const u = a.clone().sub(from).normalize();
+    const v = b.clone().sub(from).normalize();
+    return Math.acos(THREE.MathUtils.clamp(u.dot(v), -1, 1)) / (Math.PI / 180);
+  };
+  it('Great Conjunction 2020 Dec 21 18h UTC: Jupiter–Saturn 0.10° apart from Earth (observed 6.1′)', () => {
+    m.update(utcToTT(calendarToJD(2020, 12, 21.75)));
+    const s = sep(m.get('jupiter')!.position, m.get('saturn')!.position, m.get('earth')!.position);
+    // Standish Table 1 is good to ~1′ (Jupiter) and ~10′ (Saturn).
+    expect(s).toBeGreaterThan(0.02);
+    expect(s).toBeLessThan(0.25);
+  });
+  it('Total solar eclipse 2027 Aug 2 (greatest 10:07 UT): the Moon covers the Sun as seen from Earth', () => {
+    m.update(utcToTT(calendarToJD(2027, 8, 2 + (10 + 7 / 60) / 24)));
+    const e = m.get('earth')!.position;
+    const moon = m.get('moon')!;
+    const s = sep(m.sun.position, moon.position, e);
+    // Geocentric separation at greatest eclipse is ~0.3 × the Moon's radius plus parallax (< 1°).
+    expect(s).toBeLessThan(0.6);
+    // Total: the Moon's apparent radius exceeds the Sun's (perigee Moon, aphelion-ish Earth).
+    const rMoon = moon.radius / moon.position.distanceTo(e);
+    const rSun = m.sun.radius / e.length();
+    expect(rMoon / rSun).toBeGreaterThan(1.0);
+    expect(rMoon / rSun).toBeLessThan(1.1);
+  });
+  it('Family Portrait 1990 Feb 14: Voyager 1 is ~40 AU out, well above the ecliptic', () => {
+    m.update(utcToTT(calendarToJD(1990, 2, 14.2)));
+    const v = m.get('voyager-1')!.position;
+    expect(v.length()).toBeGreaterThan(39.5);
+    expect(v.length()).toBeLessThan(40.8);
+    // Ecliptic latitude ~ +32° (three.js y is ecliptic north).
+    const lat = Math.asin(v.y / v.length()) / (Math.PI / 180);
+    expect(lat).toBeGreaterThan(28);
+    expect(lat).toBeLessThan(36);
+  });
+});
+
+describe('GPU orbit placement mirrors the CPU (frames and axes)', () => {
+  // GLSL orbitPoint() returns three.js axes (x, z, −y) of the astro-frame ellipse point; the CPU
+  // particlePosition() returns astro axes. They must agree through toThree().
+  const orbitPointGLSL = (a: number, e: number, inc: number, node: number, peri: number, E: number) => {
+    const xp = a * (Math.cos(E) - e);
+    const yp = a * Math.sqrt(Math.max(1 - e * e, 0)) * Math.sin(E);
+    const cO = Math.cos(node), sO = Math.sin(node), ci = Math.cos(inc), si = Math.sin(inc), cw = Math.cos(peri), sw = Math.sin(peri);
+    const x = (cO * cw - sO * sw * ci) * xp + (-cO * sw - sO * cw * ci) * yp;
+    const y = (sO * cw + cO * sw * ci) * xp + (-sO * sw + cO * cw * ci) * yp;
+    const z = sw * si * xp + cw * si * yp;
+    return new THREE.Vector3(x, z, -y);
+  };
+  it('belt members land where the CPU ephemeris puts them', () => {
+    const p = sampleTrojans(300);
+    const jd = BELT_EPOCH + 1234.5;
+    const out = { x: 0, y: 0, z: 0 };
+    const cpu = new THREE.Vector3();
+    for (let k = 0; k < p.count; k++) {
+      particlePosition(p, k, jd, out);
+      toThree(out.x, out.y, out.z, cpu);
+      const t = jd - BELT_EPOCH;
+      let M = p.M0[k] + p.n[k] * t;
+      const amp = p.orbitB[k * 4 + 3];
+      if (amp) M += amp * Math.sin(p.libPhase[k] + p.libOmega * t);
+      M = M - 2 * Math.PI * Math.floor((M + Math.PI) / (2 * Math.PI));
+      const e = p.orbitA[k * 4 + 1];
+      let E = M;
+      for (let i = 0; i < 12; i++) E -= (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+      const gpu = orbitPointGLSL(p.orbitA[k * 4], e, p.orbitA[k * 4 + 2], p.orbitA[k * 4 + 3], p.orbitB[k * 4], E);
+      expect(gpu.distanceTo(cpu)).toBeLessThan(1e-9);
+    }
+  });
+});

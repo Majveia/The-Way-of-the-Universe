@@ -73,7 +73,10 @@ void main() {
   float I = uBright * pow(flux / uFluxRef, uGamma) * uFade;
   float radPx = 0.5 * Dau / max(dist, 1e-12) / uPixelAngle;
   vRadiusPx = radPx * uPixelRatio;
-  float size = clamp(2.0 * vRadiusPx + 5.0 * uPixelRatio, 3.0 * uPixelRatio, uMaxSize);
+  // Sprite: the PSF core (σ = 0.62 px) is < 0.6 % of its peak at 2 px, so ±2 px (4 px, was 5)
+  // carries it — 36 % fewer additive fragments for ~100 000 points. Resolved impostors need their
+  // radius × the 1.23 outline wobble plus the anti-aliasing pixel.
+  float size = clamp(2.5 * vRadiusPx + 4.0 * uPixelRatio, 3.0 * uPixelRatio, uMaxSize);
   gl_PointSize = size;
   vSizePx = size;
   vec3 tint = uTaxon[int(aPhys.z + 0.5)];
@@ -138,6 +141,7 @@ export class BeltPoints {
   private mat: THREE.ShaderMaterial;
   private geo: THREE.BufferGeometry;
   private epoch = BELT_EPOCH;
+  private lastJd = NaN;
   private hideInts = new Int32Array(16).fill(-1);
 
   constructor(pop: Population, style: BeltStyle, boundRadius: number, shared: Record<string, THREE.IUniform>) {
@@ -199,7 +203,12 @@ export class BeltPoints {
    * @param sunRel Sun position relative to the camera (AU)
    */
   update(jd: number, sunRel: THREE.Vector3, pixelAngle: number, pixelRatio: number, maxPointSize: number): void {
-    if (Math.abs(jd - this.epoch) > 2000) this.rebase(jd);
+    // Re-base once float32 time would cost precision (> 2000 d). At high warp (a century per second
+    // is ~600 d per frame) the belts are a blur and that precision is moot, so allow ~40 frames of
+    // travel before re-basing: that avoids re-uploading every orbit attribute (4 MB) every frame.
+    const step = Number.isFinite(this.lastJd) ? Math.abs(jd - this.lastJd) : 0;
+    this.lastJd = jd;
+    if (Math.abs(jd - this.epoch) > Math.max(2000, 40 * step)) this.rebase(jd);
     this.object.position.copy(sunRel);
     const u = this.mat.uniforms;
     u.uT.value = jd - this.epoch;
