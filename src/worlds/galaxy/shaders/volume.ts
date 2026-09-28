@@ -31,6 +31,7 @@ uniform vec2 uBounds;      // Rmax, Zmax
 uniform float uMaxSteps;
 uniform float uStepK;
 uniform vec2 uStepRange;   // min, max step (pc)
+uniform float uStepNear;   // step as a fraction of the distance from the camera (in-plane rays)
 uniform float uFrame;
 uniform vec3 uColDisk;
 uniform vec3 uColThick;
@@ -52,6 +53,7 @@ uniform float uScatter;
 uniform sampler3D uNoise;
 uniform float uNoiseTile;
 uniform float uGain;
+uniform float uLocalReach; // local clouds + Local Bubble matter only within this distance (pc) of uBubble.xyz
 uniform float uNearCut;    // emission closer than this (pc) is drawn as individual stars instead
 uniform int uDebug;
 uniform float uEncode;     // > 0 only without float render targets: store y = xE / (1 + xE) in 8 bits
@@ -112,7 +114,7 @@ void main() {
     // camera (∝ distance) and the bulge (∝ r); far above the plane only smooth, faint light remains.
     float ds = uStepK * (abs(h0) + 20.0) / max(absRdz, 0.012);
     float r0 = length(m0);
-    ds = min(ds, min(0.03 * t + 3.0, 0.22 * r0 + 30.0));
+    ds = min(ds, min(uStepNear * t + 3.0, 0.22 * r0 + 30.0));
     ds = clamp(ds, uStepRange.x, max(uStepRange.y, 0.35 * abs(h0)));
     ds = max(ds, (iv.y - t) / max(1.0, uMaxSteps - steps));
     float tm = t + ds * (first ? jitter : 0.5);
@@ -181,8 +183,12 @@ void main() {
     float hdEff = uDustH * (0.65 + 0.9 * n.a);
     float dustV = (mp.b + barDust(m.xy)) * uDustAmount;
     float rho = dustV * exp(-abs(h) / hdEff) / (2.0 * hdEff);
-    rho *= (0.2 + 1.35 * n.r * (0.45 + 1.1 * n2.b)) * bubbleFactor(m);
-    rho += localDustRho(m);
+    rho *= 0.2 + 1.35 * n.r * (0.45 + 1.1 * n2.b);
+    // The Local Bubble and the nearby clouds (8 Gaussians) only exist around the Sun: one distance
+    // test instead of nine evaluations on every step of every ray.
+    if (uLocalReach > 0.0 && dot(m - uBubble.xyz, m - uBubble.xyz) < uLocalReach * uLocalReach) {
+      rho = rho * bubbleFactor(m) + localDustRho(m);
+    }
     if ((uMask & 128) == 0) rho = 0.0;
 
     // Young stars (diffuse, clumped into associations) and HII regions ([OIII] cores where brightest).

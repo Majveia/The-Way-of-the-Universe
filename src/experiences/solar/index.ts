@@ -22,6 +22,8 @@ import { TimeBar, type TimeState } from './TimeBar';
 import { EVENTS, VIEWS, type ViewPreset, type ViewTarget } from './views';
 import { formatAU, formatLightTime, infoCard } from './info';
 
+/** Interface regions the body labels stay clear of. */
+const KEEP_OUT = ['.readouts', '.ui-bottom-right', '.exp-title', '.info-card'];
 const DEFAULT_WARP = WARP_STEPS.findIndex((w) => w.label === '1 day / s');
 
 class SolarExperience implements Experience {
@@ -416,6 +418,11 @@ class SolarExperience implements Experience {
     this.layer.setCamera(this.cam.position, this.cam.quaternion, this.cam.fov);
     this.layer.update(jdTT, f.time, dt);
     this.updateExposure(dt);
+    this.keepOutTimer -= dt;
+    if (this.keepOutTimer <= 0) {
+      this.keepOutTimer = 0.25;
+      this.updateKeepOut();
+    }
     this.layer.updateLabels(dt);
     this.updateResonanceLabels();
     this.time.show(this.jdUTC, this.live);
@@ -433,6 +440,28 @@ class SolarExperience implements Experience {
     }
     if (this.ready && this.frames > 2) this.ctx.signalReady();
   }
+
+  /** Keep body labels off the interface: readouts, time bar, title and info card (CSS px). */
+  private updateKeepOut(): void {
+    const labels = this.layer.labels;
+    if (!labels) return;
+    const o = this.ctx.ui.overlay.getBoundingClientRect();
+    let n = 0;
+    for (const sel of KEEP_OUT) {
+      const el = document.querySelector(sel);
+      if (!el || (el as HTMLElement).hidden) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      const k = labels.keepOut[n] ?? (labels.keepOut[n] = { x0: 0, y0: 0, x1: 0, y1: 0 });
+      k.x0 = r.left - o.left - 6;
+      k.y0 = r.top - o.top - 14;
+      k.x1 = r.right - o.left + 6;
+      k.y1 = r.bottom - o.top + 4;
+      n++;
+    }
+    labels.keepOutCount = n;
+  }
+  private keepOutTimer = 0;
 
   /** Camera-like auto exposure: expose for the subject, so the dim outer worlds stay readable. */
   private updateExposure(dt: number): void {

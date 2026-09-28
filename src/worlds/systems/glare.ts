@@ -56,12 +56,14 @@ export class StarGlare {
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = 10;
   }
-  /** Face the camera and span `fraction` of the vertical field of view. */
-  orient(camera: THREE.PerspectiveCamera, fraction: number): void {
+  /** Face the camera and span `fraction` of the vertical field of view; returns the quad's side (world units). */
+  orient(camera: THREE.PerspectiveCamera, fraction: number): number {
     const d = tmp.copy(this.mesh.position).sub(camera.position).length();
     const theta = fraction * THREE.MathUtils.degToRad(camera.fov);
+    const side = 2 * d * Math.tan(theta / 2);
     this.mesh.quaternion.copy(camera.quaternion);
-    this.mesh.scale.setScalar(2 * d * Math.tan(theta / 2));
+    this.mesh.scale.setScalar(side);
+    return side;
   }
   dispose(): void {
     this.mesh.removeFromParent();

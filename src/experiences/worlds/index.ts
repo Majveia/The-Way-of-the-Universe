@@ -143,7 +143,10 @@ class PossibleWorlds implements Experience {
     this.layer?.dispose();
     this.sys = generateSystem(seed);
     this.layer = new SystemLayer(this.sys, { detail: this.detail, gamma: this.toggles.trueScale ? 1 : 0.5 });
-    this.layer.prepare(this.ctx.renderer);
+    // First load: bake everything before the first frame. Portal jumps bake one planet per frame
+    // (update → prepareStep) behind the vortex, instead of one multi-hundred-ms hitch.
+    if (initial) this.layer.prepare(this.ctx.renderer);
+    this.innerPeriodDays = Math.min(365, ...this.sys.planets.map((p) => p.periodDays));
     this.layer.setOrbitsVisible(this.toggles.orbits);
     this.layer.setZonesVisible(this.toggles.zones);
     this.gammaGoal = this.layer.compression;
@@ -193,8 +196,9 @@ class PossibleWorlds implements Experience {
   }
 
   /** Natural clock: the innermost planet completes an orbit in ~25 s. */
+  private innerPeriodDays = 365;
   private innerPeriod(): number {
-    return Math.min(...this.sys.planets.map((p) => p.periodDays), 365);
+    return this.innerPeriodDays;
   }
   private get daysPerSecond(): number {
     if (this.mode === 'system') return (this.innerPeriod() / 25) * this.rate;
@@ -461,6 +465,7 @@ class PossibleWorlds implements Experience {
       if (this.mode === 'system' && this.focus.to < 0) this.rig.goal.logDistance = Math.log(this.layer.extent * this.frameFactor);
     }
     this.layer.setTime(this.timeDays);
+    this.layer.prepareStep(this.ctx.renderer, 1);
     this.rig.update(dt);
     this.focus.t = Math.min(this.focus.t + dt, this.focus.dur);
     // Exposure eases toward the goal (the close-up of a bright ice world vs a dark hot Jupiter).
@@ -497,7 +502,11 @@ class PossibleWorlds implements Experience {
       const card = document.querySelector('.info-card') as HTMLElement | null;
       this.cardOpen = !!card && !card.hidden && !document.querySelector('.ui.is-hidden');
     }
-    this.updateReadouts();
+    // Readouts at ~12 Hz: the digits are unreadable faster, and it keeps string churn off the frame.
+    if (--this.readoutCheck <= 0) {
+      this.readoutCheck = 5;
+      this.updateReadouts();
+    }
     this.labels.update(this.layer, this.camera, this.cssW, this.cssH, this.mode === 'system' && !this.jump);
   }
 
@@ -564,6 +573,11 @@ class PossibleWorlds implements Experience {
 
   render(target: THREE.WebGLRenderTarget): void {
     const r = this.ctx.renderer;
+    // Every renderer.render() into the multisampled HDR target ends with an MSAA resolve blit;
+    // this world draws several passes (sky, depth slices, portal). Nothing samples the resolved
+    // depth, so resolve colour only (≈ ⅓ less traffic per pass); restored below.
+    const resolveDepth = target.resolveDepthBuffer;
+    target.resolveDepthBuffer = false;
     this.camera.aspect = target.width / Math.max(1, target.height);
     this.camera.fov = this.mode === 'orbit' ? 60 : 42;
     r.setRenderTarget(target);
@@ -590,12 +604,20 @@ class PossibleWorlds implements Experience {
     else this.closeup?.render(r, this.camera);
     this.portal.render(r, target, this.shaderTime, 1.4);
     this.camera.clearViewOffset();
+    target.resolveDepthBuffer = resolveDepth;
+  }
+
+  /** Debug: cost accounting for the current view (render passes into the HDR target). */
+  stats(): { mode: Mode; passes: number; slices: number; planetsReady: boolean } {
+    const slices = this.mode === 'system' ? 1 : this.closeup?.slicesDrawn ?? 0;
+    return { mode: this.mode, passes: 1 + slices + (this.portal.active ? 1 : 0), slices, planetsReady: this.layer.prepared };
   }
 
   private frameShift = 0;
   private savedQuat = new THREE.Quaternion();
   private savedPos = new THREE.Vector3();
   private cardCheck = 0;
+  private readoutCheck = 0;
   private cardOpen = false;
 
   // ——— Input ———
@@ -684,7 +706,7 @@ class PossibleWorlds implements Experience {
       0,
     );
     v.toggle({ label: 'Orbits', value: true, onChange: (x) => { this.toggles.orbits = x; this.layer.setOrbitsVisible(x); } });
-    v.toggle({ label: 'Habitable zone · snow line', value: true, onChange: (x) => { this.toggles.zones = x; this.layer.setZonesVisible(x); } });
+    v.toggle({ label: 'Habitable zone · snow line', value: true, onChange: (x) => { this.toggles.zones = x; this.layer.setZonesVisible(x); this.labels.setZonesVisible(x); } });
     v.toggle({ label: 'Labels', value: true, onChange: (x) => { this.toggles.labels = x; this.labels.setVisible(x && this.mode === 'system'); } });
     this.trueScaleCtl = v.toggle({ label: 'True distances', value: false, onChange: (x) => this.setTrueScale(x, false) });
     v.slider({ label: 'Time rate', min: 0.02, max: 50, log: true, value: 1, unit: '×', onChange: (x) => (this.rate = x) });

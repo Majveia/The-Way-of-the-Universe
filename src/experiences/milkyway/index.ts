@@ -141,9 +141,10 @@ class MilkyWay implements Experience {
     if (Number.isFinite(lum) && lum > 0) {
       // Looking at a galaxy: adapt to the bright parts it is made of.
       const outside = base * THREE.MathUtils.clamp(Math.pow(1.08 / lum, 0.7), 0.25, 1.1);
-      // Surrounded by sky (inside the disk): keep the typical background dark (scene ≈ 0.05) so the
-      // band glows and the stars stand out, as in an unprocessed dark-site photograph.
-      const inside = Number.isFinite(sky) && sky > 0 ? THREE.MathUtils.clamp(0.05 / sky, 0.1 * base, 1.5 * base) : outside;
+      // Surrounded by sky (inside the disk): keep the typical background dark (scene ≈ 0.03, ≈ 12 %
+      // grey after the tone curve) so the band glows and the stars stand out, as in an unprocessed
+      // dark-site photograph; brighter than that the whole OLED frame turns into a grey-brown haze.
+      const inside = Number.isFinite(sky) && sky > 0 ? THREE.MathUtils.clamp(0.03 / sky, 0.1 * base, 1.5 * base) : outside;
       target = THREE.MathUtils.lerp(outside, inside, THREE.MathUtils.smoothstep(lit, 0.85, 0.99));
     }
     const tau = this.shotMode ? 0.12 : 1.1;
@@ -634,7 +635,9 @@ class MilkyWay implements Experience {
     // Arm names (Milky Way), riding with the pattern.
     const k = this.layer.kin;
     const list = params.spiral.armList;
-    const labelsOn = this.showLabels && dm && !!list && w > 720 && camPos.length() > 9000 && camPos.length() < 120000;
+    // Arm names lie in the plane: seen nearly edge-on they collapse onto one line, so hide them.
+    const elev = Math.abs(camPos.y) / Math.max(camPos.length(), 1);
+    const labelsOn = this.showLabels && dm && !!list && w > 720 && elev > 0.2 && camPos.length() > 9000 && camPos.length() < 120000;
     if (labelsOn && Math.abs(this.layer.time - this.labelsPlacedAt) > 40) this.placeArmLabels();
     for (const a of this.armLabels) {
       if (!labelsOn || !list) {

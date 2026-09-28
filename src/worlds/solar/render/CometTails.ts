@@ -347,6 +347,9 @@ interface Slot {
   comaMat: THREE.ShaderMaterial;
   ages: Float64Array;
   maxAge: number;
+  /** Body and TT date the Finson–Probstein grid was last propagated for. */
+  gridBody: SolarBody | null;
+  gridJd: number;
 }
 
 export interface CometFrame {
@@ -398,6 +401,7 @@ export class CometTails {
   private nComa: number;
   private mats: THREE.ShaderMaterial[] = [];
   private activeSlots = 0;
+  private regrid: SolarBody | null = null;
 
   constructor(detail: number, shared: Record<string, THREE.IUniform>) {
     const nDust = Math.round(26000 * detail);
@@ -504,6 +508,8 @@ export class CometTails {
         comaMat,
         ages: tailAges(AGES, 30, AGE_POW),
         maxAge: 30,
+        gridBody: null,
+        gridJd: 0,
       });
     }
   }
@@ -524,6 +530,9 @@ export class CometTails {
     return this.activeSlots > 0;
   }
 
+  /** Does any on-screen splat need the reduced-resolution pass this frame? */
+  lowUsed = false;
+
   /** Choose which comets get tails this frame and update them. */
   update(cands: CometCandidate[], n: number, f: CometFrame): void {
     const list = this.cands;
@@ -542,11 +551,27 @@ export class CometTails {
     list.sort((a, b) => b.score - a.score);
     const chosen = list.length > MAX_ACTIVE ? MAX_ACTIVE : list.length;
     this.activeSlots = chosen;
+    this.lowUsed = false;
     // Keep assignments stable: comets already in a slot stay there.
     for (const s of this.slots) {
       let keep = false;
       for (let i = 0; i < chosen; i++) if (list[i].c.body === s.body) keep = true;
       if (!keep) s.body = null;
+    }
+    // CPU cost: a grid is ~700 universal-variable propagations (~1 ms). Tail shapes change over
+    // hours, and offsets are relative to the (exact, per-frame) nucleus, so re-propagate at most one
+    // grid per frame — the stalest, once it is > 0.005 d (7 min) old; a newly assigned comet always.
+    this.regrid = null;
+    let stalest = 0.005;
+    for (let i = 0; i < chosen; i++) {
+      const b = list[i].c.body;
+      let slot: Slot | null = null;
+      for (const s of this.slots) if (s.body === b) slot = s;
+      const age = !slot || slot.gridBody !== b ? Infinity : Math.abs(f.jd - slot.gridJd);
+      if (age > stalest) {
+        stalest = age;
+        this.regrid = b;
+      }
     }
     for (let i = 0; i < chosen; i++) {
       const c = list[i].c;
@@ -590,6 +615,8 @@ export class CometTails {
       if (Math.abs(vx) / vz - half > f.tanX || Math.abs(vy) / vz - half > f.tanY) return 0;
     }
     const size = (6 * sigmaW) / (Math.max(d, 1e-12) * f.pixelAngle);
+    // (× 1.3: the per-splat size jitter) — does any splat reach the reduced-resolution pass?
+    if (size * 1.3 > TAIL_SPLIT_PX) this.lowUsed = true;
     return splatCost(size, f.maxPointSize, this.lowRes ? TAIL_LOW_RES : 1, TAIL_SPLIT_PX);
   }
 
@@ -611,8 +638,18 @@ export class CometTails {
       s.maxAge = maxAge;
       s.ages = tailAges(AGES, maxAge, AGE_POW);
     }
-    computeTailGrid(el, f.jd, s.ages, this.betas, this.ionAges, s.grid);
-    // Upload the dust grid (astro → three axes) with the release distance in w.
+    const g = s.grid;
+    if (this.regrid === b || s.gridBody !== b) {
+      s.gridBody = b;
+      s.gridJd = f.jd;
+      computeTailGrid(el, f.jd, s.ages, this.betas, this.ionAges, g);
+      this.uploadGrid(s);
+    }
+    this.finishSlot(s, c, f, budget, A, maxAge);
+  }
+
+  /** Upload the dust grid (astro → three axes, release distance in w) and the ion release points. */
+  private uploadGrid(s: Slot): void {
     const g = s.grid;
     const td = s.texData;
     for (let i = 0; i < AGES; i++) {
@@ -628,6 +665,15 @@ export class CometTails {
     s.tex.needsUpdate = true;
     const ionU = s.ionMat.uniforms.uIon.value as THREE.Vector4[];
     for (let i = 0; i < ION_N; i++) ionU[i].set(g.ion[i * 3], g.ion[i * 3 + 2], -g.ion[i * 3 + 1], g.ionReleaseR[i]);
+  }
+
+  private finishSlot(s: Slot, c: CometCandidate, f: CometFrame, budget: number, A: number, maxAge: number): void {
+    const b = c.body;
+    const cp = b.def.comet!;
+    const el = b.conic!;
+    const r = b.sunDistance;
+    const g = s.grid;
+    const td = s.texData;
     // Tail axis & its perpendiculars (three axes).
     conicState(el, f.jd, _r, _v);
     ionTailAxis(_r, _v, _s);
@@ -732,10 +778,10 @@ export class CometTails {
     const wi = s.ion.visible ? 0.25 : 0;
     const wc = 0.2;
     const wsum = wd + wi + wc;
-    // Floors: the plasma tail's few narrow rays need more of their splats than the broad dust fan.
+    // Floors: the plasma tail's few narrow rays and the compact coma need more of their splats than the broad dust fan.
     this.setCount(s.dustMat, splatDrawCount(this.nDust, cDust, (budget * wd) / wsum, 0.15));
     this.setCount(s.ionMat, splatDrawCount(this.nIon, cIon, (budget * wi) / wsum, 0.35));
-    this.setCount(s.comaMat, splatDrawCount(this.nComa, cComa, (budget * wc) / wsum, 0.25));
+    this.setCount(s.comaMat, splatDrawCount(this.nComa, cComa, (budget * wc) / wsum, 0.6));
   }
 
   dispose(): void {

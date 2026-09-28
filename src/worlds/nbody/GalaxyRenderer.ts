@@ -33,7 +33,7 @@ import { ADD_ONE_ONE } from './NBodySystem';
  * et al. 1989).
  */
 
-const PARTICLE_GLSL = /* glsl */ `
+const PARTICLE_CORE_GLSL = /* glsl */ `
 uniform sampler2D tPos;
 uniform sampler2D tVel;
 uniform sampler2D tAttr;
@@ -43,9 +43,9 @@ uniform float uExtrap;
 uniform float uProj;
 vec4 P_pos;
 vec4 P_attr;
-vec3 particleWorld() {
-  int id = gl_VertexID;
-  ivec2 t = ivec2(id % uWidth, id / uWidth);
+ivec2 P_tex;
+vec3 particleAt(ivec2 t) {
+  P_tex = t;
   P_pos = texelFetch(tPos, t, 0);
   P_attr = texelFetch(tAttr, t, 0);
   vec3 v = texelFetch(tVel, t, 0).xyz;
@@ -57,11 +57,16 @@ float massToLight(float ageMyr) {
 float popTemp(float ageMyr) {
   return clamp(4500.0 * pow(clamp(ageMyr, 3.0, 13000.0) / 10000.0, -0.18), 3500.0, 30000.0);
 }
-void offscreen() { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; }
 // White balance: the integrated light of an average spiral (≈ 5300 K) maps to neutral white, the
 // reference astronomers use for photometric colour calibration of galaxy images.
 uniform vec3 uWhite;
 vec3 wb(vec3 c) { return c * uWhite; }
+`;
+/** Vertex-shader particle access: one point per tracer, gl_VertexID → texel. */
+const PARTICLE_GLSL = /* glsl */ `
+${PARTICLE_CORE_GLSL}
+vec3 particleWorld() { return particleAt(ivec2(gl_VertexID % uWidth, gl_VertexID / uWidth)); }
+void offscreen() { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; }
 `;
 
 const DUST_READ_GLSL = /* glsl */ `
@@ -124,17 +129,13 @@ void main() { o0 = vF0; o1 = vF1; }`;
 /** Shared stellar photometry for the diffuse deposit and the resolved points. */
 const STAR_LIGHT_GLSL = /* glsl */ `
 ${BLACKBODY_GLSL}
-${PARTICLE_GLSL}
+${PARTICLE_CORE_GLSL}
 ${DUST_READ_GLSL}
 uniform float uExposure;
 uniform float uBulgeTemp;
-uniform float uYoungBoost;
-// Dust-attenuated luminosity × colour (10¹⁰ L☉), and clip-space position.
-vec3 starLight(out vec4 clip, out float d) {
-  vec3 x = particleWorld();
-  vec4 mv = modelViewMatrix * vec4(x, 1.0);
-  clip = projectionMatrix * mv;
-  d = max(-mv.z, 1e-3);
+// Dust-attenuated luminosity × colour (10¹⁰ L☉) of the particle last fetched by particleAt(),
+// seen at view-space position mv / clip-space position clip.
+vec3 starLight(vec4 clip, float d) {
   int kind = int(P_attr.x + 0.5);
   float age = P_attr.z + uTime;
   float L = P_attr.w / massToLight(age);
@@ -159,19 +160,20 @@ out vec4 outColor;
 void main() { outColor = vec4(1.0); }`;
 
 /**
- * Diffuse light, scattered into one of LEVELS resolution levels (texel = 2^k light pixels): the
- * particle's continuous level l* is where its neighbourhood holds uNgb particles; its light is
- * split linearly between the two nearest levels, so smoothing lengths vary continuously.
+ * Per-particle light prepass (one fragment per tracer texel, fragment shaders fetch far more
+ * efficiently than vertex shaders): dust-attenuated luminosity × colour and the continuous
+ * smoothing level l*, where the particle's neighbourhood in the count pyramid holds uNgb
+ * particles. Computed once per frame and reused by the LEVELS deposit passes and the resolved
+ * points, which then only fetch 3 texels per vertex.
  */
-const DEPOSIT_VERT = /* glsl */ `
+const LIGHT_FRAG = /* glsl */ `
 ${STAR_LIGHT_GLSL}
 uniform sampler2D tCount;
-uniform float uProjL;
-uniform float uDiffuse;
 uniform float uNgb;
-uniform float uLevel;
 uniform float uMaxLevel;
-out vec4 vC;
+uniform mat4 uView;
+uniform mat4 uProjM;
+out vec4 outColor;
 float chooseLevel(vec2 uv) {
   float nPrev = textureLod(tCount, uv, 0.0).r;
   if (nPrev >= uNgb) return 0.0;
@@ -188,16 +190,48 @@ float chooseLevel(vec2 uv) {
   return uMaxLevel;
 }
 void main() {
-  vec4 clip; float d;
-  vec3 c = starLight(clip, d);
+  vec3 x = particleAt(ivec2(gl_FragCoord.xy));
+  vec4 mv = uView * vec4(x, 1.0);
+  vec4 clip = uProjM * mv;
+  if (clip.w <= 0.0) { outColor = vec4(0.0, 0.0, 0.0, -100.0); return; }
+  vec3 c = starLight(clip, max(-mv.z, 1e-3));
+  outColor = vec4(c, chooseLevel(clip.xy / clip.w * 0.5 + 0.5));
+}`;
+
+/** Light of the particle fetched by particleWorld(), from the prepass (rgb = light, a = level). */
+const LIGHT_READ_GLSL = /* glsl */ `
+${PARTICLE_GLSL}
+uniform sampler2D tLight;
+vec4 particleLight() { return texelFetch(tLight, P_tex, 0); }
+`;
+
+/**
+ * Diffuse light, scattered into one of LEVELS resolution levels (texel = 2^k light pixels): the
+ * particle's continuous level l* (from the prepass) is where its neighbourhood holds uNgb
+ * particles; its light is split linearly between the two nearest levels, so smoothing lengths
+ * vary continuously.
+ */
+const DEPOSIT_VERT = /* glsl */ `
+${LIGHT_READ_GLSL}
+uniform float uExposure;
+uniform float uProjL;
+uniform float uDiffuse;
+uniform float uLevel;
+out vec4 vC;
+void main() {
+  vec3 x = particleWorld();
+  vec4 mv = modelViewMatrix * vec4(x, 1.0);
+  vec4 clip = projectionMatrix * mv;
   if (clip.w <= 0.0) { offscreen(); return; }
-  float w = 1.0 - abs(chooseLevel(clip.xy / clip.w * 0.5 + 0.5) - uLevel);
+  vec4 lt = particleLight();
+  float w = 1.0 - abs(lt.w - uLevel);
   if (w <= 0.0) { offscreen(); return; }
   gl_Position = clip;
   gl_PointSize = 1.0;
+  float d = max(-mv.z, 1e-3);
   // Surface brightness of one level texel: L / (texel area in kpc²).
   float pl = uProjL * exp2(-uLevel);
-  vC = vec4(c * (w * uDiffuse * uExposure * pl * pl / (d * d)), 1.0);
+  vC = vec4(lt.rgb * (w * uDiffuse * uExposure * pl * pl / (d * d)), 1.0);
 }`;
 
 /** Separable Gaussian, σ = 1 texel (7 taps). */
@@ -236,16 +270,20 @@ out vec4 outColor;
 void main() { outColor = vC; }`;
 
 const POINT_VERT = /* glsl */ `
-${STAR_LIGHT_GLSL}
+${LIGHT_READ_GLSL}
+uniform float uExposure;
 uniform float uPoint;
 uniform float uSigma;
 uniform vec2 uRes;
 out vec3 vC;
 out vec2 vCenter;
 void main() {
-  vec4 clip; float d;
-  vec3 c = starLight(clip, d);
+  vec3 x = particleWorld();
+  vec4 mv = modelViewMatrix * vec4(x, 1.0);
+  vec4 clip = projectionMatrix * mv;
   if (clip.w <= 0.0) { offscreen(); return; }
+  float d = max(-mv.z, 1e-3);
+  vec3 c = particleLight().rgb;
   gl_Position = clip;
   gl_PointSize = ceil(6.0 * uSigma) + 1.0;
   vCenter = (clip.xy / clip.w * 0.5 + 0.5) * uRes;
@@ -258,7 +296,10 @@ in vec2 vCenter;
 out vec4 outColor;
 void main() {
   vec2 q = gl_FragCoord.xy - vCenter;
-  outColor = vec4(vC * exp(-dot(q, q) / (2.0 * uSigma * uSigma)), 1.0);
+  float r2 = dot(q, q) / (uSigma * uSigma);
+  // Gaussian support to 3σ (98.9 % of the light): the sprite's corners cost blending but carry nothing.
+  if (r2 > 9.0) discard;
+  outColor = vec4(vC * exp(-0.5 * r2), 1.0);
 }`;
 
 /**
@@ -333,8 +374,10 @@ void main() {
   // expands (≈ 10 km/s) and fades.
   float Lh = 0.5 * m / massToLight(3.0) * exp(-tb / 5.0) * smoothstep(0.0, 1.0, tb + 0.5);
   float rCore = max(uMinR, 0.03 * uProj / d);
-  // The HII region only exists while O stars live (≲ 40 Myr); after that draw the bare cluster.
-  if (tb > 40.0) Lh = 0.0;
+  // Hα needs O stars: by ~25 Myr the ionising output of a burst has fallen by > 10² (e^-5 here;
+  // Leitherer et al. 1999, Starburst99), so draw the bare cluster from then on. This also keeps
+  // the large, nearly black HII sprites from costing fill rate when the camera is close.
+  if (tb > 25.0) Lh = 0.0;
   float rGlow = Lh > 0.0 ? min(max(uMinR * 2.0, (0.22 + 0.012 * tb) * uProj / d), 96.0) : rCore;
   float r = max(rGlow, rCore);
   gl_PointSize = 2.0 * r;
@@ -378,6 +421,12 @@ void main() {
   float d = max(-mv.z, 1e-3);
   vC = vec4(vec3(p.w * uProjL * uProjL / (d * d)), 1.0);
 }`;
+
+/**
+ * V-band dust opacity per unit gas column, τ_V / Σ_gas in (10¹⁰ M☉ kpc⁻²)⁻¹: N_H = X Σ / m_H with
+ * X = 0.74, A_V / N_H = 1 / 1.9×10²¹ mag cm² (Bohlin et al. 1978, R_V = 3.1), τ = A / 1.086.
+ */
+export const DUST_KAPPA_V = 470;
 
 /** Per-channel gains that map a blackbody of temperature T to luminance-preserving white. */
 export function whiteBalance(T: number): THREE.Vector3 {
@@ -448,6 +497,17 @@ export class GalaxyRenderer {
   private countMat!: THREE.ShaderMaterial;
   private blurMat!: THREE.ShaderMaterial;
   private sumMat!: THREE.ShaderMaterial;
+  /** Per-particle light prepass (rgb = dust-attenuated light, a = smoothing level); float32. */
+  private lightRT = new THREE.WebGLRenderTarget(TRACER_WIDTH, 1, {
+    type: THREE.FloatType,
+    format: THREE.RGBAFormat,
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
+    depthBuffer: false,
+    stencilBuffer: false,
+    generateMipmaps: false,
+  });
+  private lightMat: THREE.ShaderMaterial;
   private dustRT = pyramidTarget(2);
   private dmRT = pyramidTarget(1);
   private dustScene = new THREE.Scene();
@@ -493,6 +553,7 @@ export class GalaxyRenderer {
       uBulgeTemp: { value: 4200 },
       uMinR: { value: 1 },
       uWhite: { value: whiteBalance(5300) },
+      tLight: { value: this.lightRT.texture },
     };
     this.shared = shared;
     const mk = (vert: string, frag: string, extra: Record<string, THREE.IUniform>) => {
@@ -509,15 +570,9 @@ export class GalaxyRenderer {
       this.mats.push(m);
       return m;
     };
-    this.dustMat = mk(DUST_VERT, DUST_FRAG, { uKappa: { value: 470 } });
+    this.dustMat = mk(DUST_VERT, DUST_FRAG, { uKappa: { value: DUST_KAPPA_V } });
     this.countMat = mk(COUNT_VERT, COUNT_FRAG, {});
-    this.depositMat = mk(DEPOSIT_VERT, DEPOSIT_FRAG, {
-      tCount: { value: this.countRT.texture },
-      uDiffuse: { value: 0.7 },
-      uNgb: { value: 4 },
-      uLevel: { value: 0 },
-      uMaxLevel: { value: LEVELS - 1 },
-    });
+    this.depositMat = mk(DEPOSIT_VERT, DEPOSIT_FRAG, { uDiffuse: { value: 0.7 }, uLevel: { value: 0 } });
     const level = () =>
       new THREE.WebGLRenderTarget(1, 1, {
         type: THREE.HalfFloatType,
@@ -546,6 +601,18 @@ export class GalaxyRenderer {
       this.mats.push(m);
       return m;
     };
+    this.lightMat = fs(
+      `${COMMON_GLSL}\n${LIGHT_FRAG}`,
+      {
+        ...shared,
+        tCount: { value: this.countRT.texture },
+        uNgb: { value: 4 },
+        uMaxLevel: { value: LEVELS - 1 },
+        uView: { value: new THREE.Matrix4() },
+        uProjM: { value: new THREE.Matrix4() },
+      },
+      false,
+    );
     this.blurMat = fs(BLUR_FRAG, { tSrc: { value: null }, uStep: { value: new THREE.Vector2() } }, false);
     const sumU: Record<string, THREE.IUniform> = { uTexel: { value: this.levelRT.map(() => new THREE.Vector2(1, 1)) } };
     this.levelRT.forEach((rt, k) => (sumU[`tL${k}`] = { value: rt.texture }));
@@ -592,6 +659,7 @@ export class GalaxyRenderer {
       p.frustumCulled = false;
       scene.add(p);
     };
+    this.lightRT.setSize(TRACER_WIDTH, data.tracers.n / TRACER_WIDTH);
     const R = data.tracers.ranges;
     const stars = [...R.bulge, ...R.disk];
     for (const r of R.gas) pts(r, this.dustMat, this.dustScene);
@@ -640,12 +708,12 @@ export class GalaxyRenderer {
     u.uMinR.value = Math.max(1, 0.9 * p.pixelRatio);
     u.uExposure.value = this.exposure;
     u.uDustOn.value = this.dust > 0 ? 1 : 0;
-    this.dustMat.uniforms.uKappa.value = 470 * this.dust;
+    this.dustMat.uniforms.uKappa.value = DUST_KAPPA_V * this.dust;
     this.depositMat.uniforms.uDiffuse.value = 1 - this.pointFraction;
     this.pointMat.uniforms.uPoint.value = this.pointFraction;
     this.pointMat.uniforms.uSigma.value = 0.6 * Math.max(1, p.pixelRatio);
     (this.pointMat.uniforms.uRes.value as THREE.Vector2).set(target.width, target.height);
-    this.depositMat.uniforms.uNgb.value = this.ngb;
+    this.lightMat.uniforms.uNgb.value = this.ngb;
     const near = Math.max(0.5, p.depthNear), far = Math.max(near + 1, p.depthFar);
     u.uDepth0.value = near;
     u.uDepthStep.value = (far - near) / 7;
@@ -661,6 +729,11 @@ export class GalaxyRenderer {
     renderer.setRenderTarget(this.countRT);
     renderer.clear(true, false, false);
     renderer.render(this.countScene, camera); // count pyramid (mipmaps regenerate after the draw)
+    camera.updateMatrixWorld();
+    (this.lightMat.uniforms.uView.value as THREE.Matrix4).copy(camera.matrixWorldInverse);
+    (this.lightMat.uniforms.uProjM.value as THREE.Matrix4).copy(camera.projectionMatrix);
+    this.quad.material = this.lightMat;
+    this.quad.render(renderer, this.lightRT);
     for (let k = 0; k < LEVELS; k++) {
       this.depositMat.uniforms.uLevel.value = k;
       renderer.setRenderTarget(this.levelRT[k]);
@@ -699,6 +772,7 @@ export class GalaxyRenderer {
     for (const g of this.geoms) g.dispose();
     for (const m of this.mats) m.dispose();
     this.countRT.dispose();
+    this.lightRT.dispose();
     for (const rt of [...this.levelRT, ...this.blurRT]) rt.dispose();
     this.dustRT.dispose();
     this.dmRT.dispose();

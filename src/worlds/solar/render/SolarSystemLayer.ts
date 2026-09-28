@@ -34,6 +34,7 @@ import { TailComposite } from './TailComposite';
 import { sampleHildas, sampleKuiper, sampleMainBelt, sampleNEAs, sampleOort, sampleTrojans } from '../belts';
 
 export type ScaleMode = 'true' | 'enlarged';
+const BELT_KEYS = ['main', 'hildas', 'trojans', 'neas', 'kuiper', 'oort'] as const;
 
 export interface SolarLayerSettings {
   orbits: boolean;
@@ -561,13 +562,15 @@ export class SolarSystemLayer {
     const s = this.settings;
     const camR = cam.length();
     const bm = this.belts;
-    for (const k of ['main', 'hildas', 'trojans', 'neas', 'kuiper', 'oort'] as const) {
+    for (const k of BELT_KEYS) {
       const belt = bm[k];
       let fade: number;
       if (k === 'oort') fade = s.oort ? THREE.MathUtils.smoothstep(camR, 400, 3000) : 0;
       // From inside ~15 AU the Kuiper belt surrounds us and is far too faint to see: fade it in from afar.
       else if (k === 'kuiper') fade = s.kuiper ? THREE.MathUtils.smoothstep(camR, 12, 30) : 0;
-      else fade = s.asteroids ? 1 - THREE.MathUtils.smoothstep(camR, 400, 3000) : 0;
+      // The inner populations (2–5 AU) shrink to a few arc-minutes from the Kuiper belt outward, where
+      // 100 000 additive points would pile up into a bright smudge around the Sun: fade them out.
+      else fade = s.asteroids ? 1 - THREE.MathUtils.smoothstep(camR, 60, 130) : 0;
       belt.fade = fade / expo;
       if (fade > 0) {
         belt.update(jd, this.sunRel, pa, this.pixelRatio, this.maxPointSize);
@@ -751,7 +754,7 @@ export class SolarSystemLayer {
     this.orbits.near = this.overlayNear * 1.001;
     r.render(this.overlayScene, cam);
     if (this.tails.active) {
-      const low = this.tailLow;
+      const low = this.tails.lowUsed ? this.tailLow : null;
       this.tails.setPass(low ? 1 : 0);
       r.render(this.tailScene, cam);
       if (low) {

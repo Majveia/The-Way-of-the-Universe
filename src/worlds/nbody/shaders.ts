@@ -104,78 +104,126 @@ void main() {
 }`;
 
 /**
- * Centre tracking + filter (one fragment per galaxy). Predict with the previous bulk acceleration,
- * measure the Gaussian-windowed centroid / bulk velocity / bulk acceleration of the galaxy's own
- * skeleton, then correct gently (see CENTER_TAU in cpu.ts).
- * Outputs: 0 centre, 1 velocity, 2 bulk acceleration, 3 previous centre.
+ * Centre tracking + filter, as a parallel reduction. Predict each galaxy's centre with the
+ * previous bulk acceleration, then measure the Gaussian-windowed centroid of the galaxy's own
+ * skeleton in two shrinking passes (window 2w, then w), then its bulk velocity / acceleration
+ * in the final window, and correct gently (see CENTER_TAU in cpu.ts).
+ *
+ * Every stage is split into a per-row pass (one fragment per 64-particle skeleton row; rows never
+ * straddle galaxies) and a per-galaxy pass that sums the rows: the serial depth is ~64 fetches
+ * instead of the whole galaxy (several thousand dependent fetches in one GPU thread).
+ *
+ * Tracking state (1×2, one texel per galaxy): 0 centre, 1 velocity, 2 bulk acceleration,
+ * 3 previous centre.
  */
-export const TRACK_FRAG = /* glsl */ `
-uniform sampler2D tPos;
-uniform sampler2D tVel;
-uniform sampler2D tAcc;
+const TRACK_COMMON = /* glsl */ `
 uniform sampler2D tM0;
 uniform sampler2D tM1;
 uniform sampler2D tM2;
-uniform ivec2 uRows[6];
-uniform float uWin[2];
 uniform vec3 uInitCenter[2];
 uniform float uDt;
-uniform vec3 uTau;
 uniform int uInit;
+// Predicted (ballistic) centre and velocity of galaxy g at the end of this step.
+void predict(int g, out vec3 c, out vec3 u) {
+  if (uInit == 1) {
+    c = g == 0 ? uInitCenter[0] : uInitCenter[1];
+    u = vec3(0.0);
+    return;
+  }
+  c = texelFetch(tM0, ivec2(0, g), 0).xyz;
+  u = texelFetch(tM1, ivec2(0, g), 0).xyz + 0.5 * uDt * texelFetch(tM2, ivec2(0, g), 0).xyz;
+  c += uDt * u;
+}
+`;
+
+/**
+ * Per-row windowed sums around the current centre estimate of the row's galaxy.
+ * uMode 0: o0 = (Σ w x, Σ w).   uMode 1: also o1 = (Σ w v, ·), o2 = (Σ w a, ·).
+ * Centre estimate: the prediction (uUsePred = 1) or texel g of tCen.
+ */
+export const TRACK_ROWS_FRAG = /* glsl */ `
+uniform sampler2D tPos;
+uniform sampler2D tVel;
+uniform sampler2D tAcc;
+uniform sampler2D tCen;
+uniform int uUsePred;
+uniform int uMode;
+uniform float uS2[2];
+${TRACK_COMMON}
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+void main() {
+  int r = int(gl_FragCoord.y);
+  int g = int(texelFetch(tVel, ivec2(0, r), 0).w + 0.5) >> 2;
+  vec3 c, u;
+  if (uUsePred == 1) predict(g, c, u);
+  else c = texelFetch(tCen, ivec2(0, g), 0).xyz;
+  float s2 = g == 0 ? uS2[0] : uS2[1];
+  vec4 sx = vec4(0.0), sv = vec4(0.0);
+  vec3 sa = vec3(0.0);
+  for (int x = 0; x < ${64}; x++) {
+    ivec2 t = ivec2(x, r);
+    vec4 q = texelFetch(tPos, t, 0);
+    vec3 d = q.xyz - c;
+    float w = q.w * exp(-dot(d, d) / s2);
+    sx += vec4(q.xyz * w, w);
+    if (uMode == 1) {
+      sv += vec4(texelFetch(tVel, t, 0).xyz * w, w);
+      sa += texelFetch(tAcc, t, 0).xyz * w;
+    }
+  }
+  o0 = sx;
+  o1 = sv;
+  o2 = vec4(sa, 0.0);
+}`;
+
+/** Per-galaxy centroid from the row sums (falls back to the previous estimate if the window is empty). */
+export const TRACK_REDUCE_FRAG = /* glsl */ `
+uniform sampler2D tRows;
+uniform sampler2D tCen;
+uniform int uUsePred;
+uniform ivec2 uRows[6];
+${TRACK_COMMON}
+out vec4 oC;
+void main() {
+  int g = int(gl_FragCoord.y);
+  vec4 sum = vec4(0.0);
+  for (int comp = 0; comp < 3; comp++) {
+    ivec2 rows = uRows[comp * 2 + g];
+    for (int r = rows.x; r < rows.y; r++) sum += texelFetch(tRows, ivec2(0, r), 0);
+  }
+  vec3 c, u;
+  if (uUsePred == 1) predict(g, c, u);
+  else c = texelFetch(tCen, ivec2(0, g), 0).xyz;
+  oC = vec4(sum.w > 0.0 ? sum.xyz / sum.w : c, 1.0);
+}`;
+
+/** Final filter step: bulk velocity / acceleration from the row sums, then the corrected state. */
+export const TRACK_FRAG = /* glsl */ `
+uniform sampler2D tRows1;
+uniform sampler2D tRows2;
+uniform sampler2D tCen;
+uniform ivec2 uRows[6];
+uniform vec3 uTau;
+${TRACK_COMMON}
 layout(location = 0) out vec4 oC;
 layout(location = 1) out vec4 oU;
 layout(location = 2) out vec4 oA;
 layout(location = 3) out vec4 oP;
 void main() {
   int g = int(gl_FragCoord.y);
-  vec3 c, u, a0;
-  if (uInit == 1) {
-    c = g == 0 ? uInitCenter[0] : uInitCenter[1];
-    u = vec3(0.0);
-    a0 = vec3(0.0);
-  } else {
-    c = texelFetch(tM0, ivec2(0, g), 0).xyz;
-    u = texelFetch(tM1, ivec2(0, g), 0).xyz;
-    a0 = texelFetch(tM2, ivec2(0, g), 0).xyz;
-  }
-  vec3 cPrev = c;
-  if (uInit == 0) {
-    u += 0.5 * uDt * a0;
-    c += uDt * u;
-  }
-  float win = g == 0 ? uWin[0] : uWin[1];
-  vec3 cm = c;
-  float s2 = 0.0;
-  for (int it = 0; it < 2; it++) {
-    float f = it == 0 ? 2.0 : 1.0;
-    s2 = 2.0 * (f * win) * (f * win);
-    vec4 sum = vec4(0.0);
-    for (int comp = 0; comp < 3; comp++) {
-      ivec2 rows = uRows[comp * 2 + g];
-      for (int r = rows.x; r < rows.y; r++) {
-        for (int x = 0; x < ${64}; x++) {
-          vec4 q = texelFetch(tPos, ivec2(x, r), 0);
-          vec3 d = q.xyz - cm;
-          float w = q.w * exp(-dot(d, d) / s2);
-          sum += vec4(q.xyz * w, w);
-        }
-      }
-    }
-    if (sum.w > 0.0) cm = sum.xyz / sum.w;
-  }
+  vec3 c, u;
+  predict(g, c, u);
+  vec3 cPrev = uInit == 1 ? c : texelFetch(tM0, ivec2(0, g), 0).xyz;
+  vec3 cm = texelFetch(tCen, ivec2(0, g), 0).xyz;
   vec4 sv = vec4(0.0);
   vec3 sa = vec3(0.0);
   for (int comp = 0; comp < 3; comp++) {
     ivec2 rows = uRows[comp * 2 + g];
     for (int r = rows.x; r < rows.y; r++) {
-      for (int x = 0; x < ${64}; x++) {
-        ivec2 t = ivec2(x, r);
-        vec4 q = texelFetch(tPos, t, 0);
-        vec3 d = q.xyz - cm;
-        float w = q.w * exp(-dot(d, d) / s2);
-        sv += vec4(texelFetch(tVel, t, 0).xyz * w, w);
-        sa += texelFetch(tAcc, t, 0).xyz * w;
-      }
+      sv += texelFetch(tRows1, ivec2(0, r), 0);
+      sa += texelFetch(tRows2, ivec2(0, r), 0).xyz;
     }
   }
   vec3 vm = sv.w > 0.0 ? sv.xyz / sv.w : u;
@@ -258,7 +306,8 @@ vec3 c0a, c0b, c1a, c1b;
 float gridRho(vec3 x, vec3 c, int g) {
   ivec3 cell;
   if (!gridCell(x, c, cell)) return 0.0;
-  return texelFetch(tGrid, gridTexel(cell, g), 0).r;
+  // Parcels are spread over the 4 channels (see DEPOSIT_VERT): the cell mass is their sum.
+  return dot(texelFetch(tGrid, gridTexel(cell, g), 0), vec4(1.0));
 }
 // Gas density (10¹⁰ M☉ kpc⁻³): both grids see all gas, so take whichever covers x (max).
 float gasDensity(vec3 x, vec3 ca, vec3 cb) {
@@ -306,6 +355,10 @@ void main() {
  * Gas deposit into the star-formation grids: one point per gas parcel and grid, additive
  * (nearest grid point). Grid g is a 64³ block of 0.75 kpc cells centred on galaxy g, stored as
  * an 8×8 atlas of 64×64 slices; the two atlases sit side by side (1024×512).
+ * The target is half float (blendable everywhere, unlike float32 which needs EXT_float_blend), whose
+ * 11-bit mantissa makes each addition to a dense cell round to ~0.05 % of the running sum. Parcels
+ * are therefore spread round-robin over the RGBA channels, so each channel holds a quarter of the
+ * sum and the per-addition rounding error is 4× smaller.
  */
 export const DEPOSIT_VERT = /* glsl */ `
 uniform sampler2D tPos;
@@ -314,7 +367,7 @@ uniform sampler2D tM0;
 uniform int uWidth;
 uniform int uGrid;
 ${GRID_GLSL}
-out float vMass;
+out vec4 vMass;
 void main() {
   int id = gl_VertexID;
   ivec2 t = ivec2(id % uWidth, id / uWidth);
@@ -322,15 +375,16 @@ void main() {
   vec3 c = texelFetch(tM0, ivec2(0, uGrid), 0).xyz;
   ivec3 cell;
   gl_PointSize = 1.0;
-  vMass = texelFetch(tAttr, t, 0).w * ${SF_MASS_SCALE.toFixed(1)};
+  int ch = id & 3;
+  vMass = texelFetch(tAttr, t, 0).w * ${SF_MASS_SCALE.toFixed(1)} * vec4(ch == 0, ch == 1, ch == 2, ch == 3);
   if (!gridCell(x, c, cell)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec2 px = vec2(gridTexel(cell, uGrid)) + 0.5;
   gl_Position = vec4(px / vec2(${2 * SF_GRID_N * 8}.0, ${SF_GRID_N * 8}.0) * 2.0 - 1.0, 0.0, 1.0);
 }`;
 export const DEPOSIT_FRAG = /* glsl */ `
-in float vMass;
+in vec4 vMass;
 out vec4 outColor;
-void main() { outColor = vec4(vMass, 0.0, 0.0, 0.0); }`;
+void main() { outColor = vMass; }`;
 
 /** Per-row sums for the skeleton's energy, momentum and angular momentum. */
 export const DIAG_FRAG = /* glsl */ `

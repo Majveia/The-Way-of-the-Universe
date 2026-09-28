@@ -45,7 +45,15 @@ void main() {
   float inner = uInner * (1.0 - wob * 0.8);
   float aa = 1.5 / (diag * 540.0);
   float inside = smoothstep(outer + aa, outer - aa, d) * smoothstep(inner - aa, inner + aa, d);
+  // Rims: a thin hot edge and a soft halo (they add light over the scene as well).
+  float rimO = uOuter > 0.001 ? exp(-abs(d - outer) / 0.004) * 1.4 + exp(-abs(d - outer) / 0.04) * 0.18 : 0.0;
+  float rimI = uInner > 0.001 ? exp(-abs(d - inner) / 0.004) * 1.4 + exp(-abs(d - inner) / 0.04) * 0.18 : 0.0;
+  // Early out: outside the annulus and away from its rims nothing is drawn, so skip the ~8
+  // octaves of noise below (most of the screen while the vortex opens and while the iris clears).
+  if (inside <= 0.0 && rimO + rimI < 2e-4) discard;
 
+  vec3 col = vec3(0.0);
+  if (inside > 0.0) {
   // Logarithmic spiral coordinates: arms wind inward and rotate.
   float r = d / max(uOuter, 1e-3);
   float lr = log(max(r, 1e-3));
@@ -55,18 +63,15 @@ void main() {
   float fil = pow(1.0 - abs(snoise(vec3(sp * 2.4, lr * 2.2 - uTime * 1.4))), 16.0) * smoothstep(0.35, 0.75, n);
   float fil2 = pow(1.0 - abs(snoise(vec3(sp * 6.0 + 3.1, lr * 4.0 - uTime * 2.1))), 24.0);
   float depth = smoothstep(0.05, 1.0, r);                 // the throat recedes into darkness…
-  float core = exp(-r * 9.0);                             // …toward a pale far opening
   // Mostly dark, with luminous gas streaming along the spiral: OLED-friendly, not a green wall.
   // Filaments thin out toward the throat so the centre stays black until the iris opens.
   float wall = smoothstep(0.12, 0.7, r);
-  vec3 col = uGreen * (0.001 + 0.05 * pow(n, 5.0)) * depth;
+  col = uGreen * (0.001 + 0.05 * pow(n, 5.0)) * depth;
   col += uGreen * (fil * 0.3 + fil2 * 0.14) * wall * (0.3 + 0.7 * depth);
   col += mix(uGreen, vec3(1.0), 0.5) * exp(-r * 40.0) * 0.8;
   col *= uIntensity;
+  }
 
-  // Rims: a thin hot edge and a soft halo (they add light over the scene as well).
-  float rimO = uOuter > 0.001 ? exp(-abs(d - outer) / 0.004) * 1.4 + exp(-abs(d - outer) / 0.04) * 0.18 : 0.0;
-  float rimI = uInner > 0.001 ? exp(-abs(d - inner) / 0.004) * 1.4 + exp(-abs(d - inner) / 0.04) * 0.18 : 0.0;
   float flick = 0.85 + 0.15 * snoise(vec3(cs * 4.0, uTime * 3.0));
   vec3 rim = mix(uGreen, vec3(1.0), 0.25) * (rimO + rimI) * flick * uIntensity;
 

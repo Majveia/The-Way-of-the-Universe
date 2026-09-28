@@ -444,6 +444,9 @@ export class GalaxyLayer {
         uBounds: { value: new THREE.Vector2() },
         uMaxSteps: { value: Math.round(90 + 150 * Math.min(1.2, this.detail)) },
         uStepK: { value: 0.3 },
+        // In-plane rays (views from inside the disk) are dominated by this geometric schedule:
+        // 3.5 % of the distance per step on high, coarser on lower tiers (jitter + history hide it).
+        uStepNear: { value: THREE.MathUtils.clamp(0.035 / Math.sqrt(Math.max(this.detail, 0.35)), 0.03, 0.06) },
         uStepRange: { value: new THREE.Vector2(6, 260) },
         uFrame: { value: 0 },
         uColDisk: { value: new THREE.Vector3() },
@@ -467,6 +470,7 @@ export class GalaxyLayer {
         uNoiseTile: { value: 2400 },
         uGain: { value: 1 },
         uNearCut: { value: 0 },
+        uLocalReach: { value: 0 },
         uDebug: { value: 0 },
         uMask: { value: 255 },
         uEncode: { value: 0 },
@@ -581,8 +585,11 @@ export class GalaxyLayer {
     if (!ism || !sun) {
       s.uCloudCount.value = 0;
       (s.uBubble.value as THREE.Vector4).set(0, 0, 0, 0);
+      this.volMat.uniforms.uLocalReach.value = 0;
       return;
     }
+    // Everything local lies within this distance of the Sun (bubble edge; clouds to 3 radii).
+    let reach = 1.3 * ism.bubble;
     (s.uBubble.value as THREE.Vector4).set(sun.x, sun.y, sun.z, ism.bubble);
     const phi = Math.atan2(sun.y, sun.x);
     const gx = -Math.cos(phi), gy = -Math.sin(phi); // toward the Galactic Centre (l = 0)
@@ -601,7 +608,9 @@ export class GalaxyLayer {
         c.r,
       );
       T[i] = c.tau * this.live.dust;
+      reach = Math.max(reach, c.d + 3.2 * c.r);
     }
+    this.volMat.uniforms.uLocalReach.value = reach;
     s.uCloudCount.value = n;
   }
 

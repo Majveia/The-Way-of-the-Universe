@@ -388,3 +388,17 @@ describe('review: the Sun in the Galaxy', () => {
     expect(per).toBeLessThan(11200);
   });
 });
+
+describe('review: the GPU frequency table', () => {
+  it('LUT interpolation (what every star shader reads) matches the exact potential to < 0.5 % from 0.3 to 30 kpc', () => {
+    const p = milkyWay(1);
+    const k = new Kinematics(p);
+    for (let R = 300; R <= 30000; R *= 1.17) {
+      for (const [row, dark] of [[0, true], [1, false]] as const) {
+        expect(Math.abs(k.lutAt(R, row, 0) / k.potential.omega(R, dark) - 1)).toBeLessThan(5e-3);
+        expect(Math.abs(k.lutAt(R, row, 1) / k.potential.kappa(R, dark) - 1)).toBeLessThan(5e-3);
+        expect(Math.abs(k.lutAt(R, row, 3) / k.potential.vc(R, dark) - 1)).toBeLessThan(5e-3);
+      }
+    }
+  });
+});
