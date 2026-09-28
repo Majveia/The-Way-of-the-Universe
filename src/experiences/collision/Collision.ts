@@ -31,15 +31,31 @@ export function budgetFor(detail: number) {
 }
 
 /**
- * GPU work the integrator may submit per frame, in skeleton pair interactions (the N² force pass
- * dominates a step: ~20 flops per pair). 2.7×10⁸ ≈ 4 steps of the 8k-particle 'high' skeleton,
- * ~4–5 ms on a 2.5 TFLOPS laptop GPU; beyond that a fast rate slows down instead of the frame.
+ * GPU work the integrator may submit per frame, in skeleton pair interactions (~20 flops each).
+ * A step costs N_sk² pairs for the direct force pass plus the tracer sub-steps: each tracer
+ * sub-step evaluates both smooth galaxy models and the star-formation grid (~300 flops ≈ 15
+ * pairs), i.e. 15 · substeps · N_tr. 2.7×10⁸ ≈ 3.5 steps of the 'high' budget (8k skeleton,
+ * 196k tracers), ~4–5 ms on a 2.5 TFLOPS laptop GPU; beyond that a fast rate slows down instead
+ * of the frame.
  */
 const STEP_BUDGET = 2.7e8;
-/** Fast-forward (loading, timeline jumps) may spend twice that per frame. */
+/** Fast-forward (loading, timeline jumps) may spend twice that per frame (then adapts to the GPU). */
 const WARM_BUDGET = 5.4e8;
-export function stepsPerFrame(skeleton: number, budget = STEP_BUDGET, max = 10): number {
-  return Math.max(1, Math.min(max, Math.floor(budget / (skeleton * skeleton))));
+export const TRACER_PAIR_COST = 15;
+export function stepCost(skeleton: number, tracers = 0, substeps = 4): number {
+  return skeleton * skeleton + TRACER_PAIR_COST * substeps * tracers;
+}
+export function stepsPerFrame(skeleton: number, budget = STEP_BUDGET, max = 10, tracers = 0, substeps = 4): number {
+  return Math.max(1, Math.min(max, Math.floor(budget / stepCost(skeleton, tracers, substeps))));
+}
+/**
+ * Fast-forward chunk control: the GPU runs the steps asynchronously, so the only honest measure of
+ * their cost is the frame interval they produce. Aim for ~33 ms frames (≥ 30 fps with progress on
+ * screen): shrink the chunk when frames run long, grow it when they are short.
+ */
+export function adaptChunk(chunk: number, frameMs: number, max: number): number {
+  const next = frameMs > 50 ? chunk * 0.6 : frameMs > 36 ? chunk * 0.85 : frameMs < 24 ? chunk * 1.25 : chunk;
+  return Math.max(1, Math.min(max, Math.round(next)));
 }
 
 type ViewName = 'orbit' | 'edge-on' | 'oblique' | 'default';
@@ -349,7 +365,11 @@ export class CollisionExperience implements Experience {
    */
   private async integrate(sim: NBodySystem, t: number, gen: number, progress: (f: number) => void): Promise<void> {
     const t0 = sim.time;
-    const chunk = this.ctx.engine.shotMode ? 64 : stepsPerFrame(sim.skeletonCount, WARM_BUDGET, 64);
+    const shot = this.ctx.engine.shotMode;
+    const cap = shot ? 64 : stepsPerFrame(sim.skeletonCount, WARM_BUDGET, 64, sim.tracerCount, sim.substeps);
+    // Start at a quarter of the budget cap and let the measured frame interval steer it.
+    let chunk = shot ? 64 : Math.max(1, Math.round(cap / 4));
+    let tFrame = performance.now();
     while (sim.time < t - 0.5 * sim.dt) {
       if (gen !== this.gen || this.disposed) return;
       const n = Math.min(chunk, Math.round((t - sim.time) / sim.dt));
@@ -362,6 +382,9 @@ export class CollisionExperience implements Experience {
       this.trackEvents(true);
       progress((sim.time - t0) / Math.max(1e-9, t - t0));
       await this.yieldFrame();
+      const now = performance.now();
+      if (!shot && !document.hidden) chunk = adaptChunk(chunk, now - tFrame, cap);
+      tFrame = now;
     }
     sim.requestDiagnostics();
     sim.requestGalaxies();
@@ -378,7 +401,7 @@ export class CollisionExperience implements Experience {
     if (this.busy === null) {
       this.frameCount++;
       if (!this.paused) this.owed += this.rate * f.dt;
-      const maxSteps = stepsPerFrame(sim.skeletonCount);
+      const maxSteps = stepsPerFrame(sim.skeletonCount, STEP_BUDGET, 10, sim.tracerCount, sim.substeps);
       let n = Math.floor(this.owed / sim.dt);
       if (n > maxSteps) {
         n = maxSteps;

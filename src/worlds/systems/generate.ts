@@ -175,6 +175,9 @@ export interface SystemData {
 }
 
 const clamp = (x: number, a: number, b: number) => Math.min(b, Math.max(a, x));
+/** Hot Jupiters (P < 10 d) keep their neighbours ≥ 5× farther out in period (a ratio 5^⅔). */
+export const HOT_JUPITER_CLEAR_P = 5;
+const HOT_JUPITER_CLEAR_A = Math.pow(HOT_JUPITER_CLEAR_P, 2 / 3);
 const rayleigh = (rng: Rng, sigma: number) => sigma * Math.sqrt(-2 * Math.log(1 - rng.next() * 0.9999));
 
 /* ——— Stars ——— */
@@ -410,7 +413,18 @@ export function generateSystem(seed: number, hint: StarHint = {}): SystemData {
         giant = true;
       } else m = drawInnerMass(ra, Mstar);
       let na = prev ? nextHillSpacedOrbit(prev.a, prev.mass, m, Delta(), MstarPlanets) : a;
+      // A giant inside ~10 d is a hot Jupiter, and hot Jupiters are lonely: no neighbours within a
+      // factor of a few in period (Steffen et al. 2012, PNAS 109, 7982; Huang et al. 2016, ApJ 825,
+      // 98 — WASP-47 is the famous exception). A warm-Jupiter draw landing that close *outside* an
+      // inner planet becomes an ordinary inner planet instead; one at the inner edge keeps the
+      // region beyond it clear (below).
+      if (giant && !outer && prev && periodDays(na, MstarPlanets) < 10) {
+        m = drawInnerMass(ra, Mstar);
+        giant = false;
+        na = nextHillSpacedOrbit(prev.a, prev.mass, m, Delta(), MstarPlanets);
+      }
       if (prev && ra.chance(0.2)) na *= ra.range(1.1, 1.8); // gaps happen
+      if (prev && prev.giant && periodDays(prev.a, MstarPlanets) < 10) na = Math.max(na, prev.a * HOT_JUPITER_CLEAR_A);
       if (na > aOut) break;
       const emb: Embryo = { a: na, mass: m, e: 0, inc: rayleigh(ra, 1.2 * DEG), giant, formedOut: na > snow };
       giantMade ||= giant;

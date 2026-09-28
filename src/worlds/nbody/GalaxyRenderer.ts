@@ -219,13 +219,16 @@ uniform float uDiffuse;
 uniform float uLevel;
 out vec4 vC;
 void main() {
-  vec3 x = particleWorld();
+  // Each particle feeds at most 2 of the LEVELS passes: read its level (1 fetch) before its state
+  // (3 fetches). Behind-camera particles carry level −100 from the prepass.
+  ivec2 t = ivec2(gl_VertexID % uWidth, gl_VertexID / uWidth);
+  vec4 lt = texelFetch(tLight, t, 0);
+  float w = 1.0 - abs(lt.w - uLevel);
+  if (w <= 0.0) { offscreen(); return; }
+  vec3 x = particleAt(t);
   vec4 mv = modelViewMatrix * vec4(x, 1.0);
   vec4 clip = projectionMatrix * mv;
   if (clip.w <= 0.0) { offscreen(); return; }
-  vec4 lt = particleLight();
-  float w = 1.0 - abs(lt.w - uLevel);
-  if (w <= 0.0) { offscreen(); return; }
   gl_Position = clip;
   gl_PointSize = 1.0;
   float d = max(-mv.z, 1e-3);
@@ -262,6 +265,20 @@ void main() {
   vec3 c = texture(tL0, vUv).rgb + texture(tL1, vUv).rgb;
   ${Array.from({ length: LEVELS - 2 }, (_, k) => `c += tent(tL${k + 2}, 0.5 * uTexel[${k + 2}]);`).join('\n  ')}
   outColor = vec4(c, 1.0);
+}`;
+
+/**
+ * Final composite into the (possibly multisampled) HDR target: the diffuse light (summed at the
+ * light-buffer resolution, bilinearly up-sampled) plus the full-resolution sprite buffer. One
+ * full-screen write per frame into the MSAA target instead of one per sprite fragment.
+ */
+const COMPOSITE_FRAG = /* glsl */ `
+uniform sampler2D tSum;
+uniform sampler2D tSprites;
+in vec2 vUv;
+out vec4 outColor;
+void main() {
+  outColor = vec4(texture(tSum, vUv).rgb + texelFetch(tSprites, ivec2(gl_FragCoord.xy), 0).rgb, 1.0);
 }`;
 
 const DEPOSIT_FRAG = /* glsl */ `
@@ -316,7 +333,14 @@ uniform float uMaxLod;
 uniform vec3 uTint;
 in vec2 vUv;
 out vec4 outColor;
-float countAt(float l) { return textureLod(tL, vUv, l).a * exp2(2.0 * l); }
+// Counts through the same 4-tap tent as the light: plain bilinear reads of the coarse levels show
+// their texel grid as bands where the fade threshold crosses it.
+float countAt(float l) {
+  vec2 o = uTexel * exp2(floor(l)) * 0.5;
+  float a = textureLod(tL, vUv + o, l).a + textureLod(tL, vUv - o, l).a
+    + textureLod(tL, vUv + vec2(o.x, -o.y), l).a + textureLod(tL, vUv + vec2(-o.x, o.y), l).a;
+  return 0.25 * a * exp2(2.0 * l);
+}
 vec3 tentAt(float l) {
   vec2 o = uTexel * exp2(floor(l)) * 0.5;
   return 0.25 * (textureLod(tL, vUv + vec2(o.x, o.y), l).rgb + textureLod(tL, vUv + vec2(-o.x, o.y), l).rgb
@@ -476,6 +500,17 @@ const pyramidTarget = (count: number) =>
     count,
   });
 
+const colorTarget = () =>
+  new THREE.WebGLRenderTarget(1, 1, {
+    type: THREE.HalfFloatType,
+    format: THREE.RGBAFormat,
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    depthBuffer: false,
+    stencilBuffer: false,
+    generateMipmaps: false,
+  });
+
 export class GalaxyRenderer {
   exposure: number;
   /** Dust strength multiplier (1 = solar-metallicity dust-to-gas; 0 = off). */
@@ -508,6 +543,11 @@ export class GalaxyRenderer {
     generateMipmaps: false,
   });
   private lightMat: THREE.ShaderMaterial;
+  /** Diffuse light summed over the levels, at the light-buffer resolution (half of the target). */
+  private sumRT = colorTarget();
+  /** Resolved points and young-cluster sprites, at the target resolution but never multisampled. */
+  private spriteRT = colorTarget();
+  private compositeMat: THREE.ShaderMaterial;
   private dustRT = pyramidTarget(2);
   private dmRT = pyramidTarget(1);
   private dustScene = new THREE.Scene();
@@ -616,7 +656,8 @@ export class GalaxyRenderer {
     this.blurMat = fs(BLUR_FRAG, { tSrc: { value: null }, uStep: { value: new THREE.Vector2() } }, false);
     const sumU: Record<string, THREE.IUniform> = { uTexel: { value: this.levelRT.map(() => new THREE.Vector2(1, 1)) } };
     this.levelRT.forEach((rt, k) => (sumU[`tL${k}`] = { value: rt.texture }));
-    this.sumMat = fs(SUM_FRAG, sumU, true);
+    this.sumMat = fs(SUM_FRAG, sumU, false);
+    this.compositeMat = fs(COMPOSITE_FRAG, { tSum: { value: this.sumRT.texture }, tSprites: { value: this.spriteRT.texture } }, true);
     this.pointMat = mk(POINT_VERT, POINT_FRAG, { uPoint: { value: 0.3 }, uSigma: { value: 0.7 }, uRes: { value: new THREE.Vector2(1, 1) } });
     this.gasMat = mk(GAS_VERT, GAS_FRAG, { uSfEff: { value: SF_EFFICIENCY }, uHII: { value: hiiColor() } });
     this.dmMat = mk(DM_VERT, DEPOSIT_FRAG, { tSPos: { value: null }, uHaloEnd: { value: 0 } });
@@ -679,6 +720,8 @@ export class GalaxyRenderer {
     this.h = h;
     const lw = Math.max(1, Math.round(w * this.lightScale)), lh = Math.max(1, Math.round(h * this.lightScale));
     this.countRT.setSize(lw, lh);
+    this.sumRT.setSize(lw, lh);
+    this.spriteRT.setSize(w, h);
     this.levelRT.forEach((rt, k) => {
       const w2 = Math.max(1, Math.round(lw / 2 ** k)), h2 = Math.max(1, Math.round(lh / 2 ** k));
       rt.setSize(w2, h2);
@@ -748,24 +791,31 @@ export class GalaxyRenderer {
       (b.uStep.value as THREE.Vector2).set(0, 1 / this.levelRT[k].height);
       this.quad.render(renderer, this.levelRT[k]);
     }
-    if (this.darkMatter && p.skeletonPos) {
+    const dm = this.darkMatter && !!p.skeletonPos;
+    if (dm) {
       this.dmMat.uniforms.tSPos.value = p.skeletonPos;
       this.dmComposite.uniforms.uTint.value.set(0.45, 0.28, 1.0).multiplyScalar(this.darkMatterExposure * this.exposure);
       renderer.setRenderTarget(this.dmRT);
       renderer.clear(true, false, false);
       renderer.render(this.dmScene, camera);
     }
-    renderer.setClearColor(prevClear, prevAlpha);
-
-    renderer.setRenderTarget(target);
-    if (this.darkMatter && p.skeletonPos) {
-      this.quad.material = this.dmComposite;
-      this.quad.render(renderer, target);
-    }
+    // Diffuse light: sum the levels at the light resolution (+ the smooth dark-matter glow).
     this.quad.material = this.sumMat;
-    this.quad.render(renderer, target);
+    this.quad.render(renderer, this.sumRT);
+    if (dm) {
+      this.quad.material = this.dmComposite;
+      this.quad.render(renderer, this.sumRT);
+    }
+    // Sprites into a single-sampled buffer: additive sprites drawn straight into a 4× MSAA target
+    // would blend every covered sample (4× the fill and bandwidth for no gain; they are Gaussians).
+    renderer.setRenderTarget(this.spriteRT);
+    renderer.clear(true, false, false);
     renderer.render(this.pointScene, camera);
     if (this.youngStars) renderer.render(this.gasScene, camera);
+    renderer.setClearColor(prevClear, prevAlpha);
+
+    this.quad.material = this.compositeMat;
+    this.quad.render(renderer, target);
   }
 
   dispose(): void {
@@ -773,6 +823,8 @@ export class GalaxyRenderer {
     for (const m of this.mats) m.dispose();
     this.countRT.dispose();
     this.lightRT.dispose();
+    this.sumRT.dispose();
+    this.spriteRT.dispose();
     for (const rt of [...this.levelRT, ...this.blurRT]) rt.dispose();
     this.dustRT.dispose();
     this.dmRT.dispose();

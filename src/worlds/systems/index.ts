@@ -9,7 +9,7 @@
 export * from './generate';
 export * from './stellar';
 export * from './planets';
-export { SystemLayer, starIntensity, adaptedLight, ADAPTATION, type SystemLayerOptions, type BodyEntry } from './SystemLayer';
+export { SystemLayer, starIntensity, adaptedLight, ADAPTATION, poleAzimuth, applyObliquity, spinAxis, type SystemLayerOptions, type BodyEntry } from './SystemLayer';
 export { WorldCloseup } from './Closeup';
 export { EyeballIce, eyeballOpening } from './eyeball';
 export { catalogueName, givenName } from './names';

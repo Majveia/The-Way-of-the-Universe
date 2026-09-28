@@ -307,7 +307,7 @@ describe('collision · Milkomeda timing (CPU reference)', () => {
 import * as THREE from 'three';
 import { timeToPericentre } from '../src/worlds/nbody/orbit';
 import { DUST_KAPPA_V } from '../src/worlds/nbody/GalaxyRenderer';
-import { budgetFor, stepsPerFrame } from '../src/experiences/collision/Collision';
+import { adaptChunk, budgetFor, stepCost, stepsPerFrame } from '../src/experiences/collision/Collision';
 
 describe('collision · review: orbit timing and frames', () => {
   it('time to pericentre matches a direct integration of the two-body problem (e < 1, = 1, > 1)', () => {
@@ -418,13 +418,54 @@ describe('collision · review: GPU cost scaling of the quality tiers', () => {
   });
   it('the per-frame step cap bounds the N² work (≤ 2.7×10⁸ pair interactions, ≥ 1 step)', () => {
     for (const d of [0.35, 0.7, 1, 1.6]) {
-      const sk = budgetFor(d).skeleton;
-      const n = stepsPerFrame(sk);
+      const { skeleton: sk, tracers } = budgetFor(d);
+      const n = stepsPerFrame(sk, undefined, undefined, tracers, 4);
       expect(n).toBeGreaterThanOrEqual(1);
       expect(n).toBeLessThanOrEqual(10);
-      if (n > 1) expect(n * sk * sk).toBeLessThanOrEqual(2.7e8);
+      if (n > 1) expect(n * stepCost(sk, tracers, 4)).toBeLessThanOrEqual(2.7e8);
     }
     // The default rates (30–60 Myr/s at dt = 1–1.5 Myr) need ≤ 1 step per 60 Hz frame on every tier.
     for (const p of PRESETS) expect(p.rate / (p.dt ?? 1) / 60).toBeLessThanOrEqual(stepsPerFrame(budgetFor(1.6).skeleton));
+  });
+});
+
+describe('collision · review 2: frame budget and sprite photometry', () => {
+  it('a step costs the N² force pass plus the tracer sub-steps (which dominate on low tiers)', () => {
+    const lo = budgetFor(0.35), hi = budgetFor(1);
+    // high: force pass dominates; low: tracers are a sizeable share, so they must be in the budget
+    expect(stepCost(hi.skeleton, 0)).toBeGreaterThan(0.8 * stepCost(hi.skeleton, hi.tracers));
+    expect(stepCost(lo.skeleton, lo.tracers) / stepCost(lo.skeleton, 0)).toBeGreaterThan(1.3);
+    // the low tier's per-frame step cap is therefore smaller than N² alone would allow
+    expect(stepsPerFrame(lo.skeleton, 5.4e8, 64, lo.tracers)).toBeLessThan(stepsPerFrame(lo.skeleton, 5.4e8, 64));
+    // whole-frame integrator work on 'low' is ≤ ¼ of 'high' at the same simulated rate
+    expect(stepCost(lo.skeleton, lo.tracers) / stepCost(hi.skeleton, hi.tracers)).toBeLessThan(0.25);
+  });
+  it('fast-forward chunks adapt to the measured frame interval and stay within [1, cap]', () => {
+    expect(adaptChunk(10, 80, 64)).toBeLessThan(10);
+    expect(adaptChunk(10, 16, 64)).toBeGreaterThan(10);
+    expect(adaptChunk(10, 30, 64)).toBe(10);
+    expect(adaptChunk(1, 500, 64)).toBe(1);
+    expect(adaptChunk(64, 1, 64)).toBe(64);
+    // a slow GPU converges from the cap to a frame near 33 ms: cost 5 ms/step → ~6 steps
+    let c = 64;
+    for (let i = 0; i < 30; i++) c = adaptChunk(c, 5 * c, 64);
+    expect(5 * c).toBeGreaterThan(20);
+    expect(5 * c).toBeLessThan(50);
+  });
+  it('sprite normalisations: 2πσ² for the Gaussian points, 0.771 R² for the exp(−4r²/R²) cluster disks', () => {
+    // ∫∫_{r<R} exp(−4 r²/R²) dA = (π R²/4)(1 − e⁻⁴)
+    expect((Math.PI / 4) * (1 - Math.exp(-4))).toBeCloseTo(0.771, 3);
+    // numerical check of the discrete Gaussian point (σ = 0.6 px, truncated at 3σ) on a pixel grid
+    for (const sigma of [0.6, 0.9, 1.2]) {
+      let sum = 0;
+      for (let y = -6; y <= 6; y++)
+        for (let x = -6; x <= 6; x++) {
+          const r2 = (x * x + y * y) / (sigma * sigma);
+          if (r2 <= 9) sum += Math.exp(-0.5 * r2);
+        }
+      // light conserved to a few per cent whatever the sub-pixel phase (here centred)
+      expect(sum / (2 * Math.PI * sigma * sigma)).toBeGreaterThan(0.97);
+      expect(sum / (2 * Math.PI * sigma * sigma)).toBeLessThan(1.25);
+    }
   });
 });

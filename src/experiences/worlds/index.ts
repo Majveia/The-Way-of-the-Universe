@@ -4,7 +4,7 @@ import { OrbitRig } from '../../core/rigs/OrbitRig';
 import { Sky } from '../../worlds/sky/Sky';
 import { formatNumber } from '../../physics/units';
 import { Rng } from '../../physics/random';
-import { findSeed, generateSystem, SystemLayer, WorldCloseup, type SystemData, type SystemFeature } from '../../worlds/systems';
+import { findSeed, generateSystem, spinAxis, SystemLayer, WorldCloseup, type SystemData, type SystemFeature } from '../../worlds/systems';
 import { Portal } from './portal';
 import { formatPeriod, planetCard, skySizeText, starCard } from './cards';
 import { Labels } from './labels';
@@ -110,6 +110,7 @@ class PossibleWorlds implements Experience {
     const q = ctx.params;
     const seed = q.has('seed') ? Number(q.get('seed')) : DEFAULT_SEED;
     this.buildUI();
+    this.fitAspect = this.cssW / Math.max(1, this.cssH);
     this.load(seed, true);
     this.bindInput();
     ctx.audio.setMood('worlds', { intensity: 0.35 });
@@ -133,7 +134,16 @@ class PossibleWorlds implements Experience {
   resize(w: number, h: number): void {
     this.width = w;
     this.height = h;
+    // Re-fit the overview when the screen's *shape* changes (a phone rotating), not when dynamic
+    // resolution rescales the target (that would undo the viewer's zoom every few seconds).
+    if (!this.ctx) return;
+    const aspect = this.cssW / Math.max(1, this.cssH);
+    if (Math.abs(aspect - this.fitAspect) > 0.05 * this.fitAspect) {
+      this.fitAspect = aspect;
+      if (this.layer && this.mode === 'system' && this.focus.to < 0 && !this.jump) this.frameSystem(0.6);
+    }
   }
+  private fitAspect = 0;
 
   // ——— Systems ———
 
@@ -192,7 +202,7 @@ class PossibleWorlds implements Experience {
   /** Overview distance in units of the system's extent (fits ~80% of the width). */
   private get frameFactor(): number {
     const aspect = this.cssW / Math.max(1, this.cssH);
-    return THREE.MathUtils.clamp(1.27 / (Math.tan((21 * Math.PI) / 180) * aspect), 1.85, 5.2);
+    return THREE.MathUtils.clamp(1.27 / (Math.tan((21 * Math.PI) / 180) * aspect), 1.85, 7.5);
   }
 
   /** Natural clock: the innermost planet completes an orbit in ~25 s. */
@@ -259,7 +269,7 @@ class PossibleWorlds implements Experience {
     this.rig.minDistance = 1.08;
     this.rig.maxDistance = 60;
     this.rig.set({ distance: dPlanetRadii });
-    this.rig.flyTo({ distance: this.closeDistance(i), pitch: this.bigStar(i) ? -0.2 : this.rig.pitch }, 1.6);
+    this.rig.flyTo({ distance: this.closeDistance(i), pitch: this.bigStar(i) ? -0.2 : this.closePitch(i, this.rig.goal.yaw, this.rig.goal.pitch) }, 1.6);
     this.labels.setVisible(false);
     this.updateReadoutLabels();
   }
@@ -348,7 +358,7 @@ class PossibleWorlds implements Experience {
         this.focus = { from: i, to: i, t: 1, dur: 1 };
         this.rig.set({ distance: this.layer.bodies[i].displayRadius * 5.5, yaw: this.dayYaw(i), pitch: 0.16 });
         this.enterCloseup(i);
-        this.rig.set({ distance: this.closeDistance(i), pitch: this.bigStar(i) ? -0.2 : 0.16 });
+        this.rig.set({ distance: this.closeDistance(i), pitch: this.bigStar(i) ? -0.2 : this.closePitch(i, this.rig.yaw, 0.16) });
         break;
       }
       case 'orbit': {
@@ -393,6 +403,30 @@ class PossibleWorlds implements Experience {
     const p = this.sys.planets[i];
     if (this.bigStar(i)) return 6.5;
     return p.spec.rings ? 3.4 * Math.max(1.5, p.spec.rings.outer * 0.75) : 3.4;
+  }
+
+  /**
+   * Close-up camera elevation for planet i. A ringed planet seen from near its orbital plane shows
+   * its rings edge-on (a hairline across the disk) whenever the axial tilt is small, so aim for
+   * ≈ 22° above the *ring* plane, on the star-lit face, with the least change from `pitch`.
+   */
+  private closePitch(i: number, yaw: number, pitch: number): number {
+    const p = this.sys.planets[i];
+    if (!p.spec.rings || this.bigStar(i)) return pitch;
+    const n = spinAxis(p, this.tmp2); // ring normal
+    let side = 1;
+    if (this.closeup) side = Math.sign(n.dot(this.closeup.starDirection(this.tmp))) || 1;
+    let best = pitch, bestCost = Infinity;
+    for (let q = -0.9; q <= 0.9; q += 0.02) {
+      const d = Math.cos(q) * Math.sin(yaw) * n.x + Math.sin(q) * n.y + Math.cos(q) * Math.cos(yaw) * n.z;
+      const elev = Math.asin(THREE.MathUtils.clamp(d * side, -1, 1));
+      const cost = Math.abs(elev - 0.38) + 0.25 * Math.abs(q - pitch);
+      if (cost < bestCost) {
+        bestCost = cost;
+        best = q;
+      }
+    }
+    return best;
   }
 
   /** The most interesting planet: habitable > eyeball > ringed > largest. */
@@ -581,6 +615,13 @@ class PossibleWorlds implements Experience {
     this.camera.aspect = target.width / Math.max(1, target.height);
     this.camera.fov = this.mode === 'orbit' ? 60 : 42;
     r.setRenderTarget(target);
+    if (this.portal.covers) {
+      // Mid-jump the vortex hides everything: skip the sky and the system (two full passes and
+      // their MSAA resolves) while the next system bakes behind it.
+      this.portal.render(r, target, this.shaderTime, 1.4);
+      target.resolveDepthBuffer = resolveDepth;
+      return;
+    }
     // Sky at infinity: rotation only, with this system's orientation.
     const saved = this.savedQuat.copy(this.camera.quaternion);
     this.camera.quaternion.premultiply(this.skyRotation);
@@ -610,6 +651,7 @@ class PossibleWorlds implements Experience {
   /** Debug: cost accounting for the current view (render passes into the HDR target). */
   stats(): { mode: Mode; passes: number; slices: number; planetsReady: boolean } {
     const slices = this.mode === 'system' ? 1 : this.closeup?.slicesDrawn ?? 0;
+    if (this.portal.covers) return { mode: this.mode, passes: 1, slices: 0, planetsReady: this.layer.prepared };
     return { mode: this.mode, passes: 1 + slices + (this.portal.active ? 1 : 0), slices, planetsReady: this.layer.prepared };
   }
 

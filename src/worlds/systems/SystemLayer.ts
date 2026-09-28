@@ -118,7 +118,7 @@ export class SystemLayer {
     for (const p of sys.planets) {
       const planet = createPlanet({ ...p.spec, radius: 1, detail: detail * (p.spec.detail ?? 1) });
       const tilt = new THREE.Group();
-      tilt.rotation.z = p.axialTilt;
+      applyObliquity(tilt, p);
       tilt.add(planet.object);
       this.scene.add(tilt);
       const orbit = new OrbitLine(p.orbit, this.gamma, ORBIT_COLOR);
@@ -454,3 +454,20 @@ export function adaptedLight(c: THREE.Color, out = new THREE.Color()): THREE.Col
   const y = 0.2126 * out.r + 0.7152 * out.g + 0.0722 * out.b;
   return out.multiplyScalar(1 / y);
 }
+
+/**
+ * Spin-axis orientation: obliquity `axialTilt` toward a pole azimuth fixed by the planet's seed
+ * (no generator draw, so every seed keeps its system). R = R_y(φ) · R_z(obliquity), so the
+ * equinoxes fall at a different point of each orbit instead of every planet's pole leaning along
+ * the same axis (which put every ringed giant at equinox — rings edge-on to their star — at the
+ * same orbital phase).
+ */
+export const poleAzimuth = (p: PlanetData): number => (((p.spec.seed * 0.6180339887) % 1) + 1) % 1 * 2 * Math.PI;
+export function applyObliquity(obj: THREE.Object3D, p: PlanetData): void {
+  obj.rotation.set(0, poleAzimuth(p), p.axialTilt);
+}
+/** Unit spin axis (north pole) of planet p in the three.js frame. */
+export function spinAxis(p: PlanetData, out: THREE.Vector3): THREE.Vector3 {
+  return out.set(0, 1, 0).applyEuler(_euler.set(0, poleAzimuth(p), p.axialTilt));
+}
+const _euler = new THREE.Euler();

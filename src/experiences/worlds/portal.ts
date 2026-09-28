@@ -117,6 +117,12 @@ export class Portal {
     this.scene.add(this.mesh);
   }
 
+  /** The vortex covers the whole screen (the wobbling outer edge beyond the corners, iris shut):
+   * nothing behind it can show, so the scene need not be drawn. */
+  get covers(): boolean {
+    return this.outer >= 1.2 && this.inner <= 0;
+  }
+
   get active(): boolean {
     return this.outer > 0.0005 && this.inner < 1.3;
   }

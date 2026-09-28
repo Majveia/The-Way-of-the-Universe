@@ -2,10 +2,11 @@ import * as THREE from 'three';
 import { createPlanet, type PlanetRenderer } from '../planet';
 import type { PlanetUpdate } from '../planet/types';
 import { createStar, type StarRenderer } from '../star';
-import type { BodyEntry, SystemLayer } from './SystemLayer';
+import { applyObliquity, type BodyEntry, type SystemLayer } from './SystemLayer';
 import type { MoonData } from './generate';
 import { R_EARTH_KM } from './planets';
 import { StarGlare, glareStrength } from './glare';
+import { cornerCos, planSlices, ringDistance, shellDistance, type SliceItem } from './slices';
 
 /**
  * A planet at true scale, in its own frame: 1 unit = the planet's radius, planet at the origin.
@@ -25,6 +26,7 @@ const R_SUN_KM = 695700;
 const tmp = new THREE.Vector3();
 const tmp2 = new THREE.Vector3();
 const tmpC = new THREE.Color();
+const tmpQ = new THREE.Quaternion();
 
 /** Star disk-centre radiance relative to the white surface it lights is ≈ π/Ω★ (4.6 × 10⁴ for the
  * Sun at 1 AU); like the Pale Blue Dot experience we draw it ~40× dimmer so bloom stays a glare. */
@@ -35,13 +37,15 @@ interface MoonEntry {
   view: PlanetRenderer;
   pos: THREE.Vector3;
   radius: number;
+  /** Surface baked (see update). */
+  ready: boolean;
 }
 
-interface Slice {
+/** One body to draw: its own scene (stars) or an object in the shared local scene (planet, moons). */
+interface Item extends SliceItem {
   scene: THREE.Scene;
-  centre: THREE.Vector3;
-  radius: number;
-  dist: number;
+  /** Object toggled per slice in the shared scene; null for a star's own scene. */
+  obj: THREE.Object3D | null;
 }
 
 const frustum = new THREE.Frustum();
@@ -71,8 +75,6 @@ export class WorldCloseup {
   readonly starRadius: number;
   readonly companionRadius: number = 0;
   readonly moons: MoonEntry[] = [];
-  private moonScenes: THREE.Scene[] = [];
-  private slices: Slice[] = [];
   private prevParent: THREE.Object3D | null;
   private prevScale: number;
   /** Starlight colour × irradiance at the planet (luminance-normalised to the primary). */
@@ -87,7 +89,7 @@ export class WorldCloseup {
     this.prevParent = b.planet.object.parent;
     this.prevScale = b.planet.object.scale.x;
     b.planet.object.scale.setScalar(1);
-    this.tilt.rotation.z = b.data.axialTilt;
+    applyObliquity(this.tilt, b.data);
     this.tilt.add(b.planet.object);
     this.planetScene.add(this.tilt);
 
@@ -117,15 +119,18 @@ export class WorldCloseup {
       const rel = (c.luminosity / (dComp * dComp)) / (s.luminosity / (b.data.orbit.a * b.data.orbit.a));
       this.glares.push(this.addGlare(this.companion, this.compScene, compDeg, Math.min(1, Math.pow(rel, 0.25))));
     }
+    // Moons share the planet's scene (see render): each is baked on a later frame (update →
+    // one per frame) and stays hidden until then, so arriving at a giant does not stall on four
+    // surface bakes and their read-backs at once.
     for (const m of b.data.moons) {
       const radius = m.radius / b.data.radius;
       const view = createPlanet({ ...m.spec, radius, detail: detail * (m.spec.detail ?? 1) });
-      view.prepare(renderer);
-      const sc = new THREE.Scene();
-      sc.add(view.object);
-      this.moonScenes.push(sc);
-      this.moons.push({ data: m, view, pos: new THREE.Vector3(), radius });
+      view.object.visible = false;
+      this.planetScene.add(view.object);
+      this.moons.push({ data: m, view, pos: new THREE.Vector3(), radius, ready: false });
     }
+    void renderer;
+    this.measureShells();
     // Eclipses: the planet shadows its moons, and the two innermost moons can shadow the planet
     // (lists hold live references; set once).
     const planetOcc = [{ position: ORIGIN, radius: 1 }];
@@ -212,7 +217,15 @@ export class WorldCloseup {
     this.star.update(this.su);
     this.companion?.update(this.su);
     pu.sunColor = tmpC;
+    let baked = false;
     for (const m of this.moons) {
+      if (!m.ready) {
+        // At most one moon bake per frame (an update with a renderer would bake it now).
+        if (baked) continue;
+        m.view.prepare(renderer);
+        m.ready = baked = true;
+        m.view.object.visible = true;
+      }
       tmpC.copy(this.sunColor);
       m.view.update(pu);
     }
@@ -227,26 +240,83 @@ export class WorldCloseup {
     return out.copy(this.starPos).multiplyScalar(L1 / (L1 + L2)).addScaledVector(this.companionPos, L2 / (L1 + L2));
   }
 
-  /** Slice records, reused every frame (no per-frame garbage). */
-  private pool: Slice[] = [];
-  private order: Slice[] = [];
-  /** Number of depth slices drawn in the last frame (debug / cost accounting). */
+  /* ——— Depth slices ——— */
+
+  /** Radial extent [lo, hi] of each of the planet's shell-like meshes (surface proxy, air, ice). */
+  private shells: number[] = [];
+  private ring: { inner: number; outer: number } | null = null;
+
+  private measureShells(): void {
+    const f = Math.min(Math.max(this.body.data.spec.oblateness ?? 0, 0), 0.3);
+    this.body.planet.object.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const g = mesh.geometry as THREE.BufferGeometry & { parameters?: { innerRadius?: number; outerRadius?: number } };
+      if (g.type === 'RingGeometry' && g.parameters?.innerRadius !== undefined) {
+        this.ring = { inner: g.parameters.innerRadius, outer: g.parameters.outerRadius! };
+        return;
+      }
+      const pos = g.getAttribute('position');
+      if (!pos) return;
+      let lo = Infinity, hi = 0;
+      for (let i = 0; i < pos.count; i++) {
+        const r = Math.hypot(pos.getX(i), pos.getY(i), pos.getZ(i));
+        lo = Math.min(lo, r);
+        hi = Math.max(hi, r);
+      }
+      // The surface proxy is inflated in the vertex shader by up to 3.5 % (Planet: uProxyScale);
+      // shells may be flattened by the spin (oblateness). Widen the band to cover both.
+      const inflate = mesh.name === 'planet-surface' ? 1.037 : 1.001;
+      this.shells.push(lo * (1 - f) * 0.999, hi * inflate);
+    });
+  }
+
+  /** Distance from the camera to the nearest planet geometry, or 0 when it may touch some. */
+  private nearestPlanetGeometry(camPos: THREE.Vector3): number {
+    const d = camPos.length();
+    let best = Infinity;
+    for (let i = 0; i < this.shells.length; i += 2) best = Math.min(best, shellDistance(d, this.shells[i], this.shells[i + 1]));
+    if (this.ring) {
+      const p = tmp.copy(camPos).applyQuaternion(tmpQ.copy(this.tilt.quaternion).invert());
+      best = Math.min(best, ringDistance(p.x, p.y, p.z, this.ring.inner, this.ring.outer));
+    }
+    return Number.isFinite(best) ? best : 0;
+  }
+
+  /** Body records, reused every frame (no per-frame garbage). */
+  private pool: Item[] = [];
+  private order: Item[] = [];
+  private ranges: number[] = [];
+  /** Number of depth slices (render passes) drawn in the last frame (debug / cost accounting). */
   slicesDrawn = 0;
 
-  private slice(k: number, scene: THREE.Scene, centre: THREE.Vector3, radius: number, camPos: THREE.Vector3): Slice {
-    const s = (this.pool[k] ??= { scene, centre, radius, dist: 0 });
-    s.scene = scene;
-    s.centre = centre;
-    s.radius = radius;
-    s.dist = camPos.distanceTo(centre);
-    return s;
+  private item(k: number, scene: THREE.Scene, obj: THREE.Object3D | null, centre: THREE.Vector3, radius: number, camera: THREE.Camera): Item | null {
+    // View-space depth (what the clip planes test), not Euclidean distance: an off-axis star at
+    // depth d·cos θ would otherwise fall in front of the near plane.
+    const z = -tmp.copy(centre).applyMatrix4(camera.matrixWorldInverse).z;
+    if (z + radius <= 0) return null; // entirely behind the camera
+    if (!inSideFrustum(centre, radius)) return null; // entirely off-screen
+    const it = (this.pool[k] ??= { scene, obj, near: 0, far: 0, dist: 0, solo: false, slice: 0 });
+    it.scene = scene;
+    it.obj = obj;
+    it.dist = camera.position.distanceTo(centre);
+    it.near = Math.max(z - radius, it.dist * 1e-6, 1e-6);
+    it.far = Math.max(z + radius, it.near * 4);
+    it.solo = obj === null;
+    return it;
+  }
+
+  private glareHalf(i: number, camera: THREE.PerspectiveCamera): number {
+    const g = this.glares[i];
+    return g ? g.orient(camera, 0.09) * Math.SQRT1_2 : 0;
   }
 
   /**
-   * Draw far → near, one depth slice per body. Every `renderer.render()` into a multisampled
-   * target ends with a full-screen MSAA resolve (three.js blits after each call), so bodies wholly
-   * outside the view are skipped rather than drawn into an empty slice: a star behind the camera
-   * or a moon off-screen costs nothing.
+   * Draw far → near in depth slices. Every `renderer.render()` into a multisampled target ends with
+   * a full-screen MSAA resolve (three.js blits after each call), so: bodies wholly outside the view
+   * are skipped; the planet and its moons share one slice whenever their depth range fits one
+   * buffer (see slices.ts); stars keep their own (their glare ignores depth and must precede the
+   * planet that hides it behind the limb).
    */
   render(renderer: THREE.WebGLRenderer, camera: THREE.PerspectiveCamera): void {
     camera.updateMatrixWorld();
@@ -256,35 +326,63 @@ export class WorldCloseup {
     const sl = this.order;
     sl.length = 0;
     let k = 0;
-    const glareHalf = (g: StarGlare | null) => (g ? g.orient(camera, 0.09) * Math.SQRT1_2 : 0);
-    const g0 = glareHalf(this.glares[0] ?? null);
-    sl.push(this.slice(k++, this.starScene, this.starPos, Math.max(this.starRadius * 7, g0), cp));
+    let it = this.item(k++, this.starScene, null, this.starPos, Math.max(this.starRadius * 7, this.glareHalf(0, camera)), camera);
+    if (it) sl.push(it);
     if (this.companion) {
-      const g1 = glareHalf(this.glares[1] ?? null);
-      sl.push(this.slice(k++, this.compScene, this.companionPos, Math.max(this.companionRadius * 7, g1), cp));
+      it = this.item(k++, this.compScene, null, this.companionPos, Math.max(this.companionRadius * 7, this.glareHalf(1, camera)), camera);
+      if (it) sl.push(it);
     }
     for (let i = 0; i < this.moons.length; i++) {
       const m = this.moons[i];
-      sl.push(this.slice(k++, this.moonScenes[i], m.pos, m.radius * 1.1, cp));
+      if (!m.ready) continue;
+      it = this.item(k++, this.planetScene, m.view.object, m.pos, m.radius * 1.1, camera);
+      if (it) sl.push(it);
     }
     const ringR = this.body.data.spec.rings ? this.body.data.spec.rings.outer * 1.05 : 1.2;
-    sl.push(this.slice(k++, this.planetScene, ORIGIN, ringR, cp));
-    sl.sort(byDistanceDesc);
-    let drawn = 0;
-    for (const s of sl) {
-      // Bracket the body in *view-space depth* (what the clip planes test), not Euclidean
-      // distance: an off-axis star at depth d·cos θ would otherwise fall in front of the near plane.
-      const z = -tmp.copy(s.centre).applyMatrix4(camera.matrixWorldInverse).z;
-      if (z + s.radius <= 0) continue; // entirely behind the camera
-      if (!inSideFrustum(s.centre, s.radius)) continue; // entirely off-screen
-      renderer.clearDepth();
-      camera.near = Math.max(z - s.radius, s.dist * 1e-6, 1e-6);
-      camera.far = Math.max(z + s.radius, camera.near * 4);
-      camera.updateProjectionMatrix();
-      renderer.render(s.scene, camera);
-      drawn++;
+    const pl = this.item(k++, this.planetScene, this.tilt, ORIGIN, ringR, camera);
+    if (pl) {
+      // Camera inside the bounding sphere (low orbit): bound the near plane by the distance to the
+      // nearest real geometry instead of letting it collapse to 10⁻⁶.
+      const g = this.nearestPlanetGeometry(cp) * cornerCos(camera.projectionMatrix.elements) * 0.9;
+      if (g > pl.near) {
+        pl.near = g;
+        pl.far = Math.max(pl.far, g * 4);
+      }
+      sl.push(pl);
     }
-    this.slicesDrawn = drawn;
+    sl.sort(byDistanceDesc);
+    const ranges = this.ranges;
+    const n = planSlices(sl, ranges);
+    for (let s = 0; s < n; s++) {
+      let scene: THREE.Scene | null = null;
+      for (const x of sl) {
+        if (x.slice !== s) continue;
+        scene = x.scene;
+        break;
+      }
+      if (!scene) continue;
+      // The shared scene: show only this slice's bodies.
+      if (scene === this.planetScene) this.showLocal(s);
+      renderer.clearDepth();
+      camera.near = ranges[2 * s];
+      camera.far = ranges[2 * s + 1];
+      camera.updateProjectionMatrix();
+      renderer.render(scene, camera);
+    }
+    this.showLocal(-1);
+    this.slicesDrawn = n;
+  }
+
+  /** Visibility in the shared local scene: bodies of slice `s` only (−1: restore all ready bodies). */
+  private showLocal(s: number): void {
+    this.tilt.visible = false;
+    for (const m of this.moons) m.view.object.visible = false;
+    if (s < 0) {
+      this.tilt.visible = true;
+      for (const m of this.moons) m.view.object.visible = m.ready;
+      return;
+    }
+    for (const it of this.order) if (it.slice === s && it.obj) it.obj.visible = true;
   }
 
   /** Return the planet to the system view and free the close-up's own resources. */
@@ -301,4 +399,4 @@ export class WorldCloseup {
 }
 
 const ORIGIN = new THREE.Vector3();
-const byDistanceDesc = (a: Slice, b: Slice) => b.dist - a.dist;
+const byDistanceDesc = (a: Item, b: Item) => b.dist - a.dist;
